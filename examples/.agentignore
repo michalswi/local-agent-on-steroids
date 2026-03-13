@@ -1,0 +1,85 @@
+# Local Agent Ignore Rules
+# Similar to .gitignore, this file defines patterns for files/directories
+# that should NOT be analyzed by the agent
+
+# Dependencies
+node_modules/
+vendor/
+bower_components/
+
+# Build outputs
+dist/
+build/
+out/
+target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.tmp
+
+# Sensitive files
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+.aws/
+.ssh/
+secrets/
+credentials
+
+# Version control
+.git/
+.svn/
+.hg/
+
+# Archives
+*.zip
+*.tar
+*.gz
+*.bz2
+*.7z
+*.rar
+
+# Media files (usually not needed for code analysis)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.mp4
+*.mp3
+
+# Cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Package managers
+package-lock.json
+yarn.lock
+Cargo.lock
+poetry.lock
+
+# Documentation build outputs
+_site/
+docs/_build/

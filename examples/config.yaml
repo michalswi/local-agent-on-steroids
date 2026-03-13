@@ -1,0 +1,104 @@
+# Local Agent Configuration Example
+
+agent:
+  max_file_size_bytes: 1048576  # 1MB - maximum file size to analyze
+  token_limit: 8000              # maximum tokens to send to LLM per request
+  concurrent_files: 10           # number of files to analyze concurrently
+
+llm:
+  provider: "ollama"                      # LLM provider (ollama, openai, anthropic)
+  endpoint: "http://localhost:11434"     # LLM API endpoint
+  model: "codellama"                     # model to use for analysis
+  temperature: 0.1                       # lower = more deterministic
+  timeout: 120                           # request timeout in seconds
+  # api_key: ""                          # optional API key for cloud providers
+
+filters:
+  respect_gitignore: true                # honor .gitignore patterns
+  custom_ignore_file: ".agentignore"    # custom ignore file name
+  
+  deny_patterns:
+    # Directories to exclude
+    - "node_modules/**"
+    - ".git/**"
+    - "vendor/**"
+    - "dist/**"
+    - "build/**"
+    - "__pycache__/**"
+    
+    # File patterns to exclude
+    - "*.log"
+    - "*.tmp"
+    - "*.cache"
+    
+    # Sensitive files
+    - ".env*"
+    - "*.key"
+    - "*.pem"
+    - "*.crt"
+    - "secrets/**"
+    
+    # Binary and media
+    - "*.exe"
+    - "*.dll"
+    - "*.so"
+    - "*.dylib"
+    - "*.jpg"
+    - "*.png"
+    - "*.gif"
+    
+  allow_patterns:
+    # Source code files
+    - "*.go"
+    - "*.py"
+    - "*.js"
+    - "*.ts"
+    - "*.jsx"
+    - "*.tsx"
+    - "*.java"
+    - "*.c"
+    - "*.cpp"
+    - "*.h"
+    - "*.hpp"
+    - "*.rs"
+    - "*.rb"
+    - "*.php"
+    - "*.swift"
+    - "*.kt"
+    - "*.scala"
+    
+    # Configuration files
+    - "*.json"
+    - "*.yaml"
+    - "*.yml"
+    - "*.toml"
+    - "*.xml"
+    - "*.ini"
+    - "*.conf"
+    
+    # Documentation
+    - "*.md"
+    - "*.txt"
+    - "*.rst"
+    
+    # Scripts
+    - "*.sh"
+    - "*.bash"
+    - "*.zsh"
+    - "*.ps1"
+
+security:
+  detect_secrets: true       # scan for potential secrets/credentials
+  skip_binaries: true        # skip binary files
+  follow_symlinks: false     # whether to follow symbolic links
+  max_depth: 20              # maximum directory depth to traverse (nested folders)
+
+chunking:
+  strategy: "smart"          # smart (context-aware), lines, or tokens
+  chunk_size: 1000           # size of each chunk (in tokens or lines)
+  overlap: 100               # overlap between chunks (for context)
+
+# Example usage:
+# local-agent verify . --config examples/config.yaml --task "security audit"
+# local-agent verify ./src --task "check for bugs"
+# local-agent analyze main.go --question "explain this code"
