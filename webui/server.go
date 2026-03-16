@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ type Server struct {
 	directory   string
 	model       string
 	endpoint    string
+	indexTmpl   *template.Template
 	scanResult  *types.ScanResult
 	focusedPath string
 	cfg         *config.Config
@@ -90,6 +92,7 @@ func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, 
 		directory:   directory,
 		model:       model,
 		endpoint:    endpoint,
+		indexTmpl:   template.Must(template.New("index").Parse(htmlTemplate)),
 		scanResult:  scanResult,
 		focusedPath: focusedPath,
 		cfg:         cfg,
@@ -108,35 +111,38 @@ func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, 
 }
 
 func (s *Server) Start(port int) error {
+	mux := http.NewServeMux()
+
 	staticFS, err := fs.Sub(StaticFiles, "webstatic")
 	if err != nil {
 		log.Printf("Warning: failed to access embedded static files: %v", err)
 	} else {
-		http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+		mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 	}
 
-	http.HandleFunc("/", s.handleIndex)
-	http.HandleFunc("/api/chat", s.handleChat)
-	http.HandleFunc("/api/stop", s.handleStop)
-	http.HandleFunc("/api/status", s.handleStatus)
-	http.HandleFunc("/api/messages", s.handleMessages)
-	http.HandleFunc("/api/rescan", s.handleRescan)
-	http.HandleFunc("/api/files", s.handleFiles)
-	http.HandleFunc("/api/file", s.handleFileContent)
-	http.HandleFunc("/api/file/write", s.handleFileWrite)
-	http.HandleFunc("/api/settings", s.handleSettings)
-	http.HandleFunc("/api/agent/run", s.handleAgentRun)
-	http.HandleFunc("/api/agent/stream", s.handleAgentStream)
-	http.HandleFunc("/api/agent/commit", s.handleAgentCommit)
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/api/chat", s.handleChat)
+	mux.HandleFunc("/api/stop", s.handleStop)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/messages", s.handleMessages)
+	mux.HandleFunc("/api/rescan", s.handleRescan)
+	mux.HandleFunc("/api/files", s.handleFiles)
+	mux.HandleFunc("/api/file", s.handleFileContent)
+	mux.HandleFunc("/api/file/write", s.handleFileWrite)
+	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/agent/run", s.handleAgentRun)
+	mux.HandleFunc("/api/agent/stream", s.handleAgentStream)
+	mux.HandleFunc("/api/agent/commit", s.handleAgentCommit)
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("🌐 Web UI available at http://localhost%s\n", addr)
-	return http.ListenAndServe(addr, nil)
+	return http.ListenAndServe(addr, mux)
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
-	tmpl.Execute(w, nil)
+	if err := s.indexTmpl.Execute(w, nil); err != nil {
+		http.Error(w, "Failed to render page", http.StatusInternalServerError)
+	}
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -234,7 +240,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Get active files, scoped to any filenames mentioned in the question.
 	// If there are no files at all, still send the request — the user may be
 	// asking the LLM to generate something from scratch.
-	activeFiles := s.scopeFilesToQuestion(userInput, s.getActiveFiles())
+	activeFiles := s.scopeFilesToQuestion(userInput, s.getActiveFilesSnapshot())
 
 	// Use a background context so a page refresh does NOT cancel the Ollama
 	// request. Only an explicit Stop press (via /api/stop) cancels it.
@@ -334,7 +340,7 @@ func (s *Server) handleCommand(input string) string {
 	case lower == "stats":
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		activeFiles := s.getActiveFiles()
+		activeFiles := s.getActiveFilesLocked()
 		return fmt.Sprintf(`📊 Statistics:
 • Directory: %s
 • Total files scanned: %d
@@ -344,7 +350,7 @@ func (s *Server) handleCommand(input string) string {
 	case lower == "files":
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		activeFiles := s.getActiveFiles()
+		activeFiles := s.getActiveFilesLocked()
 		var builder strings.Builder
 		builder.WriteString(fmt.Sprintf("📁 Files (%d total):\n", len(activeFiles)))
 		for _, file := range activeFiles {
@@ -401,7 +407,10 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-func (s *Server) getActiveFiles() []*types.FileInfo {
+// getActiveFilesLocked returns active files while assuming s.mu is already held
+// by the caller (read or write lock). Returned file pointers point to copies,
+// so they remain safe after the lock is released.
+func (s *Server) getActiveFilesLocked() []*types.FileInfo {
 	if s.scanResult == nil {
 		return nil
 	}
@@ -409,24 +418,48 @@ func (s *Server) getActiveFiles() []*types.FileInfo {
 	if s.focusedPath == "" {
 		files := make([]*types.FileInfo, 0, len(s.scanResult.Files))
 		for i := range s.scanResult.Files {
-			files = append(files, &s.scanResult.Files[i])
+			copied := s.scanResult.Files[i]
+			files = append(files, &copied)
 		}
 		return files
 	}
 
 	for i := range s.scanResult.Files {
 		if s.scanResult.Files[i].RelPath == s.focusedPath {
-			return []*types.FileInfo{&s.scanResult.Files[i]}
+			copied := s.scanResult.Files[i]
+			return []*types.FileInfo{&copied}
 		}
 	}
 
 	return nil
 }
 
-// scopeFilesToQuestion narrows the file list to only files whose name or relative
-// path is mentioned in the question. If no file is mentioned, all files are returned.
+// getActiveFilesSnapshot safely snapshots active files under a read lock.
+// Use this from call sites that do not already hold s.mu.
+func (s *Server) getActiveFilesSnapshot() []*types.FileInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getActiveFilesLocked()
+}
+
+// scopeFilesToQuestion narrows the file list to files relevant to the prompt.
+// If explicit filenames are mentioned, those win. Otherwise use conservative
+// heuristics to avoid fanning out edits across unrelated files.
 func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []*types.FileInfo {
 	lower := strings.ToLower(question)
+	if len(all) <= 1 {
+		return all
+	}
+
+	// Explicit broad intent means "touch many files".
+	if strings.Contains(lower, "all files") ||
+		strings.Contains(lower, "entire project") ||
+		strings.Contains(lower, "whole project") ||
+		strings.Contains(lower, "across project") ||
+		strings.Contains(lower, "across codebase") {
+		return all
+	}
+
 	var matched []*types.FileInfo
 	for _, f := range all {
 		name := strings.ToLower(filepath.Base(f.RelPath))
@@ -435,10 +468,104 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 			matched = append(matched, f)
 		}
 	}
-	if len(matched) == 0 {
-		return all // no specific file mentioned — include everything
+	if len(matched) > 0 {
+		return matched
 	}
-	return matched
+
+	// No explicit file mentions: pick a conservative, likely-relevant subset.
+	// This prevents generic follow-up prompts (e.g. "add auth") from modifying
+	// README/config/generated artifacts unintentionally.
+
+	// 1) Task-specific file families.
+	if strings.Contains(lower, "readme") || strings.Contains(lower, "documentation") || strings.Contains(lower, "docs") {
+		return pickByExtensions(all, map[string]bool{".md": true}, 3)
+	}
+	if strings.Contains(lower, "terraform") || strings.Contains(lower, "gke") || strings.Contains(lower, "tf") {
+		picked := pickByExtensions(all, map[string]bool{".tf": true, ".tfvars": true}, 6)
+		if len(picked) > 0 {
+			return picked
+		}
+	}
+
+	// 2) Prefer dominant source extension among code files (e.g. .py in a
+	// generated Python app), capped to a small set.
+	codeExts := map[string]bool{
+		".py": true, ".go": true, ".js": true, ".ts": true, ".tsx": true,
+		".java": true, ".rs": true, ".rb": true, ".php": true, ".cs": true,
+		".cpp": true, ".c": true, ".h": true, ".kt": true, ".scala": true,
+		".swift": true,
+	}
+	extFreq := map[string]int{}
+	for _, f := range all {
+		if f == nil {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f.RelPath))
+		if codeExts[ext] {
+			extFreq[ext]++
+		}
+	}
+	bestExt := ""
+	bestCount := 0
+	for ext, n := range extFreq {
+		if n > bestCount {
+			bestExt = ext
+			bestCount = n
+		}
+	}
+	if bestExt != "" {
+		picked := pickByExtensions(all, map[string]bool{bestExt: true}, 3)
+		if len(picked) > 0 {
+			return picked
+		}
+	}
+
+	// 3) Last fallback: include only likely code files (still capped).
+	picked := pickByExtensions(all, codeExts, 3)
+	if len(picked) > 0 {
+		return picked
+	}
+
+	// If everything else fails, keep previous behavior.
+	return all
+}
+
+func pickByExtensions(all []*types.FileInfo, allowed map[string]bool, limit int) []*types.FileInfo {
+	if limit <= 0 {
+		limit = 1
+	}
+	mainLike := make([]*types.FileInfo, 0)
+	others := make([]*types.FileInfo, 0)
+	for _, f := range all {
+		if f == nil {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f.RelPath))
+		if !allowed[ext] {
+			continue
+		}
+		base := strings.ToLower(filepath.Base(f.RelPath))
+		if strings.HasPrefix(base, "main.") || strings.HasPrefix(base, "app.") || strings.HasPrefix(base, "server.") || strings.HasPrefix(base, "index.") {
+			mainLike = append(mainLike, f)
+		} else {
+			others = append(others, f)
+		}
+	}
+
+	out := make([]*types.FileInfo, 0, limit)
+	for _, f := range mainLike {
+		if len(out) >= limit {
+			return out
+		}
+		out = append(out, f)
+	}
+	for _, f := range others {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 func (s *Server) processQuestion(ctx context.Context, question string, files []*types.FileInfo) (*llm.ChatResponse, string, time.Duration, error) {
@@ -494,26 +621,34 @@ func (s *Server) saveSession(question, answer string, resp *llm.ChatResponse, du
 		return
 	}
 
-	record := &sessionlog.Record{
-		Timestamp:  time.Now(),
-		Mode:       "webui",
-		Directory:  s.directory,
-		Task:       question,
-		Focus:      s.focusedPath,
-		Model:      s.model,
-		TokensUsed: resp.PromptEvalCount + resp.EvalCount,
-		Duration:   duration,
-		Files:      sessionlog.FilesFromTokens(nil, s.focusedPath),
-		Response:   answer,
-	}
-
+	// Snapshot mutable server state under lock to avoid racing with rescans
+	// and runtime model/focus changes while building the record.
+	s.mu.RLock()
+	focus := s.focusedPath
+	model := s.model
+	var scanSummary *sessionlog.ScanSummary
 	if s.scanResult != nil {
-		record.ScanSummary = &sessionlog.ScanSummary{
+		scanSummary = &sessionlog.ScanSummary{
 			TotalFiles:    s.scanResult.TotalFiles,
 			FilteredFiles: s.scanResult.FilteredFiles,
 			TotalSize:     s.scanResult.TotalSize,
 			Duration:      s.scanResult.Duration,
 		}
+	}
+	s.mu.RUnlock()
+
+	record := &sessionlog.Record{
+		Timestamp:   time.Now(),
+		Mode:        "webui",
+		Directory:   s.directory,
+		Task:        question,
+		Focus:       focus,
+		Model:       model,
+		TokensUsed:  resp.PromptEvalCount + resp.EvalCount,
+		Duration:    duration,
+		Files:       sessionlog.FilesFromTokens(nil, focus),
+		Response:    answer,
+		ScanSummary: scanSummary,
 	}
 
 	if _, err := sessionlog.Save(record); err != nil {
@@ -602,6 +737,8 @@ type AgentFileResult struct {
 	File    string `json:"file"`
 	Changed bool   `json:"changed"`
 	Created bool   `json:"created"`
+	// Deleted is true when the agent determined this file should be removed.
+	Deleted bool `json:"deleted,omitempty"`
 	// Pending is true when the result is a proposed change that has NOT yet
 	// been written to disk — the user must confirm via /api/agent/commit.
 	Pending    bool   `json:"pending,omitempty"`
@@ -619,6 +756,8 @@ type AgentCommitRequest struct {
 type AgentCommitFile struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	// Delete, when true, removes the file instead of writing Content.
+	Delete bool `json:"delete,omitempty"`
 }
 
 // AgentRunResponse is the JSON response for POST /api/agent/run.
@@ -933,6 +1072,21 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 			results = append(results, commitResult{File: f.Path, Success: false, Error: "path outside working directory"})
 			continue
 		}
+
+		// Delete operation: remove the file instead of writing.
+		if f.Delete {
+			if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+				results = append(results, commitResult{File: f.Path, Success: false, Error: err.Error()})
+				continue
+			}
+			anyWritten = true
+			results = append(results, commitResult{File: f.Path, Success: true})
+			s.mu.Lock()
+			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.Path, Task: "(confirmed via Apply)"})
+			s.mu.Unlock()
+			continue
+		}
+
 		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 			results = append(results, commitResult{File: f.Path, Success: false, Error: err.Error()})
 			continue
@@ -1095,16 +1249,139 @@ func (s *Server) agentChangelogPrompt() string {
 	var b strings.Builder
 	b.WriteString("Previous actions in this session:\n")
 	for _, e := range log {
-		fmt.Fprintf(&b, "- %s %s (task: %q)\n", e.Operation, e.File, e.Task)
+		switch e.Operation {
+		case "deleted":
+			fmt.Fprintf(&b, "- DELETED %s (task: %q) — this file no longer exists\n", e.File, e.Task)
+		default:
+			fmt.Fprintf(&b, "- %s %s (task: %q)\n", e.Operation, e.File, e.Task)
+		}
 	}
 	return b.String()
 }
 
+// agentIsDeleteTask returns true when the task is clearly asking to delete or
+// remove one or more files entirely (not to delete code inside a file).
+func agentIsDeleteTask(task string) bool {
+	lower := strings.ToLower(task)
+	deleteWords := []string{"delete", "remove", "erase", "drop"}
+	fileWords := []string{"file", ".go", ".py", ".js", ".ts", ".yaml", ".yml", ".json",
+		".tf", ".sh", ".md", ".txt", ".html", ".css", ".toml", ".env"}
+	for _, d := range deleteWords {
+		if strings.Contains(lower, d) {
+			for _, f := range fileWords {
+				if strings.Contains(lower, f) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func promptTokens(s string) []string {
+	parts := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if len(p) >= 3 {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func promptTokenSet(s string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, t := range promptTokens(s) {
+		set[t] = struct{}{}
+	}
+	return set
+}
+
+func truncatePromptContent(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	return s[:maxBytes] + "\n\n...[truncated for context]"
+}
+
 func (s *Server) runAgentTask(ctx context.Context, task string, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
 	// Scope to files mentioned in the task; fall back to all files.
-	allFiles := s.getActiveFiles()
+	allFiles := s.getActiveFilesSnapshot()
 	targetFiles := s.scopeFilesToQuestion(task, allFiles)
 	progress(fmt.Sprintf("Scoping: %d file(s) in range…", len(targetFiles)))
+
+	// ── Detect "delete file" intent ─────────────────────────────────────────
+	// When the task is asking to delete files, bypass the LLM entirely and
+	// directly propose deletions for the scoped files.  This prevents the LLM
+	// from misinterpreting a delete request as a rewrite instruction and
+	// overwriting files that were never supposed to change.
+	//
+	// Only act when scopeFilesToQuestion found explicit matches; if it fell back
+	// to "all files" we refuse rather than blindly deleting everything.
+	if agentIsDeleteTask(task) {
+		allCount := len(allFiles)
+		scopedCount := len(targetFiles)
+		if scopedCount == allCount {
+			// No specific file was identified — refuse to avoid mass-deletion.
+			errMsg := "⚠️ Could not identify a specific file to delete. Please mention the exact filename (e.g. \"delete main.go\")."
+			return errMsg, nil, nil
+		}
+		var results []AgentFileResult
+		for _, f := range targetFiles {
+			if f == nil {
+				continue
+			}
+			absPath := filepath.Clean(filepath.Join(s.directory, f.RelPath))
+			oldContent := ""
+			if data, err := os.ReadFile(absPath); err == nil {
+				oldContent = string(data)
+			}
+			if !dryRun {
+				if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+					results = append(results, AgentFileResult{File: f.RelPath, Error: err.Error()})
+					continue
+				}
+				progress(fmt.Sprintf("🗑️  %s — deleted", f.RelPath))
+				s.mu.Lock()
+				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
+				s.mu.Unlock()
+			} else {
+				progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
+			}
+			results = append(results, AgentFileResult{
+				File:       f.RelPath,
+				Changed:    true,
+				Deleted:    true,
+				Pending:    dryRun,
+				OldContent: oldContent,
+			})
+		}
+		var sb strings.Builder
+		if dryRun {
+			fmt.Fprintf(&sb, "🤖 **Agent**: %d file(s) proposed for deletion — confirm or deny below.\n", len(results))
+		} else {
+			fmt.Fprintf(&sb, "🤖 **Agent**: deleted %d file(s).\n", len(results))
+		}
+		for _, r := range results {
+			if r.Error != "" {
+				fmt.Fprintf(&sb, "• ❌ %s — %s\n", r.File, r.Error)
+			} else if r.Pending {
+				fmt.Fprintf(&sb, "• 📋 %s — pending confirmation\n", r.File)
+			} else {
+				fmt.Fprintf(&sb, "• 🗑️  %s — deleted\n", r.File)
+			}
+		}
+		if needsRescan := !dryRun && len(results) > 0; needsRescan {
+			if scanned, err := s.performRescan(); err == nil {
+				s.mu.Lock()
+				s.scanResult = scanned
+				s.mu.Unlock()
+			}
+		}
+		return sb.String(), results, nil
+	}
 
 	// ── Detect "create new file" intent ─────────────────────────────────────
 	// If the task implies a specific new file type (e.g. ".md") and none of the
@@ -1119,13 +1396,16 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			}
 		}
 		if !hasMatch {
-			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
+			// File-creation flows should always be confirm-first in UI so users can
+			// select/tick which proposed files to create.
+			return s.runAgentCreate(ctx, task, allFiles, progress, true)
 		}
 	}
 
 	// ── No existing files: ask LLM to create a new one ──────────────────────
 	if len(targetFiles) == 0 {
-		return s.runAgentCreate(ctx, task, nil, progress, dryRun)
+		// Force confirm-first for initial scaffold generation.
+		return s.runAgentCreate(ctx, task, nil, progress, true)
 	}
 
 	var results []AgentFileResult
@@ -1154,17 +1434,24 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	changelog := s.agentChangelogPrompt()
 	systemPrompt := "You are a coding agent. " +
 		"You will be given a file and a task describing a change to make. " +
-		"You MUST apply the requested change to the file. " +
+		"You MUST apply the requested change ONLY to this specific file. " +
 		"Reply with ONLY the complete updated file content — every line, not a diff or partial snippet. " +
-		"Do not explain, do not add markdown fences, do not add commentary. Just the raw file content."
+		"Do not explain, do not add markdown fences, do not add commentary. Just the raw file content. " +
+		"IMPORTANT EXCEPTIONS — output exactly one of these tokens and nothing else:\n" +
+		"  • NO_CHANGE  — if this specific file does not need to be modified for the given task.\n" +
+		"  • DELETE_FILE — if and only if the task explicitly asks to DELETE or REMOVE this exact file entirely.\n" +
+		"When in doubt whether to change a file, output NO_CHANGE."
 	if changelog != "" {
 		systemPrompt += "\n\n" + changelog
 	}
 
 	// crossFileContextLimit caps the total bytes of cross-file context injected
-	// into each per-file prompt. This prevents O(n²) context growth from
-	// exceeding model context windows on large file selections.
-	const crossFileContextLimit = 32 * 1024
+	// into each per-file prompt. Additional caps keep fanout bounded.
+	const crossFileContextLimit = 24 * 1024
+	const crossFileMaxFiles = 3
+	const crossFileSnippetBytes = 6 * 1024
+	taskLower := strings.ToLower(task)
+	taskTokenSet := promptTokenSet(task)
 
 	// Pre-read all target files once so that each goroutine can build its
 	// cross-file context from memory rather than issuing O(n²) disk reads.
@@ -1210,20 +1497,77 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				oldContent = string(rawData)
 			}
 
-			// Build cross-file context from the in-memory cache (no extra disk I/O).
-			// Files are skipped once the cumulative byte budget is exhausted so
-			// that large selections cannot exceed model context windows.
+			// Build bounded cross-file context from in-memory cache (no extra disk I/O).
+			// Rank candidates and include only a few relevant files/snippets.
+			type related struct {
+				relPath string
+				content string
+				score   int
+			}
+			currentRelLower := strings.ToLower(f.RelPath)
+			currentDir := strings.ToLower(filepath.Dir(currentRelLower))
+			currentExt := strings.ToLower(filepath.Ext(currentRelLower))
+			candidates := make([]related, 0, len(targetFiles))
+
 			var ctxBuf strings.Builder
 			for _, other := range targetFiles {
 				if other == nil || other.RelPath == f.RelPath || !other.IsReadable {
 					continue
 				}
 				if content, ok := fileCache[other.RelPath]; ok {
-					if ctxBuf.Len()+len(content) > crossFileContextLimit {
-						continue
+					otherRelLower := strings.ToLower(other.RelPath)
+					otherBaseLower := strings.ToLower(filepath.Base(otherRelLower))
+					otherDir := strings.ToLower(filepath.Dir(otherRelLower))
+					otherExt := strings.ToLower(filepath.Ext(otherRelLower))
+
+					score := 0
+					if strings.Contains(taskLower, otherRelLower) {
+						score += 12
 					}
-					fmt.Fprintf(&ctxBuf, "=== %s ===\n%s\n\n", other.RelPath, content)
+					if strings.Contains(taskLower, otherBaseLower) {
+						score += 8
+					}
+					if otherDir == currentDir {
+						score += 4
+					}
+					if otherExt != "" && otherExt == currentExt {
+						score += 3
+					}
+					for _, tok := range promptTokens(otherBaseLower) {
+						if _, ok := taskTokenSet[tok]; ok {
+							score++
+						}
+					}
+
+					candidates = append(candidates, related{
+						relPath: other.RelPath,
+						content: content,
+						score:   score,
+					})
 				}
+			}
+
+			sort.Slice(candidates, func(i, j int) bool {
+				if candidates[i].score == candidates[j].score {
+					return candidates[i].relPath < candidates[j].relPath
+				}
+				return candidates[i].score > candidates[j].score
+			})
+
+			included := 0
+			for _, cand := range candidates {
+				if included >= crossFileMaxFiles {
+					break
+				}
+				if cand.score <= 0 {
+					continue
+				}
+				snippet := truncatePromptContent(cand.content, crossFileSnippetBytes)
+				if ctxBuf.Len()+len(snippet) > crossFileContextLimit {
+					continue
+				}
+				fmt.Fprintf(&ctxBuf, "=== %s ===\n%s\n\n", cand.relPath, snippet)
+				included++
 			}
 
 			var userPrompt string
@@ -1253,6 +1597,39 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			}
 
 			newContent := agentStripFences(resp.Message.Content)
+
+			// Handle explicit no-change sentinel.
+			if strings.TrimSpace(newContent) == "NO_CHANGE" {
+				progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
+				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+				return
+			}
+
+			// Handle explicit delete sentinel.
+			if strings.TrimSpace(newContent) == "DELETE_FILE" {
+				if !dryRun {
+					if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+						progress(fmt.Sprintf("❌ %s — delete error", f.RelPath))
+						resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: err.Error()}}
+						return
+					}
+					progress(fmt.Sprintf("🗑️ %s — deleted", f.RelPath))
+					s.mu.Lock()
+					s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
+					s.mu.Unlock()
+				} else {
+					progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
+				}
+				resultsCh <- indexedResult{idx, AgentFileResult{
+					File:       f.RelPath,
+					Changed:    true,
+					Deleted:    true,
+					Pending:    dryRun,
+					OldContent: oldContent,
+				}}
+				return
+			}
+
 			if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
 				progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
 				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
@@ -1380,6 +1757,21 @@ func parseAgentCreateResponse(raw string) []agentFileBlock {
 	return blocks
 }
 
+// agentExplicitFilenameFromTask returns a single explicitly mentioned filename
+// from the task, e.g. "README.md" in "prepare README.md ...".
+// If none is clearly present, it returns "".
+func agentExplicitFilenameFromTask(task string) string {
+	match := agentFilenameRe.FindString(task)
+	if match == "" {
+		return ""
+	}
+	name := agentSanitizeFilename(match)
+	if name == "" || strings.Contains(name, " ") || filepath.Ext(name) == "" {
+		return ""
+	}
+	return name
+}
+
 // runAgentPlan asks the LLM which files need to be created for the task.
 // It returns a deduplicated, sanitized list of filenames. This is a cheap
 // "thinking" call — the model only returns names, not content.
@@ -1443,21 +1835,29 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 // from scratch. It first calls runAgentPlan to collect the full file list, then
 // generates each file with a focused, isolated LLM prompt.
 func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles []*types.FileInfo, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
-	// ── Step 1: planning call ───────────────────────────────────────────────
-	// Ask the model which files are needed. This small focused call is far more
-	// reliable than asking a small LLM to plan AND generate in one shot.
-	progress("🗺️  Planning: asking LLM which files to create…")
-	plannedFiles, err := s.runAgentPlan(ctx, task, contextFiles)
-	if err != nil {
-		return "", nil, fmt.Errorf("agent plan step failed: %w", err)
-	}
-	if len(plannedFiles) == 0 {
-		// Planning failed silently (model returned only prose). Fall back to
-		// the legacy single-call path.
-		progress("⚠️  Planning returned no files — falling back to single-file mode…")
-		plannedFiles = nil
+	// ── Step 1: planning call (or explicit single-file shortcut) ───────────
+	var plannedFiles []string
+	if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
+		// The user explicitly named a file, so avoid broad multi-file planning.
+		plannedFiles = []string{explicit}
+		progress(fmt.Sprintf("📋 Plan: explicit target %s (planning skipped)", explicit))
 	} else {
-		progress(fmt.Sprintf("📋 Plan: %s", strings.Join(plannedFiles, ", ")))
+		// Ask the model which files are needed. This small focused call is far more
+		// reliable than asking a small LLM to plan AND generate in one shot.
+		progress("🗺️  Planning: asking LLM which files to create…")
+		var err error
+		plannedFiles, err = s.runAgentPlan(ctx, task, contextFiles)
+		if err != nil {
+			return "", nil, fmt.Errorf("agent plan step failed: %w", err)
+		}
+		if len(plannedFiles) == 0 {
+			// Planning failed silently (model returned only prose). Fall back to
+			// the legacy single-call path.
+			progress("⚠️  Planning returned no files — falling back to single-file mode…")
+			plannedFiles = nil
+		} else {
+			progress(fmt.Sprintf("📋 Plan: %s", strings.Join(plannedFiles, ", ")))
+		}
 	}
 
 	// ── Step 2: build context block ─────────────────────────────────────────
