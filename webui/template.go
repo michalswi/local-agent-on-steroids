@@ -163,7 +163,7 @@ const htmlTemplate = `<!DOCTYPE html>
         .cb pre { margin: 0; padding: 0.8rem 1rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; }
         .cb code { font-family: "Cascadia Code", "JetBrains Mono", "Fira Code", monospace; }
         /* Input area */
-        .input-area { padding: 0.85rem 1.25rem; background: var(--bg2); border-top: 1px solid var(--border); flex-shrink: 0; }
+        .input-area { padding: 0.85rem 1.25rem 3rem; background: var(--bg2); border-top: 1px solid var(--border); flex-shrink: 0; }
         .input-row { display: flex; gap: 0.65rem; align-items: flex-end; }
         .msg-input {
             flex: 1; padding: 0.65rem 0.9rem; background: var(--bg3); border: 1px solid var(--border);
@@ -196,13 +196,15 @@ const htmlTemplate = `<!DOCTYPE html>
             border: none; border-radius: 8px; cursor: pointer; font-weight: 600;
             font-size: 0.88rem; height: 40px; transition: opacity 0.15s; white-space: nowrap;
         }
-        .btn-help:hover { opacity: 0.85; }
+        .btn-help:hover:not(:disabled) { opacity: 0.85; }
+        .btn-help:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-auto {
             padding: 0.65rem 1.1rem; background: #f59e0b; color: #fff;
             border: none; border-radius: 8px; cursor: pointer; font-weight: 600;
             font-size: 0.88rem; height: 40px; transition: opacity 0.15s; white-space: nowrap;
         }
-        .btn-auto:hover { opacity: 0.85; }
+        .btn-auto:hover:not(:disabled) { opacity: 0.85; }
+        .btn-auto:disabled { opacity: 0.4; cursor: not-allowed; }
         .input-hint { font-size: 0.73rem; color: var(--text2); margin-top: 0.35rem; }
         .input-hint code { background: var(--bg3); padding: 0.1rem 0.3rem; border-radius: 3px; color: var(--accent); font-size: 0.9em; }
         /* Typing indicator */
@@ -271,8 +273,32 @@ const htmlTemplate = `<!DOCTYPE html>
             white-space: nowrap; transition: all 0.12s;
         }
         .ibtn:hover { background: var(--bg3); color: var(--text); border-color: var(--accent); }
+        .ibtn:disabled { opacity: 0.4; cursor: not-allowed; }
         .ibtn.green:hover { border-color: var(--green); color: var(--green); }
         .ibtn.red:hover   { border-color: var(--red);   color: var(--red);   }
+        .ibtn.github-btn {
+            width: 30px; height: 30px; padding: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+        }
+        .ibtn.github-btn .gh-mark {
+            width: 20px; height: 20px; border-radius: 999px;
+            background: #111827;
+            display: inline-flex; align-items: center; justify-content: center;
+        }
+        .ibtn.github-btn svg {
+            width: 13px; height: 13px; display: block; fill: #f8fafc;
+        }
+        .app-copyright {
+            position: fixed;
+            bottom: 0.55rem;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            font-size: 0.72rem;
+            color: var(--text2);
+            pointer-events: none;
+            z-index: 20;
+        }
         .ibtn.hidden { display: none !important; }
         .hidden { display: none !important; }
 
@@ -296,8 +322,17 @@ const htmlTemplate = `<!DOCTYPE html>
             <span class="badge" id="filesBadge">📄 0 files</span>
             <span class="badge focus" id="focusBadge" style="display:none;">🎯 —</span>
         </div>
+        <a class="ibtn github-btn" id="githubBtn" href="https://github.com/michalswi/local-agent-on-steroids" target="_blank" rel="noopener noreferrer" title="Open GitHub repository" aria-label="Open GitHub repository">
+            <span class="gh-mark" aria-hidden="true">
+                <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.62 7.62 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>
+                </svg>
+            </span>
+        </a>
         <button class="ibtn" id="themeBtn" title="Toggle theme">🌙</button>
     </header>
+
+    <div class="app-copyright">© 2049 michalswi</div>
 
     <!-- ── Workspace ────────────────────────────────────────────── -->
     <div class="workspace">
@@ -319,6 +354,7 @@ const htmlTemplate = `<!DOCTYPE html>
         <div class="content">
             <div class="tab-bar" id="tabBar">
                 <button class="tab active" id="tabChat" onclick="switchTab('chat')">💬 Chat</button>
+                <button class="ibtn hidden" id="closeAllTabsBtn" onclick="closeAllFileTabs()" title="Close all open files" style="flex-shrink:0;align-self:center;margin-bottom:2px;">✕ Close All</button>
             </div>
 
             <!-- Chat panel -->
@@ -332,7 +368,7 @@ const htmlTemplate = `<!DOCTYPE html>
                         <button class="btn-help" id="clearBtn" title="Clear conversation history">Clear</button>
                         <button class="stop-btn hidden" id="stopBtn">⏹ Stop</button>
                         <button class="btn-help" id="helpBtn" onclick="openHelpModal()">Help</button>
-                        <button class="btn-auto" id="autoApplyBtn" title="Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).">🔒 Auto</button>
+                        <button class="btn-auto" id="autoApplyBtn" title="Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).">🔒 Auto Off</button>
                     </div>
                     <div class="input-hint">💡 <code>Enter</code> = ⚡ Agent &nbsp;•&nbsp; <code>Shift+Enter</code> = new line &nbsp;•&nbsp; <code>Send</code> = chat only</div>
                 </div>
@@ -454,12 +490,18 @@ function syncBusyUI() {
     var clearBtn = document.getElementById('clearBtn');
     var agentBtn = document.getElementById('agentBtn');
     var stopBtn = document.getElementById('stopBtn');
+    var helpBtn = document.getElementById('helpBtn');
+    var autoApplyBtn = document.getElementById('autoApplyBtn');
+    var rescanBtn = document.getElementById('rescanBtn');
     if (!inp || !sendBtn || !clearBtn || !agentBtn || !stopBtn) return;
 
     inp.disabled = busy;
     sendBtn.disabled = busy;
     clearBtn.disabled = busy;
     agentBtn.disabled = busy;
+    if (helpBtn) helpBtn.disabled = busy;
+    if (autoApplyBtn) autoApplyBtn.disabled = busy;
+    if (rescanBtn) rescanBtn.disabled = busy;
     if (busy) {
         stopBtn.classList.remove('hidden');
         if (serverProcessing && !window._activeAbortController) {
@@ -532,7 +574,7 @@ function pollMessages() {
             var c = document.getElementById('messages');
             c.innerHTML = '';
             msgs.forEach(function(m) {
-                c.appendChild(makeMsgEl(m.role, m.content, m.timestamp));
+                c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms));
                 if (m.agentResults && m.agentResults.length) {
                     var hasPending = m.agentResults.some(function(r){ return r.pending; });
                     if (hasPending) { renderAgentPendingResults(m.agentResults, c); }
@@ -660,7 +702,7 @@ function loadMessages() {
         var list = msgs || [];
         _lastMsgCount = list.length;
         list.forEach(function(m) {
-            c.appendChild(makeMsgEl(m.role, m.content, m.timestamp));
+            c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms));
             if (m.agentResults && m.agentResults.length) {
                 var hasPending = m.agentResults.some(function(r){ return r.pending; });
                 if (hasPending) {
@@ -675,12 +717,17 @@ function loadMessages() {
     }).catch(function(){});
 }
 
-function makeMsgEl(role, content, ts) {
+function makeMsgEl(role, content, ts, durationMs) {
     var wrap   = document.createElement('div');
     wrap.className = 'msg ' + role;
     var meta   = document.createElement('div');
     meta.className = 'msg-meta';
-    meta.textContent = (role === 'user' ? 'You' : '🤖 Assistant') + ' · ' + (ts ? new Date(ts).toLocaleTimeString() : '');
+    var metaText = (role === 'user' ? 'You' : '🤖 Assistant') + ' · ' + (ts ? new Date(ts).toLocaleTimeString() : '');
+    if (role === 'assistant' && durationMs && durationMs > 0) {
+        var secs = (durationMs / 1000).toFixed(1);
+        metaText += ' · ⏱ ' + secs + 's';
+    }
+    meta.textContent = metaText;
     var bubble = document.createElement('div');
     bubble.className = 'bubble';
     if (role === 'assistant') {
@@ -727,7 +774,7 @@ function sendMsg() {
         if (d.cleared) {
             document.getElementById('messages').innerHTML = '';
         } else if (d.success && d.message) {
-            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp));
+            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms));
             c.scrollTop = c.scrollHeight;
             autoApplyCodeBlocks(d.message.content, c, txt);
         } else {
@@ -809,7 +856,7 @@ function sendAgentTask() {
         if (d.cleared) {
             document.getElementById('messages').innerHTML = '';
         } else if (d.success && d.message) {
-            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp));
+            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms));
             c.scrollTop = c.scrollHeight;
             if (d.agentResults && d.agentResults.length) {
                 var hasPending = d.agentResults.some(function(r){ return r.pending; });
@@ -1623,7 +1670,9 @@ function addFileTab(relPath) {
     btn.innerHTML = fileIcon(relPath) + ' ' + esc(name) +
         ' <span class="tab-x" onclick="closeFileTab(\'' + safe + '\',event)">×</span>';
     btn.onclick   = function() { openFile(relPath); };
+    // Append after the Close All button (file tabs come after it)
     document.getElementById('tabBar').appendChild(btn);
+    updateCloseAllBtn();
 }
 
 function closeFileTab(relPath, e) {
@@ -1632,6 +1681,23 @@ function closeFileTab(relPath, e) {
     var tab = document.getElementById(id);
     if (tab) tab.remove();
     if (currentFile === relPath) { currentFile = null; switchTab('chat'); }
+    updateCloseAllBtn();
+}
+
+function closeAllFileTabs() {
+    document.querySelectorAll('#tabBar .tab[data-path]').forEach(function(t) {
+        t.remove();
+    });
+    currentFile = null;
+    switchTab('chat');
+    updateCloseAllBtn();
+}
+
+function updateCloseAllBtn() {
+    var btn = document.getElementById('closeAllTabsBtn');
+    if (!btn) return;
+    var hasFileTabs = document.querySelectorAll('#tabBar .tab[data-path]').length > 0;
+    btn.classList.toggle('hidden', !hasFileTabs);
 }
 
 function switchTab(name) {
@@ -1789,10 +1855,10 @@ function applyAutoApplyUI() {
     var btn = document.getElementById('autoApplyBtn');
     if (!btn) return;
     if (autoApply) {
-        btn.textContent = '⚡ Auto';
+        btn.textContent = '⚡ Auto On';
         btn.title = 'Auto-apply is ON — code blocks are written to disk automatically. Click to disable.';
     } else {
-        btn.textContent = '🔒 Auto';
+        btn.textContent = '🔒 Auto Off';
         btn.title = 'Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).';
     }
 }

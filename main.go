@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/michalswi/local-agent-on-steroids/analyzer"
@@ -53,9 +54,16 @@ func main() {
 		cfg.LLM.Model = *model
 	}
 
-	// Override host if specified via flag
+	// Override host if specified via flag.
+	// If the value already contains a scheme (http:// or https://), use it as-is;
+	// otherwise prepend http:// so bare host:port values still work.
 	if *host != "localhost:11434" {
-		cfg.LLM.Endpoint = fmt.Sprintf("http://%s", *host)
+		h := *host
+		if strings.HasPrefix(h, "http://") || strings.HasPrefix(h, "https://") {
+			cfg.LLM.Endpoint = h
+		} else {
+			cfg.LLM.Endpoint = fmt.Sprintf("http://%s", h)
+		}
 	}
 
 	// Override secret detection if disabled via flag

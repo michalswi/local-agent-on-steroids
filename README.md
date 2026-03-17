@@ -20,6 +20,9 @@
 ```bash
 make build
 
+# Verify files (if any) in the directory
+./local-agent-on-steroids --interactive --dir ./myproject --dry-run
+
 # Web UI at http://localhost:5050
 ./local-agent-on-steroids --interactive --dir ./myproject
 
@@ -47,6 +50,15 @@ ollama serve
 
 > **`AGENT_CONCURRENT_FILES`** controls parallel LLM calls when **editing/analyzing existing files** (agent task mode).
 > It does **not** apply when **generating new files** from scratch — those are produced sequentially.
+
+## \# Session Logs
+
+Every chat and agent interaction is saved as a JSON record under `/tmp/local-agent-on-steroids/`.
+
+```bash
+ls /tmp/local-agent-on-steroids/
+# session_20260317_123456.json  session_20260317_130012.json  ...
+```
 
 ## \# Configuration
 
@@ -77,8 +89,10 @@ security:
 |---|---|
 | **⚡ Agent** | Agent mode — scans all files, plans changes, and applies them autonomously. Triggered by pressing `Enter`. |
 | **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. |
+| **Clear** | Clears the current chat conversation history (same behavior as typing `clear` in chat). |
 | **Help** | Opens the in-app help modal listing all available chat commands and keyboard shortcuts. |
-| **🔒 Auto** | Toggles auto-apply mode. When **OFF** (default), each file change requires an explicit **⚡ Apply** confirmation. When **ON**, changes are applied immediately. |
+| **⏹ Stop** | Aborts the current Agent or Send operation mid-stream. Only visible while a request is in progress. |
+| **🔒 Auto Off** | Toggles auto-apply mode. When **OFF** (default), each file change requires an explicit **⚡ Apply** confirmation. When **ON**, changes are applied immediately. Does **not** affect the Agent's planning phase — planning always runs regardless. |
 
 ## \# Chat Commands
 
@@ -90,3 +104,68 @@ security:
 | `clear` | Clear chat history |
 | `help` | Show all commands |
 
+## \# System Prompts
+
+There are three distinct system prompts used internally, each targeting a different operation mode. All live in `webui/server.go`.
+
+| Prompt | Location | Triggered by |
+|---|---|---|
+| **Chat prompt** | `server.go` | **Send** button — plain conversation, no file writes |
+| **Agent prompt** | `server.go` | **⚡ Agent** button — applied per-file in a parallel loop |
+| **Create-file prompt** | `server.go` | Agent sub-step when a new file needs to be created from scratch |
+
+All three prompts are assembled at runtime (file tree, file contents, and session changelog are injected dynamically), so what you see in source is only the static base.
+
+## \# External API
+
+`POST /api/ext/send` lets any application send messages or agent tasks directly to the running instance without going through the browser UI. Requests and replies are stored in the chat history and appear in the UI on the next refresh.
+
+**Request body:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `message` | string | required | The prompt or agent task |
+| `mode` | `"chat"` \| `"agent"` | `"chat"` | Chat (Send) or Agent mode |
+| `auto` | bool | `true` | Agent only — write files immediately (`true`) or propose diffs (`false`) |
+
+**Chat mode example** (equivalent to pressing **Send**):
+
+```bash
+curl -s -X POST http://localhost:5050/api/ext/send \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "explain the main.go file", "mode": "chat"}' | jq .
+```
+
+**Agent mode example with auto-apply ON** (equivalent to pressing **⚡ Agent** with 🔒 Auto On):
+
+```bash
+curl -s -X POST http://localhost:5050/api/ext/send \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "add error handling to all functions in utils.go", "mode": "agent", "auto": true}' | jq .
+```
+
+**Agent mode example with auto-apply OFF** (proposes diffs, no writes):
+
+```bash
+curl -s -X POST http://localhost:5050/api/ext/send \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "refactor main.go", "mode": "agent", "auto": false}' | jq .
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "message": {
+    "role": "assistant",
+    "content": "...",
+    "timestamp": "2026-03-17T12:00:00Z"
+  },
+  "agentResults": [
+    { "file": "main.go", "changed": true, "oldContent": "...", "newContent": "..." }
+  ]
+}
+```
+
+> `agentResults` is only present in agent mode responses.

@@ -62,6 +62,12 @@ func (f *Filter) ShouldInclude(path string, info interface{}) bool {
 	}
 	relPath = filepath.ToSlash(relPath)
 
+	// Keep critical workspace control files visible in the UI even if
+	// .gitignore/allow rules would otherwise hide them.
+	if f.isAlwaysVisibleFile(relPath) {
+		return !f.isSensitiveFile(relPath)
+	}
+
 	// Determine if it's a directory (assumed false for files)
 	isDir := false
 
@@ -82,7 +88,17 @@ func (f *Filter) ShouldInclude(path string, info interface{}) bool {
 			// Check if file extension is in allow patterns
 			ext := filepath.Ext(relPath)
 			if ext == "" {
-				return false
+				// Dotfiles (e.g. .gitignore, .dockerignore, .editorconfig) have
+				// no extension in Go's filepath.Ext but are valid config files.
+				// Let them pass through to the sensitive-file check rather than
+				// hard-blocking them.
+				baseName := filepath.Base(relPath)
+				if !strings.HasPrefix(baseName, ".") {
+					// Truly extensionless non-dotfile (e.g. a binary) — exclude.
+					return false
+				}
+				// Dotfile: fall through to the sensitive-file check below.
+				return !f.isSensitiveFile(relPath)
 			}
 
 			extPattern := "*" + ext
@@ -106,6 +122,16 @@ func (f *Filter) ShouldInclude(path string, info interface{}) bool {
 	}
 
 	return true
+}
+
+func (f *Filter) isAlwaysVisibleFile(path string) bool {
+	baseName := strings.ToLower(filepath.Base(path))
+	switch baseName {
+	case ".gitignore", "docker-compose.yml", "docker-compose.yaml":
+		return true
+	default:
+		return false
+	}
 }
 
 // isSensitiveFile checks if a file appears to contain sensitive data
