@@ -37,21 +37,23 @@ type AgentLogEntry struct {
 
 // Server represents the web UI server
 type Server struct {
-	directory   string
-	model       string
-	endpoint    string
-	indexTmpl   *template.Template
-	scanResult  *types.ScanResult
-	focusedPath string
-	cfg         *config.Config
-	llmClient   *llm.OllamaClient
-	messages    []Message
-	agentLog    []AgentLogEntry    // structured changelog injected into agent prompts
-	taskCancel  context.CancelFunc // cancels the current in-flight LLM request (Stop button)
-	taskToken   *struct{}          // unique identity token to avoid cross-task cancel races
-	taskRunning bool               // true while chat/agent work is executing
-	taskKind    string             // "chat" | "agent"
-	mu          sync.RWMutex
+	directory    string
+	model        string
+	endpoint     string
+	indexTmpl    *template.Template
+	scanResult   *types.ScanResult
+	focusedPath  string
+	cfg          *config.Config
+	llmClient    *llm.OllamaClient
+	messages     []Message
+	agentLog     []AgentLogEntry     // structured changelog injected into agent prompts
+	taskCancel   context.CancelFunc  // cancels the current in-flight LLM request (Stop button)
+	taskToken    *struct{}           // unique identity token to avoid cross-task cancel races
+	taskRunning  bool                // true while chat/agent work is executing
+	taskKind     string              // "chat" | "agent"
+	scanFilter   *filter.Filter      // filter snapshot from startup; reused by rescan so agent-created files (e.g. .gitignore) don't hide themselves
+	writtenFiles map[string]struct{} // rel paths written via /api/file/write; always shown on rescan
+	mu           sync.RWMutex
 }
 
 // Message represents a chat message
@@ -59,6 +61,7 @@ type Message struct {
 	Role         string            `json:"role"`
 	Content      string            `json:"content"`
 	Timestamp    time.Time         `json:"timestamp"`
+	DurationMs   int64             `json:"duration_ms,omitempty"`
 	AgentResults []AgentFileResult `json:"agentResults,omitempty"`
 }
 
@@ -89,15 +92,23 @@ type StatusResponse struct {
 // NewServer creates a new web UI server
 func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, cfg *config.Config, llmClient *llm.OllamaClient, focusedPath string) *Server {
 	s := &Server{
-		directory:   directory,
-		model:       model,
-		endpoint:    endpoint,
-		indexTmpl:   template.Must(template.New("index").Parse(htmlTemplate)),
-		scanResult:  scanResult,
-		focusedPath: focusedPath,
-		cfg:         cfg,
-		llmClient:   llmClient,
-		messages:    make([]Message, 0),
+		directory:    directory,
+		model:        model,
+		endpoint:     endpoint,
+		indexTmpl:    template.Must(template.New("index").Parse(htmlTemplate)),
+		scanResult:   scanResult,
+		focusedPath:  focusedPath,
+		cfg:          cfg,
+		llmClient:    llmClient,
+		messages:     make([]Message, 0),
+		writtenFiles: make(map[string]struct{}),
+	}
+
+	// Capture the filter state at startup. Re-using this on every rescan
+	// ensures that a .gitignore written by the agent during the session does
+	// not retroactively hide other files it just created.
+	if f, err := filter.NewFilter(cfg, directory); err == nil {
+		s.scanFilter = f
 	}
 
 	s.messages = append(s.messages, Message{
@@ -133,6 +144,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/agent/run", s.handleAgentRun)
 	mux.HandleFunc("/api/agent/stream", s.handleAgentStream)
 	mux.HandleFunc("/api/agent/commit", s.handleAgentCommit)
+	mux.HandleFunc("/api/ext/send", s.handleExtSend)
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("🌐 Web UI available at http://localhost%s\n", addr)
@@ -277,9 +289,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg := Message{
-		Role:      "assistant",
-		Content:   answer,
-		Timestamp: time.Now(),
+		Role:       "assistant",
+		Content:    answer,
+		Timestamp:  time.Now(),
+		DurationMs: duration.Milliseconds(),
 	}
 
 	s.mu.Lock()
@@ -487,7 +500,44 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 		}
 	}
 
-	// 2) Prefer dominant source extension among code files (e.g. .py in a
+	// 2) Technology mismatch check: if the task explicitly requests a language
+	// or framework that is NOT present in the workspace, return nil so the
+	// caller routes to runAgentCreate rather than overwriting unrelated files.
+	techMap := map[string][]string{
+		".ts":    {"typescript", " ts ", ".ts "},
+		".tsx":   {"react", ".tsx"},
+		".vue":   {"vue"},
+		".js":    {"javascript", " js ", ".js ", "nodejs", "node.js"},
+		".py":    {"python", ".py "},
+		".rs":    {"rust", ".rs "},
+		".rb":    {"ruby", ".rb "},
+		".java":  {"java "},
+		".kt":    {"kotlin"},
+		".cs":    {"c# ", "csharp", ".net"},
+		".swift": {"swift"},
+		".php":   {"php"},
+	}
+	// Collect extensions present in the workspace.
+	workspaceExts := map[string]bool{}
+	for _, f := range all {
+		if f == nil {
+			continue
+		}
+		workspaceExts[strings.ToLower(filepath.Ext(f.RelPath))] = true
+	}
+	for ext, keywords := range techMap {
+		for _, kw := range keywords {
+			if strings.Contains(lower, kw) {
+				// Task mentions this technology; if the workspace has none of
+				// these files, signal that new files must be created.
+				if !workspaceExts[ext] {
+					return nil
+				}
+			}
+		}
+	}
+
+	// 3) Prefer dominant source extension among code files (e.g. .py in a
 	// generated Python app), capped to a small set.
 	codeExts := map[string]bool{
 		".py": true, ".go": true, ".js": true, ".ts": true, ".tsx": true,
@@ -659,9 +709,23 @@ func (s *Server) saveSession(question, answer string, resp *llm.ChatResponse, du
 func (s *Server) performRescan() (*types.ScanResult, error) {
 	startTime := time.Now()
 
-	f, err := filter.NewFilter(s.cfg, s.directory)
-	if err != nil {
-		return nil, err
+	// Reuse the filter that was built at startup so that files created by
+	// the agent during this session (e.g. .gitignore) do not accidentally
+	// hide other agent-created files on subsequent rescans.
+	s.mu.RLock()
+	f := s.scanFilter
+	writtenFiles := make(map[string]struct{}, len(s.writtenFiles))
+	for relPath := range s.writtenFiles {
+		writtenFiles[relPath] = struct{}{}
+	}
+	s.mu.RUnlock()
+	if f == nil {
+		// Fallback: build a fresh filter if the startup one is unavailable.
+		var err error
+		f, err = filter.NewFilter(s.cfg, s.directory)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	analyzerEngine := analyzer.NewAnalyzer(s.cfg)
@@ -674,7 +738,7 @@ func (s *Server) performRescan() (*types.ScanResult, error) {
 	}
 
 	// Simple file walker
-	err = filepath.Walk(s.directory, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(s.directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Skip errors
 		}
@@ -683,9 +747,18 @@ func (s *Server) performRescan() (*types.ScanResult, error) {
 			return nil
 		}
 
+		relPath, relErr := filepath.Rel(s.directory, path)
+		if relErr != nil {
+			relPath = path
+		}
+		relPath = filepath.ToSlash(filepath.Clean(relPath))
+
 		// Check if file should be included
 		if !f.ShouldInclude(path, info) {
-			return nil
+			if _, keep := writtenFiles[relPath]; !keep {
+				result.FilteredFiles++
+				return nil
+			}
 		}
 
 		// Analyze file
@@ -716,6 +789,13 @@ func (s *Server) performRescan() (*types.ScanResult, error) {
 	return result, nil
 }
 
+func (s *Server) markWrittenFile(relPath string) {
+	cleanRel := filepath.ToSlash(filepath.Clean(relPath))
+	s.mu.Lock()
+	s.writtenFiles[cleanRel] = struct{}{}
+	s.mu.Unlock()
+}
+
 func sendError(w http.ResponseWriter, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
@@ -730,6 +810,21 @@ func sendError(w http.ResponseWriter, message string) {
 // AgentRunRequest is the JSON body for POST /api/agent/run.
 type AgentRunRequest struct {
 	Task string `json:"task"`
+}
+
+// ExtSendRequest is the JSON body for POST /api/ext/send.
+// It allows external apps to send messages or agent tasks directly without
+// going through the web UI chat box.
+//
+// Fields:
+//
+//	Message – the prompt / task text (required)
+//	Mode    – "chat" (default) or "agent"
+//	Auto    – for agent mode: write files immediately (default true)
+type ExtSendRequest struct {
+	Message string `json:"message"`
+	Mode    string `json:"mode"` // "chat" | "agent"
+	Auto    *bool  `json:"auto"` // nil → true for agent, ignored for chat
 }
 
 // AgentFileResult describes what the agent did with one file.
@@ -847,6 +942,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		cancel()
 	}()
 
+	agentStart := time.Now()
 	summary, results, err := s.runAgentTask(taskCtx, task, func(string) {}, dryRun)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -868,7 +964,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), AgentResults: results}
+	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
 	s.mu.Unlock()
@@ -986,6 +1082,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		cancel()
 	}()
 
+	streamAgentStart := time.Now()
 	summary, results, err := s.runAgentTask(taskCtx, task, progress, dryRun)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1008,7 +1105,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), AgentResults: results}
+	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(streamAgentStart).Milliseconds(), AgentResults: results}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
 	s.mu.Unlock()
@@ -1091,27 +1188,29 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 			results = append(results, commitResult{File: f.Path, Success: false, Error: err.Error()})
 			continue
 		}
+
+		// Determine operation from on-disk state BEFORE writing.
+		_, statErr := os.Stat(absPath)
+		existedBefore := statErr == nil
+		if statErr != nil && !os.IsNotExist(statErr) {
+			results = append(results, commitResult{File: f.Path, Success: false, Error: statErr.Error()})
+			continue
+		}
+
 		if err := os.WriteFile(absPath, []byte(f.Content), 0o644); err != nil {
 			results = append(results, commitResult{File: f.Path, Success: false, Error: err.Error()})
 			continue
 		}
+		s.markWrittenFile(f.Path)
 		anyWritten = true
 		results = append(results, commitResult{File: f.Path, Success: true})
 		// Record in agent changelog so future agent runs know about this file.
 		// The commit endpoint doesn't have access to the original task string,
 		// so we mark it generically; the file and operation are what matter.
 		s.mu.Lock()
-		op := "modified"
-		if _, statErr := os.Stat(absPath); statErr == nil {
-			// File now exists on disk (we just wrote it); if it didn't before
-			// the Content would have created it — use a heuristic: check if
-			// any existing agentLog entry already references this path.
-			for _, e := range s.agentLog {
-				if e.File == f.Path && e.Operation == "created" {
-					op = "created"
-					break
-				}
-			}
+		op := "created"
+		if existedBefore {
+			op = "modified"
 		}
 		s.agentLog = append(s.agentLog, AgentLogEntry{Operation: op, File: f.Path, Task: "(confirmed via Apply)"})
 		s.mu.Unlock()
@@ -1152,9 +1251,186 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleExtSend is the external API endpoint POST /api/ext/send.
+// It lets any application send a prompt directly to the local model without
+// using the browser chat UI.  The message (and the model's reply) are stored
+// in s.messages so they appear in the chat panel on the next poll / refresh.
+//
+// Request body (JSON):
+//
+//	{
+//	  "message": "...",   // required – the user prompt or agent task
+//	  "mode":    "chat",  // optional – "chat" (default) | "agent"
+//	  "auto":    true     // optional – agent only; write files immediately (default true)
+//	}
+//
+// Response body (JSON):
+//
+//	{
+//	  "success":      true,
+//	  "message":      { role, content, timestamp },
+//	  "agentResults": [...]    // only present for agent mode
+//	  "error":        "..."    // only present on failure
+//	}
+func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ExtSendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "invalid request body"})
+		return
+	}
+
+	text := strings.TrimSpace(req.Message)
+	if text == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "message is required"})
+		return
+	}
+
+	// Normalise mode; default to "chat".
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "chat"
+	}
+	if mode != "chat" && mode != "agent" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "mode must be \"chat\" or \"agent\""})
+		return
+	}
+
+	// Store the user message so it shows up in the chat UI immediately.
+	s.mu.Lock()
+	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	s.mu.Unlock()
+
+	// Handle built-in commands (clear, stats, …) regardless of mode.
+	if response := s.handleCommand(text); response != "" {
+		if response == "__CLEAR__" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "cleared": true})
+			return
+		}
+		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
+		return
+	}
+
+	// Acquire a task slot (cancels any previous stale task).
+	taskCtx, cancel := context.WithCancel(context.Background())
+	taskToken := new(struct{})
+	s.mu.Lock()
+	if s.taskCancel != nil {
+		s.taskCancel()
+	}
+	s.taskCancel = cancel
+	s.taskToken = taskToken
+	s.taskRunning = true
+	s.taskKind = mode
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.taskToken == taskToken {
+			s.taskCancel = nil
+			s.taskToken = nil
+			s.taskRunning = false
+			s.taskKind = ""
+		}
+		s.mu.Unlock()
+		cancel()
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch mode {
+	case "agent":
+		// Default auto=true for external API calls (caller wants changes applied).
+		autoApply := true
+		if req.Auto != nil {
+			autoApply = *req.Auto
+		}
+		dryRun := !autoApply
+
+		extAgentStart := time.Now()
+		summary, results, err := s.runAgentTask(taskCtx, text, func(string) {}, dryRun)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
+
+		if !dryRun {
+			for _, res := range results {
+				if res.Changed {
+					if scanned, scanErr := s.performRescan(); scanErr == nil {
+						s.mu.Lock()
+						s.scanResult = scanned
+						s.mu.Unlock()
+					}
+					break
+				}
+			}
+		}
+
+		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(extAgentStart).Milliseconds(), AgentResults: results}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"message":      msg,
+			"agentResults": results,
+		})
+
+	default: // "chat"
+		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
+		_, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+			return
+		}
+
+		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds()}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
+	}
+}
+
 // agentFilenameRe matches a token that looks like a real filename: word chars,
-// hyphens, dots, at least one dot with a non-empty extension, no spaces.
-var agentFilenameRe = regexp.MustCompile(`[\w\-][\w\-\.]*\.\w+`)
+// hyphens, dots, at least one dot with an extension of 2+ chars, no spaces.
+// Requires a 2-char minimum extension to avoid matching abbreviations like "e.g".
+var agentFilenameRe = regexp.MustCompile(`[\w\-][\w\-\.]*\.\w{2,}`)
+
+// agentAbbreviationRe catches common prose abbreviations that superficially
+// look like filenames but are not (e.g → e.g, i.e → i.e, vs → v.s…).
+var knownNonFilenames = map[string]bool{
+	"e.g": true, "i.e": true, "etc": true, "vs": true,
+	"fig": true, "ref": true, "no": true, "op": true,
+}
 
 // agentSanitizeFilename strips common LLM response formatting artifacts from
 // a filename string. Models frequently add numbered-list prefixes, markdown
@@ -1223,6 +1499,18 @@ func agentImpliedExtension(task string) string {
 		{".css", ".css"}, {"css file", ".css"},
 		{".env", ".env"}, {"env file", ".env"},
 		{".dockerfile", ""}, {"dockerfile", ""},
+		// TypeScript / JavaScript families
+		{"typescript", ".ts"}, {".ts ", ".ts"}, {".tsx", ".tsx"},
+		{"react", ".tsx"}, {"vue", ".vue"}, {"angular", ".ts"},
+		{"javascript", ".js"}, {".js ", ".js"}, {"node", ".js"},
+		// Python
+		{"python", ".py"}, {".py ", ".py"},
+		// Go
+		{"golang", ".go"}, {" go app", ".go"}, {" go server", ".go"},
+		// Rust / Java / other common languages
+		{"rust", ".rs"}, {"java ", ".java"}, {"kotlin", ".kt"},
+		{"c# ", ".cs"}, {"csharp", ".cs"}, {".net", ".cs"},
+		{"ruby", ".rb"}, {"php", ".php"}, {"swift", ".swift"},
 	}
 	for _, p := range pairs {
 		if strings.Contains(lower, p[0]) {
@@ -1310,6 +1598,14 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	// Scope to files mentioned in the task; fall back to all files.
 	allFiles := s.getActiveFilesSnapshot()
 	targetFiles := s.scopeFilesToQuestion(task, allFiles)
+
+	// nil means a technology mismatch was detected: the task requests a
+	// language/framework absent from the workspace — route directly to create.
+	if targetFiles == nil {
+		progress("🔍 Technology mismatch detected — routing to file creation…")
+		return s.runAgentCreate(ctx, task, allFiles, progress, true)
+	}
+
 	progress(fmt.Sprintf("Scoping: %d file(s) in range…", len(targetFiles)))
 
 	// ── Detect "delete file" intent ─────────────────────────────────────────
@@ -1642,6 +1938,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: err.Error()}}
 					return
 				}
+				s.markWrittenFile(f.RelPath)
 				progress(fmt.Sprintf("✅ %s — modified", f.RelPath))
 				s.mu.Lock()
 				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: f.RelPath, Task: task})
@@ -1759,14 +2056,30 @@ func parseAgentCreateResponse(raw string) []agentFileBlock {
 
 // agentExplicitFilenameFromTask returns a single explicitly mentioned filename
 // from the task, e.g. "README.md" in "prepare README.md ...".
+// It is intentionally conservative: long or multi-sentence tasks are
+// treated as multi-file creation requests so they go through runAgentPlan.
 // If none is clearly present, it returns "".
 func agentExplicitFilenameFromTask(task string) string {
+	// Long tasks describe multi-file projects — don't try to extract a single
+	// filename from prose ("e.g., React, Vue..." would otherwise match "e.g").
+	if len(task) > 200 {
+		return ""
+	}
 	match := agentFilenameRe.FindString(task)
 	if match == "" {
 		return ""
 	}
 	name := agentSanitizeFilename(match)
-	if name == "" || strings.Contains(name, " ") || filepath.Ext(name) == "" {
+	ext := filepath.Ext(name)
+	if name == "" || strings.Contains(name, " ") || ext == "" {
+		return ""
+	}
+	// Require at least a 2-character extension (e.g. ".go", not ".g").
+	if len(ext) < 3 {
+		return ""
+	}
+	// Block known prose abbreviations that match the filename pattern.
+	if knownNonFilenames[strings.ToLower(name)] {
 		return ""
 	}
 	return name
@@ -1819,8 +2132,13 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 		if name == "" || strings.Contains(name, " ") {
 			continue
 		}
-		// Must have an extension to be a real filename
-		if filepath.Ext(name) == "" {
+		ext := filepath.Ext(name)
+		// Must have an extension of at least 2 chars (e.g. ".go", not ".g")
+		// to reject abbreviations like "e.g" that the LLM may echo from the prompt.
+		if len(ext) < 3 {
+			continue
+		}
+		if knownNonFilenames[strings.ToLower(name)] {
 			continue
 		}
 		if !seen[name] {
@@ -1929,7 +2247,10 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 
 			// Sanitize and validate the filename.
 			fileName = agentSanitizeFilename(fileName)
-			if !strings.Contains(task, "/") && !strings.Contains(task, "\\") {
+			// Only strip to basename when the filename itself has no directory
+			// component. If the LLM proposes "src/game.ts" we preserve the
+			// subdirectory; if it proposes just "game.ts" we keep it as-is.
+			if !strings.ContainsAny(fileName, "/\\") {
 				fileName = filepath.Base(fileName)
 			}
 			if filepath.Ext(fileName) == "" {
@@ -1954,6 +2275,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				if err := os.WriteFile(absPath, []byte(fileContent), 0o644); err != nil {
 					return "", nil, fmt.Errorf("failed to write %s: %w", relSlash, err)
 				}
+				s.markWrittenFile(relSlash)
 				progress(fmt.Sprintf("✨ %s — created", relSlash))
 				s.mu.Lock()
 				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "created", File: relSlash, Task: task})
@@ -2021,7 +2343,9 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		for _, blk := range blocks {
 			fileName := blk.name
 			fileContent := blk.content
-			if !strings.Contains(task, "/") && !strings.Contains(task, "\\") {
+			// Preserve subdirectory components the LLM proposes (e.g. src/game.ts);
+			// only strip to basename when there is no directory separator.
+			if !strings.ContainsAny(fileName, "/\\") {
 				fileName = filepath.Base(fileName)
 			}
 			fileName = agentSanitizeFilename(fileName)
@@ -2044,6 +2368,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				if err := os.WriteFile(absPath, []byte(fileContent), 0o644); err != nil {
 					return "", nil, fmt.Errorf("failed to write %s: %w", relSlash, err)
 				}
+				s.markWrittenFile(relSlash)
 				progress(fmt.Sprintf("✨ %s — created", relSlash))
 				s.mu.Lock()
 				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "created", File: relSlash, Task: task})
@@ -2240,6 +2565,7 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 
 	// Append a confirmation message into the chat history.
 	s.mu.Lock()
+	s.writtenFiles[filepath.ToSlash(filepath.Clean(req.Path))] = struct{}{}
 	msg := Message{
 		Role:      "assistant",
 		Content:   fmt.Sprintf("✅ Applied changes to **%s**", req.Path),

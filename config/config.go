@@ -135,6 +135,15 @@ func DefaultConfig() *Config {
 				"*.dockerfile",
 				"*.conf",
 				"*.service",
+				// Common dotfiles (no extension — need explicit names)
+				".gitignore",
+				".dockerignore",
+				".editorconfig",
+				".eslintrc",
+				".prettierrc",
+				".babelrc",
+				".nvmrc",
+				".node-version",
 			},
 		},
 		Security: SecurityConfig{

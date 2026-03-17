@@ -12,7 +12,7 @@ import (
 	"github.com/michalswi/local-agent-on-steroids/types"
 )
 
-const sessionDir = "/tmp/local-agent"
+const sessionDir = "/tmp/local-agent-on-steroids"
 
 type ScanSummary struct {
 	TotalFiles    int           `json:"total_files"`
