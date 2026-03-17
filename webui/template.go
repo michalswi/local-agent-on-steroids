@@ -197,6 +197,12 @@ const htmlTemplate = `<!DOCTYPE html>
             font-size: 0.88rem; height: 40px; transition: opacity 0.15s; white-space: nowrap;
         }
         .btn-help:hover { opacity: 0.85; }
+        .btn-auto {
+            padding: 0.65rem 1.1rem; background: #f59e0b; color: #fff;
+            border: none; border-radius: 8px; cursor: pointer; font-weight: 600;
+            font-size: 0.88rem; height: 40px; transition: opacity 0.15s; white-space: nowrap;
+        }
+        .btn-auto:hover { opacity: 0.85; }
         .input-hint { font-size: 0.73rem; color: var(--text2); margin-top: 0.35rem; }
         .input-hint code { background: var(--bg3); padding: 0.1rem 0.3rem; border-radius: 3px; color: var(--accent); font-size: 0.9em; }
         /* Typing indicator */
@@ -323,9 +329,10 @@ const htmlTemplate = `<!DOCTYPE html>
                         <textarea class="msg-input" id="msgInput" rows="2" placeholder="Describe a task and press Enter to run Agent, or Shift+Enter for a new line…"></textarea>
                         <button class="btn-agent" id="agentBtn" title="Agent mode: reviews all files then applies changes autonomously">⚡ Agent</button>
                         <button class="send-btn" id="sendBtn">Send</button>
+                        <button class="btn-help" id="clearBtn" title="Clear conversation history">Clear</button>
                         <button class="stop-btn hidden" id="stopBtn">⏹ Stop</button>
                         <button class="btn-help" id="helpBtn" onclick="openHelpModal()">Help</button>
-                        <button class="btn-help" id="autoApplyBtn" title="Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).">🔒 Auto</button>
+                        <button class="btn-auto" id="autoApplyBtn" title="Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).">🔒 Auto</button>
                     </div>
                     <div class="input-hint">💡 <code>Enter</code> = ⚡ Agent &nbsp;•&nbsp; <code>Shift+Enter</code> = new line &nbsp;•&nbsp; <code>Send</code> = chat only</div>
                 </div>
@@ -403,8 +410,9 @@ var currentFile    = null;    // relPath of open file
 // autoApply: when false (default) chat code blocks are never
 // written automatically — the user must click ⚡ Apply explicitly.
 var autoApply      = false;
-var agentPendingStore = {};   // cardId -> {file, oldContent, newContent}
+var agentPendingStore = {};   // cardId -> {file, oldContent, newContent, deleted}
 var agentBulkGroups   = {};   // barId  -> [cardId, ...]
+var agentRevertStore  = {};   // revertId -> {file, oldContent}
 var origContent    = null;    // content when file was loaded
 var pendingApply   = null;    // {file, code} waiting for confirm
 var serverProcessing = false; // server reports an in-flight chat/agent task
@@ -443,12 +451,14 @@ function syncBusyUI() {
     var busy = !!window._activeAbortController || serverProcessing;
     var inp = document.getElementById('msgInput');
     var sendBtn = document.getElementById('sendBtn');
+    var clearBtn = document.getElementById('clearBtn');
     var agentBtn = document.getElementById('agentBtn');
     var stopBtn = document.getElementById('stopBtn');
-    if (!inp || !sendBtn || !agentBtn || !stopBtn) return;
+    if (!inp || !sendBtn || !clearBtn || !agentBtn || !stopBtn) return;
 
     inp.disabled = busy;
     sendBtn.disabled = busy;
+    clearBtn.disabled = busy;
     agentBtn.disabled = busy;
     if (busy) {
         stopBtn.classList.remove('hidden');
@@ -473,6 +483,7 @@ applyTheme();
 loadSettings();
 
 document.getElementById('sendBtn').addEventListener('click', sendMsg);
+document.getElementById('clearBtn').addEventListener('click', clearChatHistory);
 document.getElementById('agentBtn').addEventListener('click', sendAgentTask);
 document.getElementById('stopBtn').addEventListener('click', function() {
     // Cancel server-side LLM request first, then abort the browser fetch.
@@ -742,6 +753,22 @@ function sendMsg() {
     });
 }
 
+function clearChatHistory() {
+    if (serverProcessing || window._activeAbortController) return;
+    fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'clear' })
+    }).then(function(r){ return r.json(); }).then(function(d) {
+        if (d && d.cleared) {
+            var c = document.getElementById('messages');
+            if (c) c.innerHTML = '';
+            _lastMsgCount = 0;
+        }
+        loadStatus();
+    }).catch(function(){});
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Agent mode
 // ═══════════════════════════════════════════════════════════════
@@ -869,6 +896,24 @@ function renderAgentResults(results, container) {
             inner += '❌ <code style="color:var(--red)">' + esc(r.file) + '</code> — ' + esc(r.error);
         } else if (!r.changed) {
             inner += '<span style="color:var(--text2)">— <code>' + esc(r.file) + '</code> — no change needed</span>';
+        } else if (r.deleted) {
+            var diffHtml = buildDiffHtml(r.oldContent || '', '');
+            var uid = 'idiff_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+            inner += '🗑️ Deleted <code style="color:var(--red)">' + esc(r.file) + '</code>' +
+                '<div class="inline-diff" style="margin-top:0.45rem;">' +
+                    '<div class="inline-diff-hdr" onclick="toggleDiff(\'' + uid + '\')">' +
+                        '<span class="inline-diff-title">📄 ' + esc(r.file) + '</span>' +
+                        '<span class="inline-diff-toggle" id="tog_' + uid + '">▼ show diff</span>' +
+                    '</div>' +
+                    '<pre class="diff-pre inline-diff-body hidden" id="' + uid + '">' + diffHtml + '</pre>' +
+                '</div>';
+            if (r.oldContent) {
+                var revId = 'rev_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+                agentRevertStore[revId] = { file: r.file, oldContent: r.oldContent };
+                inner += '<div style="margin-top:0.45rem;">' +
+                    '<button class="btn-deny" onclick="agentRevertApplied(\'' + revId + '\')" title="Restore this file">↩ Restore</button>' +
+                    '</div>';
+            }
         } else {
             var icon  = r.created ? '✨ Created' : '✅ Modified';
             var color = r.created ? 'var(--accent2)' : 'var(--accent)';
@@ -882,7 +927,13 @@ function renderAgentResults(results, container) {
                     '</div>' +
                     '<pre class="diff-pre inline-diff-body hidden" id="' + uid + '">' + diffHtml + '</pre>' +
                 '</div>';
-
+            if (!r.created && r.oldContent) {
+                var revId = 'rev_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+                agentRevertStore[revId] = { file: r.file, oldContent: r.oldContent };
+                inner += '<div style="margin-top:0.45rem;">' +
+                    '<button class="btn-deny" onclick="agentRevertApplied(\'' + revId + '\')" title="Undo this change">↩ Revert</button>' +
+                    '</div>';
+            }
             // If this file is open in the viewer, refresh it with diff highlights.
             if (currentFile === r.file) {
                 origContent = r.newContent;
@@ -922,6 +973,32 @@ function renderAgentPendingResults(results, container) {
             inner = '<div class="bubble" style="padding:0.6rem 0.85rem;font-size:0.82rem;">' +
                 '<span style="color:var(--text2)">\u2014 <code>' + esc(r.file) + '</code> \u2014 no change needed</span>' +
                 '</div>';
+        } else if (r.deleted) {
+            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: '', deleted: true };
+            pendingCardIds.push(cardId);
+            var diffHtml = buildDiffHtml(r.oldContent||'', '');
+            var uid2 = 'idiff_p_' + Date.now() + '_' + i;
+            inner =
+                '<div class="bubble" style="padding:0.6rem 0.85rem;font-size:0.82rem;">' +
+                '\ud83d\uddd1\ufe0f Delete proposed <code style="color:var(--red)">' + esc(r.file) + '</code>' +
+                '<div style="margin-top:0.4rem;display:flex;align-items:center;gap:0.4rem;">' +
+                    '<input type="checkbox" id="selChk_' + cardId + '" checked>' +
+                    '<label for="selChk_' + cardId + '" style="color:var(--text2);font-size:0.8rem;cursor:pointer;">Select</label>' +
+                '</div>' +
+                '<div class="inline-diff" style="margin-top:0.45rem;">' +
+                    '<div class="inline-diff-hdr" onclick="toggleDiff(\'' + uid2 + '\')">' +
+                        '<span class="inline-diff-title">\ud83d\udcc4 ' + esc(r.file) + '</span>' +
+                        '<span class="inline-diff-toggle" id="tog_' + uid2 + '">\u25bc show diff</span>' +
+                    '</div>' +
+                    '<pre class="diff-pre inline-diff-body hidden" id="' + uid2 + '">' + diffHtml + '</pre>' +
+                '</div>' +
+                '<div style="display:flex;gap:0.5rem;margin-top:0.55rem;">' +
+                    '<button class="btn-apply" id="applyBtn_' + cardId + '" onclick="agentApplyFile(\'' + cardId + '\')" style="background:var(--red);">' +
+                        '\ud83d\uddd1\ufe0f Confirm Delete</button>' +
+                    '<button class="btn-deny"  id="denyBtn_'  + cardId + '" onclick="agentDenyFile(\'' + cardId  + '\')">' +
+                        '\ud83d\udeab Deny</button>' +
+                '</div>' +
+                '</div>';
         } else {
             agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: r.newContent||'' };
             pendingCardIds.push(cardId);
@@ -932,6 +1009,10 @@ function renderAgentPendingResults(results, container) {
             inner =
                 '<div class="bubble" style="padding:0.6rem 0.85rem;font-size:0.82rem;">' +
                 icon + ' <code style="color:' + color + '">' + esc(r.file) + '</code>' +
+                '<div style="margin-top:0.4rem;display:flex;align-items:center;gap:0.4rem;">' +
+                    '<input type="checkbox" id="selChk_' + cardId + '" checked>' +
+                    '<label for="selChk_' + cardId + '" style="color:var(--text2);font-size:0.8rem;cursor:pointer;">Select</label>' +
+                '</div>' +
                 '<div class="inline-diff" style="margin-top:0.45rem;">' +
                     '<div class="inline-diff-hdr" onclick="toggleDiff(\'' + uid2 + '\')">' +
                         '<span class="inline-diff-title">\ud83d\udcc4 ' + esc(r.file) + '</span>' +
@@ -961,6 +1042,7 @@ function renderAgentPendingResults(results, container) {
             '<div class="bubble" style="padding:0.5rem 0.85rem;font-size:0.82rem;' +
             'display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">' +
             '<span style="color:var(--text2)">' + pendingCardIds.length + ' proposed change(s) \u2014 review and confirm:</span>' +
+            '<button class="btn-green" onclick="agentApplySelected(\'' + barId + '\')" id="applySelBtn_' + barId + '">✅ Apply Selected</button>' +
             '<button class="btn-green" onclick="agentApplyAll(\'' + barId + '\')" id="applyAllBtn_' + barId + '">\u2705 Apply All</button>' +
             '<button class="btn-grey"  onclick="agentDenyAll(\''  + barId + '\')" id="denyAllBtn_'  + barId + '">\ud83d\udeab Deny All</button>' +
             '</div>';
@@ -986,33 +1068,50 @@ function agentApplyFile(cardId) {
     if (applyBtn) { applyBtn.disabled = true; applyBtn.textContent = '\u23f3'; }
     if (denyBtn)  { denyBtn.disabled  = true; }
 
+    var commitBody = pending.deleted
+        ? JSON.stringify({ files: [{ path: pending.file, delete: true }] })
+        : JSON.stringify({ files: [{ path: pending.file, content: pending.newContent }] });
     fetch('/api/agent/commit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ files: [{ path: pending.file, content: pending.newContent }] })
+        body: commitBody
     }).then(function(r){ return r.json(); }).then(function(d) {
         var res = d.results && d.results[0];
         var el  = document.getElementById(cardId);
         if (!el) return;
         if (res && res.success) {
-            var diffHtml = buildDiffHtml(pending.oldContent, pending.newContent);
             var uid3 = 'idiff_c_' + Date.now();
-            var icon  = pending.oldContent ? '\u2705 Applied' : '\u2705 Created';
-            var color = pending.oldContent ? 'var(--accent)' : 'var(--accent2)';
-            el.innerHTML =
-                '<div class="bubble" style="padding:0.6rem 0.85rem;font-size:0.82rem;">' +
-                icon + ' <code style="color:' + color + '">' + esc(pending.file) + '</code>' +
-                '<div class="inline-diff" style="margin-top:0.45rem;">' +
-                    '<div class="inline-diff-hdr" onclick="toggleDiff(\'' + uid3 + '\')">' +
-                        '<span class="inline-diff-title">\ud83d\udcc4 ' + esc(pending.file) + '</span>' +
-                        '<span class="inline-diff-toggle" id="tog_' + uid3 + '">\u25bc show diff</span>' +
-                    '</div>' +
-                    '<pre class="diff-pre inline-diff-body hidden" id="' + uid3 + '">' + diffHtml + '</pre>' +
-                '</div></div>';
-            if (currentFile === pending.file) {
-                origContent = pending.newContent;
-                renderFileContent(pending.newContent, pending.file);
-                showFileDiff(pending.oldContent, pending.newContent, pending.file);
+            if (pending.deleted) {
+                var diffHtml = buildDiffHtml(pending.oldContent, '');
+                el.innerHTML =
+                    '<div class="bubble" style="padding:0.6rem 0.85rem;font-size:0.82rem;">' +
+                    '\ud83d\uddd1\ufe0f Deleted <code style="color:var(--red)">' + esc(pending.file) + '</code>' +
+                    '<div class="inline-diff" style="margin-top:0.45rem;">' +
+                        '<div class="inline-diff-hdr" onclick="toggleDiff(\'' + uid3 + '\')">' +
+                            '<span class="inline-diff-title">\ud83d\udcc4 ' + esc(pending.file) + '</span>' +
+                            '<span class="inline-diff-toggle" id="tog_' + uid3 + '">\u25bc show diff</span>' +
+                        '</div>' +
+                        '<pre class="diff-pre inline-diff-body hidden" id="' + uid3 + '">' + diffHtml + '</pre>' +
+                    '</div></div>';
+            } else {
+                var diffHtml = buildDiffHtml(pending.oldContent, pending.newContent);
+                var icon  = pending.oldContent ? '\u2705 Applied' : '\u2705 Created';
+                var color = pending.oldContent ? 'var(--accent)' : 'var(--accent2)';
+                el.innerHTML =
+                    '<div class="bubble" style="padding:0.6rem 0.85rem;font-size:0.82rem;">' +
+                    icon + ' <code style="color:' + color + '">' + esc(pending.file) + '</code>' +
+                    '<div class="inline-diff" style="margin-top:0.45rem;">' +
+                        '<div class="inline-diff-hdr" onclick="toggleDiff(\'' + uid3 + '\')">' +
+                            '<span class="inline-diff-title">\ud83d\udcc4 ' + esc(pending.file) + '</span>' +
+                            '<span class="inline-diff-toggle" id="tog_' + uid3 + '">\u25bc show diff</span>' +
+                        '</div>' +
+                        '<pre class="diff-pre inline-diff-body hidden" id="' + uid3 + '">' + diffHtml + '</pre>' +
+                    '</div></div>';
+                if (currentFile === pending.file) {
+                    origContent = pending.newContent;
+                    renderFileContent(pending.newContent, pending.file);
+                    showFileDiff(pending.oldContent, pending.newContent, pending.file);
+                }
             }
             delete agentPendingStore[cardId];
             checkBulkBarDone();
@@ -1045,6 +1144,36 @@ function agentDenyFile(cardId) {
     checkBulkBarDone();
 }
 
+// agentRevertApplied restores a file to its previous state using stored oldContent.
+// Works for both reverts (undo modification) and restores (undo deletion).
+function agentRevertApplied(revId) {
+    var entry = agentRevertStore[revId];
+    if (!entry) return;
+    var btn = document.querySelector('[onclick*="' + revId + '"]');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
+
+    fetch('/api/agent/commit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files: [{ path: entry.file, content: entry.oldContent }] })
+    }).then(function(r){ return r.json(); }).then(function(d) {
+        var res = d.results && d.results[0];
+        if (res && res.success) {
+            if (btn) { btn.textContent = '✅ Reverted'; }
+            delete agentRevertStore[revId];
+            if (currentFile === entry.file) {
+                origContent = entry.oldContent;
+                renderFileContent(entry.oldContent, entry.file);
+            }
+            loadFiles();
+        } else {
+            if (btn) { btn.disabled = false; btn.textContent = '↩ Revert'; }
+        }
+    }).catch(function() {
+        if (btn) { btn.disabled = false; btn.textContent = '↩ Revert'; }
+    });
+}
+
 function checkBulkBarDone() {
     Object.keys(agentBulkGroups).forEach(function(barId) {
         var cards = agentBulkGroups[barId];
@@ -1067,6 +1196,48 @@ function agentApplyAll(barId) {
     delete agentBulkGroups[barId];
     var bar = document.getElementById(barId);
     if (bar) { bar.style.opacity = '0.5'; bar.style.pointerEvents = 'none'; }
+}
+
+function agentApplySelected(barId) {
+    var cardIds = agentBulkGroups[barId] || [];
+    var selected = cardIds.filter(function(cardId) {
+        if (!agentPendingStore[cardId]) return false;
+        var chk = document.getElementById('selChk_' + cardId);
+        return !!(chk && chk.checked);
+    });
+    if (selected.length === 0) return;
+
+    // Dismiss everything not selected: remove cards from UI and pending state.
+    // User explicitly asked to apply only selected files and hide the rest.
+    var unselected = cardIds.filter(function(cardId) {
+        return selected.indexOf(cardId) === -1;
+    });
+    unselected.forEach(function(cardId) {
+        if (agentPendingStore[cardId]) {
+            delete agentPendingStore[cardId];
+        }
+        var el = document.getElementById(cardId);
+        if (el) el.remove();
+    });
+
+    var applySelBtn = document.getElementById('applySelBtn_' + barId);
+    var applyAllBtn = document.getElementById('applyAllBtn_' + barId);
+    var denyAllBtn  = document.getElementById('denyAllBtn_'  + barId);
+    if (applySelBtn) { applySelBtn.disabled = true; applySelBtn.textContent = '⏳'; }
+    if (applyAllBtn) { applyAllBtn.disabled = true; }
+    if (denyAllBtn)  { denyAllBtn.disabled  = true; }
+
+    selected.forEach(function(cardId) { agentApplyFile(cardId); });
+
+    // Clear this bulk group now; selected cards will render their final state
+    // through agentApplyFile and the bar should no longer control anything.
+    delete agentBulkGroups[barId];
+    var bar = document.getElementById(barId);
+    if (bar) bar.remove();
+
+    if (applySelBtn) { applySelBtn.textContent = '✅ Apply Selected'; applySelBtn.disabled = false; }
+    if (applyAllBtn) { applyAllBtn.disabled = false; }
+    if (denyAllBtn)  { denyAllBtn.disabled  = false; }
 }
 
 function agentDenyAll(barId) {
@@ -1620,11 +1791,9 @@ function applyAutoApplyUI() {
     if (autoApply) {
         btn.textContent = '⚡ Auto';
         btn.title = 'Auto-apply is ON — code blocks are written to disk automatically. Click to disable.';
-        btn.style.color = 'var(--yellow)';
     } else {
         btn.textContent = '🔒 Auto';
         btn.title = 'Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).';
-        btn.style.color = '';
     }
 }
 
