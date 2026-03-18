@@ -362,8 +362,8 @@ const htmlTemplate = `<!DOCTYPE html>
                 <div class="messages" id="messages"></div>
                 <div class="input-area">
                     <div class="input-row">
-                        <textarea class="msg-input" id="msgInput" rows="2" placeholder="Describe a task and press Enter to run Agent, or Shift+Enter for a new line…"></textarea>
-                        <button class="btn-agent" id="agentBtn" title="Agent mode: reviews all files then applies changes autonomously">⚡ Agent</button>
+                        <textarea class="msg-input" id="msgInput" rows="2" placeholder="Describe a task and press Enter to run Agent (proposes changes or creates new code), or Shift+Enter for a new line…"></textarea>
+                        <button class="btn-agent" id="agentBtn" title="Agent mode: analyses all files, proposes changes or creates new code">⚡ Agent</button>
                         <button class="send-btn" id="sendBtn">Send</button>
                         <button class="btn-help" id="clearBtn" title="Clear conversation history">Clear</button>
                         <button class="stop-btn hidden" id="stopBtn">⏹ Stop</button>
@@ -845,9 +845,19 @@ function sendAgentTask() {
     c.appendChild(typing);
     c.scrollTop = c.scrollHeight;
 
+    var stickyStatus = '';
     function setStatus(text) {
         var span = document.getElementById('agent_status_span');
-        if (span) span.textContent = text;
+        if (!span) return;
+        // Plan messages are "sticky" — keep showing them alongside subsequent updates
+        if (text.indexOf('📋 Plan:') !== -1) {
+            stickyStatus = text;
+        }
+        var display = stickyStatus && text !== stickyStatus
+            ? stickyStatus + '\n' + text
+            : text;
+        span.textContent = display;
+        span.style.whiteSpace = display.indexOf('\n') !== -1 ? 'pre-line' : '';
         c.scrollTop = c.scrollHeight;
     }
 
@@ -1831,7 +1841,23 @@ function toggleSidebar() {
 function rescan() {
     fetch('/api/rescan', { method:'POST' })
         .then(function(r){ return r.json(); })
-        .then(function() { loadFiles(); loadStatus(); loadMessages(); })
+        .then(function(d) {
+            loadFiles();
+            loadStatus();
+            if (d.success && d.message) {
+                var c = document.getElementById('messages');
+                var el = makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms);
+                c.appendChild(el);
+                c.scrollTop = c.scrollHeight;
+                setTimeout(function() {
+                    el.style.transition = 'opacity 0.6s ease';
+                    el.style.opacity = '0';
+                    setTimeout(function() { el.remove(); }, 600);
+                }, 3000);
+            } else {
+                loadMessages();
+            }
+        })
         .catch(function(){});
 }
 

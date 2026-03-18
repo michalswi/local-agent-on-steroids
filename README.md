@@ -8,12 +8,12 @@
 [![forks](https://img.shields.io/github/forks/michalswi/local-agent-on-steroids?style=for-the-badge&color=353535)](https://github.com/michalswi/local-agent-on-steroids/fork)
 [![releases](https://img.shields.io/github/v/release/michalswi/local-agent-on-steroids?style=for-the-badge&color=353535)](https://github.com/michalswi/local-agent-on-steroids/releases)
 
-**local-agent-on-steroids** is a privacy-first coding agent that scans, analyzes, generates and edits your codebase from a browser UI — 100% local, powered by your own LLMs through Ollama. No cloud. No telemetry. Your code stays yours.
+**local-agent-on-steroids** is a privacy-first coding agent that scans, analyzes, generates and edits your codebase from a browser UI — 100% local, powered by your own LLMs through Ollama. Your code stays yours. Exposes a REST API for programmatic access from any external tool or script.
 
 </div>
 
 > **Default LLM:** `wizardlm2:7b`.
-> Change it in `config/config.go` under `LLMConfig.Model`, or switch live in chat with `model <name>` (for example `model gemma3:4b`).
+> Change it in `config/config.go` under `LLMConfig.Model`, or run app with `--model <model>` flag or switch on app's chat with `model <model>`.
 
 ## \# Quick Start
 

@@ -322,13 +322,13 @@ func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.scanResult = scanResult
+	s.mu.Unlock()
+
 	msg := Message{
 		Role:      "assistant",
 		Content:   fmt.Sprintf("✅ Rescan complete!\n\nFiles found: %d\nFiltered: %d", scanResult.TotalFiles, scanResult.FilteredFiles),
 		Timestamp: time.Now(),
 	}
-	s.messages = append(s.messages, msg)
-	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ChatResponse{
@@ -1551,7 +1551,7 @@ func (s *Server) agentChangelogPrompt() string {
 // remove one or more files entirely (not to delete code inside a file).
 func agentIsDeleteTask(task string) bool {
 	lower := strings.ToLower(task)
-	deleteWords := []string{"delete", "remove", "erase", "drop"}
+	deleteWords := []string{"delete", "remove", "erase"}
 	fileWords := []string{"file", ".go", ".py", ".js", ".ts", ".yaml", ".yml", ".json",
 		".tf", ".sh", ".md", ".txt", ".html", ".css", ".toml", ".env"}
 	for _, d := range deleteWords {
@@ -2174,7 +2174,12 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			progress("⚠️  Planning returned no files — falling back to single-file mode…")
 			plannedFiles = nil
 		} else {
-			progress(fmt.Sprintf("📋 Plan: %s", strings.Join(plannedFiles, ", ")))
+			var planBuf strings.Builder
+			fmt.Fprintf(&planBuf, "📋 Plan: %d file(s) to create\n", len(plannedFiles))
+			for _, f := range plannedFiles {
+				fmt.Fprintf(&planBuf, "  • %s\n", f)
+			}
+			progress(planBuf.String())
 		}
 	}
 
