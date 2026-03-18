@@ -82,7 +82,7 @@ func DefaultConfig() *Config {
 			Endpoint: "http://localhost:11434",
 			Model:    "wizardlm2:7b", // https://ollama.com/library/wizardlm2
 			// Model:       "gemma3:4b", // https://ollama.com/library/gemma3
-			Temperature: 0.1,
+			Temperature: 0.3, // 0.1 might be too conservative..
 			Timeout:     300, // 5 minutes for large batches
 		},
 		Filters: FilterConfig{
