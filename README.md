@@ -106,15 +106,15 @@ security:
 
 ## \# System Prompts
 
-There are three distinct system prompts used internally, each targeting a different operation mode. All live in `webui/server.go`.
+There are three distinct system prompts used internally, each targeting a different operation mode. They are stored as embedded `.md` files under `webui/prompts/` and compiled into the binary at build time.
 
-| Prompt | Location | Triggered by |
-|---|---|---|
-| **Chat prompt** | `server.go` | **Send** button — plain conversation, no file writes |
-| **Agent prompt** | `server.go` | **⚡ Agent** button — applied per-file in a parallel loop |
-| **Create-file prompt** | `server.go` | Agent sub-step when a new file needs to be created from scratch |
+| Prompt file | Triggered by |
+|---|---|
+| `webui/prompts/chat.md` | **Send** button — plain conversation, no file writes |
+| `webui/prompts/agent_edit.md` | **⚡ Agent** button — applied per-file in a parallel loop |
+| `webui/prompts/agent_create.md` | Agent sub-step when a new file needs to be created from scratch |
 
-All three prompts are assembled at runtime (file tree, file contents, and session changelog are injected dynamically), so what you see in source is only the static base.
+All three prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, and session changelog) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
 
 ## \# External API
 

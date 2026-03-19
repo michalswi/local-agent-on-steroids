@@ -362,7 +362,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 <div class="messages" id="messages"></div>
                 <div class="input-area">
                     <div class="input-row">
-                        <textarea class="msg-input" id="msgInput" rows="2" placeholder="Describe a task and press Enter to run Agent (proposes changes or creates new code), or Shift+Enter for a new line…"></textarea>
+                        <textarea class="msg-input" id="msgInput" rows="2" placeholder="begin your journey here..."></textarea>
                         <button class="btn-agent" id="agentBtn" title="Agent mode: analyses all files, proposes changes or creates new code">⚡ Agent</button>
                         <button class="send-btn" id="sendBtn">Send</button>
                         <button class="btn-help" id="clearBtn" title="Clear conversation history">Clear</button>
