@@ -26,6 +26,21 @@ import (
 	"github.com/michalswi/local-agent-on-steroids/types"
 )
 
+// mustPrompt reads an embedded prompt .md file by name and panics if missing.
+func mustPrompt(name string) string {
+	data, err := PromptFiles.ReadFile(name)
+	if err != nil {
+		panic(fmt.Sprintf("embedded prompt %q not found: %v", name, err))
+	}
+	return strings.TrimSpace(string(data))
+}
+
+var (
+	promptChat        = mustPrompt("prompts/chat.md")
+	promptAgentEdit   = mustPrompt("prompts/agent_edit.md")
+	promptAgentCreate = mustPrompt("prompts/agent_create.md")
+)
+
 // AgentLogEntry records a single file operation performed by the agent.
 // The log is injected into subsequent agent prompts so the LLM knows what
 // has already been done in this session.
@@ -638,15 +653,7 @@ func (s *Server) processQuestion(ctx context.Context, question string, files []*
 		}
 	}
 
-	bt := "`"
-	bt3 := bt + bt + bt
-	systemPrompt := "You are a local coding assistant. Always respond in English regardless of the language of any file content.\n" +
-		"If the task asks for analysis, a summary, or a description — respond concisely in plain text matching the requested format. Do NOT output file content unless the task explicitly requests a code change.\n" +
-		"If the task requires modifying a file, you MUST start the fenced block with " + bt3 + "LANG:FILENAME where FILENAME is the exact relative file path.\n" +
-		"Example: if editing main.go write " + bt3 + "go:main.go on the very first line of the fence.\n" +
-		"NEVER use " + bt3 + "go alone — always append :FILENAME.\n" +
-		"When outputting modified file content, always output the COMPLETE updated file, not a partial diff.\n" +
-		"Available files: " + strings.Join(filePaths, ", ")
+	systemPrompt := promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
@@ -1728,15 +1735,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 
 	// Pre-fetch changelog once; it's read-only during this loop.
 	changelog := s.agentChangelogPrompt()
-	systemPrompt := "You are a coding agent. " +
-		"You will be given a file and a task describing a change to make. " +
-		"You MUST apply the requested change ONLY to this specific file. " +
-		"Reply with ONLY the complete updated file content — every line, not a diff or partial snippet. " +
-		"Do not explain, do not add markdown fences, do not add commentary. Just the raw file content. " +
-		"IMPORTANT EXCEPTIONS — output exactly one of these tokens and nothing else:\n" +
-		"  • NO_CHANGE  — if this specific file does not need to be modified for the given task.\n" +
-		"  • DELETE_FILE — if and only if the task explicitly asks to DELETE or REMOVE this exact file entirely.\n" +
-		"When in doubt whether to change a file, output NO_CHANGE."
+	systemPrompt := promptAgentEdit
 	if changelog != "" {
 		systemPrompt += "\n\n" + changelog
 	}
@@ -2307,22 +2306,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			userContent = fmt.Sprintf("Existing files for context:\n\n%s\nTask: %s", ctxBuf.String(), task)
 		}
 
-		createSystemPrompt := "You are a coding agent that creates new files. " +
-			"If the task requires MULTIPLE files, output each file as a separate block.\n\n" +
-			"FORMAT FOR EACH FILE:\n" +
-			"FILE: <filename with extension>\n" +
-			"---\n" +
-			"<complete file content — no markdown fences, no commentary>\n" +
-			"===\n\n" +
-			"Rules:\n" +
-			"- Each filename MUST include the correct extension (e.g. main.go, variables.tf, server.py).\n" +
-			"- Use flat filenames unless the user explicitly requested a subdirectory path.\n" +
-			"- Do NOT add any text outside the FILE/---/=== blocks.\n" +
-			"- Separate multiple file blocks with a line containing only '==='.\n" +
-			"- For a SINGLE file you may omit the 'FILE:' prefix and trailing '===' — use just: filename\\n---\\ncontent\n\n" +
-			"Example (two files):\n" +
-			"FILE: main.tf\n---\nresource ...\n===\n" +
-			"FILE: variables.tf\n---\nvariable ..."
+		createSystemPrompt := promptAgentCreate
 		if changelog != "" {
 			createSystemPrompt += "\n\n" + changelog
 		}
