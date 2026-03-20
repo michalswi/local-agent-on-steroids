@@ -162,15 +162,30 @@ const htmlTemplate = `<!DOCTYPE html>
         .btn-copy:hover { color: var(--text); border-color: var(--accent); }
         .cb pre { margin: 0; padding: 0.8rem 1rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.55; }
         .cb code { font-family: "Cascadia Code", "JetBrains Mono", "Fira Code", monospace; }
+        /* Chat resize handle */
+        .chat-resizer {
+            height: 5px; background: transparent; border-top: 1px solid var(--border);
+            cursor: ns-resize; flex-shrink: 0; transition: background 0.15s;
+            position: relative; z-index: 1;
+        }
+        .chat-resizer:hover, .chat-resizer.dragging { background: var(--accent); border-color: var(--accent); }
         /* Input area */
-        .input-area { padding: 0.85rem 1.25rem 3rem; background: var(--bg2); border-top: 1px solid var(--border); flex-shrink: 0; }
+        .input-area { padding: 0.85rem 1.25rem 3rem; background: var(--bg2); border-top: none; flex-shrink: 0; }
         .input-row { display: flex; gap: 0.65rem; align-items: flex-end; }
+        .btn-group { display: flex; gap: 0.65rem; align-items: center; flex-wrap: wrap; align-self: flex-end; flex-shrink: 0; }
+        .input-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         .msg-input {
-            flex: 1; padding: 0.65rem 0.9rem; background: var(--bg3); border: 1px solid var(--border);
-            border-radius: 8px; color: var(--text); font-size: 0.88rem; font-family: inherit;
-            resize: none; outline: none; transition: border-color 0.2s; min-height: 40px; max-height: 110px;
+            width: 100%; padding: 0.65rem 0.9rem; background: var(--bg3); border: 1px solid var(--border);
+            border-radius: 8px 8px 0 0; color: var(--text); font-size: 0.88rem; font-family: inherit;
+            resize: none; outline: none; transition: border-color 0.2s; min-height: 40px;
+            overflow-y: auto; box-sizing: border-box;
         }
         .msg-input:focus { border-color: var(--accent); }
+        .input-resizer {
+            width: 100%; height: 5px; background: var(--border); border-radius: 0 0 4px 4px;
+            cursor: ns-resize; flex-shrink: 0; transition: background 0.15s;
+        }
+        .input-resizer:hover, .input-resizer.dragging { background: var(--accent); }
         .send-btn {
             padding: 0.65rem 1.35rem; background: var(--accent); color: #fff;
             border: none; border-radius: 8px; cursor: pointer; font-weight: 600;
@@ -191,6 +206,32 @@ const htmlTemplate = `<!DOCTYPE html>
         }
         .btn-agent:hover:not(:disabled) { opacity: 0.85; }
         .btn-agent:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-runfix {
+            padding: 0.65rem 1.1rem; background: #0ea5e9; color: #fff;
+            border: none; border-radius: 8px; cursor: pointer; font-weight: 600;
+            font-size: 0.88rem; height: 40px; transition: opacity 0.15s; white-space: nowrap;
+        }
+        .btn-runfix:hover:not(:disabled) { opacity: 0.85; }
+        .btn-runfix:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-info {
+            width: 40px; height: 40px; padding: 0; flex-shrink: 0; align-self: center;
+            background: none; border: 1px solid var(--border); border-radius: 4px;
+            color: var(--text2); cursor: pointer; font-size: 0.78rem; font-weight: 700;
+            line-height: 1; transition: all 0.12s; display: inline-flex; align-items: center; justify-content: center;
+        }
+        .btn-info:hover { background: var(--bg3); color: var(--accent); border-color: var(--accent); }
+        .btninfo-popup {
+            position: fixed; bottom: 6rem; left: 50%; transform: translateX(-50%);
+            background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+            padding: 1rem 1.25rem 0.85rem; width: min(480px, 92vw);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.45); z-index: 900;
+        }
+        .btninfo-popup.hidden { display: none !important; }
+        .btninfo-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
+        .btninfo-hdr h3 { font-size: 0.92rem; color: var(--text); }
+        .btninfo-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; line-height: 1.65; }
+        .btninfo-table td { padding: 0.18rem 0.5rem 0.18rem 0; vertical-align: top; }
+        .btninfo-table td:first-child { white-space: nowrap; padding-right: 0.75rem; }
         .btn-help {
             padding: 0.65rem 1.1rem; background: var(--green); color: #fff;
             border: none; border-radius: 8px; cursor: pointer; font-weight: 600;
@@ -209,6 +250,13 @@ const htmlTemplate = `<!DOCTYPE html>
         .input-hint code { background: var(--bg3); padding: 0.1rem 0.3rem; border-radius: 3px; color: var(--accent); font-size: 0.9em; }
         /* Typing indicator */
         .typing { display: flex; align-items: center; gap: 0.35rem; color: var(--text2); font-size: 0.83rem; }
+        .runfix-log { margin: 0.45rem 0 0; max-height: 180px; overflow-y: auto; font-size: 0.79rem; font-family: "Cascadia Code", "JetBrains Mono", "Fira Code", monospace; white-space: pre-wrap; word-break: break-word; color: var(--text2); line-height: 1.5; padding: 0; background: none; border: none; }
+        .runfix-history { margin-top: 0.65rem; border-top: 1px solid var(--border); padding-top: 0.45rem; }
+        .runfix-history summary { cursor: pointer; font-size: 0.79rem; color: var(--text2); user-select: none; list-style: none; display: flex; align-items: center; gap: 0.3rem; }
+        .runfix-history summary:hover { color: var(--accent); }
+        .runfix-history summary::before { content: '▶'; font-size: 0.65rem; transition: transform 0.15s; }
+        .runfix-history[open] summary::before { transform: rotate(90deg); }
+        .runfix-history .runfix-log { max-height: 260px; margin-top: 0.4rem; }
         .dot { width: 5px; height: 5px; background: var(--accent2); border-radius: 50%; animation: blink 1.2s infinite; }
         .dot:nth-child(2) { animation-delay: 0.2s; }
         .dot:nth-child(3) { animation-delay: 0.4s; }
@@ -360,15 +408,23 @@ const htmlTemplate = `<!DOCTYPE html>
             <!-- Chat panel -->
             <div class="panel" id="chatPanel">
                 <div class="messages" id="messages"></div>
+                <div class="chat-resizer" id="chatResizer"></div>
                 <div class="input-area">
                     <div class="input-row">
+                        <div class="input-col">
                         <textarea class="msg-input" id="msgInput" rows="2" placeholder="begin your journey here..."></textarea>
+                        <div class="input-resizer" id="inputResizer"></div>
+                        </div>
+                        <div class="btn-group">
+                        <button class="btn-info" id="btnInfoBtn" onclick="toggleBtnInfo()" title="Button reference">ℹ</button>
                         <button class="btn-agent" id="agentBtn" title="Agent mode: analyses all files, proposes changes or creates new code">⚡ Agent</button>
+                        <button class="btn-runfix" id="runFixBtn" title="Run the project and auto-fix compilation/build errors with LLM (up to 5 attempts)">🔧 Run &amp; Fix</button>
                         <button class="send-btn" id="sendBtn">Send</button>
                         <button class="btn-help" id="clearBtn" title="Clear conversation history">Clear</button>
                         <button class="stop-btn hidden" id="stopBtn">⏹ Stop</button>
                         <button class="btn-help" id="helpBtn" onclick="openHelpModal()">Help</button>
                         <button class="btn-auto" id="autoApplyBtn" title="Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).">🔒 Auto Off</button>
+                        </div>
                     </div>
                     <div class="input-hint">💡 <code>Enter</code> = ⚡ Agent &nbsp;•&nbsp; <code>Shift+Enter</code> = new line &nbsp;•&nbsp; <code>Send</code> = chat only</div>
                 </div>
@@ -392,6 +448,24 @@ const htmlTemplate = `<!DOCTYPE html>
             </div>
         </div>
     </div><!-- /workspace -->
+
+<!-- ── Buttons info popup ──────────────────────────────────── -->
+<div class="btninfo-popup hidden" id="btnInfoPopup">
+    <div class="btninfo-hdr">
+        <h3>🔘 Button reference</h3>
+        <button class="ibtn" onclick="closeBtnInfo()">✕</button>
+    </div>
+    <table class="btninfo-table">
+        <tr><td><span style="color:var(--accent2);font-weight:700">⚡ Agent</span></td><td>Analyse files, propose or apply code changes. LLM processes each file independently.</td></tr>
+        <tr><td><span style="color:#0ea5e9;font-weight:700">🔧 Run &amp; Fix</span></td><td>Build/run the project, show errors, let the LLM fix them, repeat — up to 5 times.</td></tr>
+        <tr><td><span style="color:var(--accent);font-weight:700">Send</span></td><td>Chat-only — ask questions about your code without modifying any files.</td></tr>
+        <tr><td><span style="color:var(--green);font-weight:700">Clear</span></td><td>Clear conversation history (files are not affected).</td></tr>
+        <tr><td><span style="color:var(--red);font-weight:700">⏹ Stop</span></td><td>Cancel the in-progress LLM request immediately.</td></tr>
+        <tr><td><span style="color:var(--green);font-weight:700">Help</span></td><td>Show available chat commands (<code style="font-size:0.82em">clear</code>, <code style="font-size:0.82em">model</code>, <code style="font-size:0.82em">stats</code>, …).</td></tr>
+        <tr><td><span style="color:#f59e0b;font-weight:700">🔒 Auto</span></td><td>Toggle auto-apply. Off = confirm each change manually. On = write files immediately.</td></tr>
+        <tr><td><span style="color:var(--text2);font-weight:700">🔄 Rescan</span></td><td>Rescan the working directory to pick up new or externally changed files.</td></tr>
+    </table>
+</div>
 
 <!-- ── Help modal ───────────────────────────────────────────── -->
 <div class="modal-bg hidden" id="helpModal" onclick="if(event.target===this)closeHelpModal()">
@@ -470,15 +544,30 @@ function clearResumeIndicator() {
     if (existing) existing.remove();
 }
 
-function ensureResumeIndicator() {
+function ensureResumeIndicator(progressText) {
     if (!serverProcessing || window._activeAbortController) return;
     var c = document.getElementById('messages');
-    if (!c || document.getElementById('resume_processing_hint')) return;
-    var kind = serverTaskKind === 'agent' ? 'Agent' : 'Request';
+    if (!c) return;
+    var plan = window._serverPlanProgress || '';
+    var step = progressText || window._serverLastProgress || '';
+    var display = plan && step && step !== plan ? plan + '\n' + step : (plan || step || (serverTaskKind === 'agent' ? 'Agent' : 'Request') + ' is still running on the server\u2026');
+    var existing = document.getElementById('resume_processing_hint');
+    if (existing) {
+        var span = existing.querySelector('span');
+        if (span) {
+            span.textContent = display;
+            span.style.whiteSpace = display.indexOf('\n') !== -1 ? 'pre-line' : '';
+        }
+        return;
+    }
     var hint = document.createElement('div');
     hint.className = 'msg assistant';
     hint.id = 'resume_processing_hint';
-    hint.innerHTML = '<div class="bubble"><div class="typing"><div class="dot"></div><div class="dot"></div><div class="dot"></div><span>' + kind + ' is still running on the server…</span></div></div>';
+    var span = document.createElement('span');
+    span.textContent = display;
+    span.style.whiteSpace = display.indexOf('\n') !== -1 ? 'pre-line' : '';
+    hint.innerHTML = '<div class="bubble"><div class="typing"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div>';
+    hint.querySelector('.typing').appendChild(span);
     c.appendChild(hint);
     c.scrollTop = c.scrollHeight;
 }
@@ -489,6 +578,7 @@ function syncBusyUI() {
     var sendBtn = document.getElementById('sendBtn');
     var clearBtn = document.getElementById('clearBtn');
     var agentBtn = document.getElementById('agentBtn');
+    var runFixBtn = document.getElementById('runFixBtn');
     var stopBtn = document.getElementById('stopBtn');
     var helpBtn = document.getElementById('helpBtn');
     var autoApplyBtn = document.getElementById('autoApplyBtn');
@@ -499,6 +589,7 @@ function syncBusyUI() {
     sendBtn.disabled = busy;
     clearBtn.disabled = busy;
     agentBtn.disabled = busy;
+    if (runFixBtn) runFixBtn.disabled = busy;
     if (helpBtn) helpBtn.disabled = busy;
     if (autoApplyBtn) autoApplyBtn.disabled = busy;
     if (rescanBtn) rescanBtn.disabled = busy;
@@ -506,7 +597,7 @@ function syncBusyUI() {
         stopBtn.classList.remove('hidden');
         if (serverProcessing && !window._activeAbortController) {
             agentBtn.textContent = '⏳';
-            ensureResumeIndicator();
+            ensureResumeIndicator(window._serverLastProgress || '');
         }
     } else {
         stopBtn.classList.add('hidden');
@@ -527,6 +618,7 @@ loadSettings();
 document.getElementById('sendBtn').addEventListener('click', sendMsg);
 document.getElementById('clearBtn').addEventListener('click', clearChatHistory);
 document.getElementById('agentBtn').addEventListener('click', sendAgentTask);
+document.getElementById('runFixBtn').addEventListener('click', sendRunFix);
 document.getElementById('stopBtn').addEventListener('click', function() {
     // Cancel server-side LLM request first, then abort the browser fetch.
     fetch('/api/stop', { method: 'POST' }).catch(function(){});
@@ -535,7 +627,109 @@ document.getElementById('stopBtn').addEventListener('click', function() {
 document.getElementById('msgInput').addEventListener('keydown', function(e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAgentTask(); }
 });
+(function() {
+    var ta = document.getElementById('msgInput');
+    var manualHeight = null;
+    function autoResize() {
+        if (manualHeight !== null) {
+            ta.style.height = Math.max(manualHeight, ta.scrollHeight) + 'px';
+        } else {
+            ta.style.height = 'auto';
+            ta.style.height = ta.scrollHeight + 'px';
+        }
+    }
+    ta.addEventListener('input', autoResize);
+    autoResize();
+
+    var resizer = document.getElementById('inputResizer');
+    var startY, startH;
+    resizer.addEventListener('mousedown', function(e) {
+        startY = e.clientY;
+        startH = ta.getBoundingClientRect().height;
+        resizer.classList.add('dragging');
+        document.body.style.cursor = 'ns-resize';
+        document.body.style.userSelect = 'none';
+        e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+        if (!resizer.classList.contains('dragging')) return;
+        var newH = Math.max(40, startH + (e.clientY - startY));
+        manualHeight = newH;
+        ta.style.height = newH + 'px';
+    });
+    document.addEventListener('mouseup', function() {
+        if (!resizer.classList.contains('dragging')) return;
+        resizer.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+    });
+    resizer.addEventListener('touchstart', function(e) {
+        startY = e.touches[0].clientY;
+        startH = ta.getBoundingClientRect().height;
+        resizer.classList.add('dragging');
+        e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchmove', function(e) {
+        if (!resizer.classList.contains('dragging')) return;
+        var newH = Math.max(40, startH + (e.touches[0].clientY - startY));
+        manualHeight = newH;
+        ta.style.height = newH + 'px';
+    }, { passive: false });
+    document.addEventListener('touchend', function() { resizer.classList.remove('dragging'); });
+    window._resetInputHeight = function() {
+        manualHeight = null;
+        ta.style.height = 'auto';
+        ta.style.height = ta.scrollHeight + 'px';
+    };
+})();
 document.getElementById('sidebarToggle').addEventListener('click', toggleSidebar);
+
+// ── Chat messages area resize ────────────────────────────────────────────────
+(function() {
+    var resizer = document.getElementById('chatResizer');
+    var messages = document.getElementById('messages');
+    var startY, startH;
+    resizer.addEventListener('mousedown', function(e) {
+        startY = e.clientY;
+        startH = messages.getBoundingClientRect().height;
+        resizer.classList.add('dragging');
+        document.body.style.cursor = 'ns-resize';
+        document.body.style.userSelect = 'none';
+        e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+        if (!resizer.classList.contains('dragging')) return;
+        var delta = e.clientY - startY;
+        var newH = Math.max(80, startH + delta);
+        messages.style.flex = 'none';
+        messages.style.height = newH + 'px';
+    });
+    document.addEventListener('mouseup', function() {
+        if (!resizer.classList.contains('dragging')) return;
+        resizer.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+    });
+    // touch support
+    resizer.addEventListener('touchstart', function(e) {
+        startY = e.touches[0].clientY;
+        startH = messages.getBoundingClientRect().height;
+        resizer.classList.add('dragging');
+        e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchmove', function(e) {
+        if (!resizer.classList.contains('dragging')) return;
+        var delta = e.touches[0].clientY - startY;
+        var newH = Math.max(80, startH + delta);
+        messages.style.flex = 'none';
+        messages.style.height = newH + 'px';
+    }, { passive: false });
+    document.addEventListener('touchend', function() {
+        resizer.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+    });
+})();
 document.getElementById('rescanBtn').addEventListener('click', rescan);
 document.getElementById('themeBtn').addEventListener('click', toggleTheme);
 document.getElementById('autoApplyBtn').addEventListener('click', toggleAutoApply);
@@ -557,6 +751,9 @@ function loadStatus() {
         var fb = document.getElementById('focusBadge');
         if (d.focusedPath) { fb.textContent = '🎯 ' + d.focusedPath; fb.style.display = ''; }
         else               { fb.style.display = 'none'; }
+        if (d.processing && d.lastProgress) { window._serverLastProgress = d.lastProgress; }
+        if (d.processing && d.planProgress) { window._serverPlanProgress = d.planProgress; }
+        if (!d.processing) { window._serverLastProgress = ''; window._serverPlanProgress = ''; }
         syncBusyUI();
     }).catch(function(){});
 }
@@ -583,7 +780,7 @@ function pollMessages() {
             });
             c.scrollTop = c.scrollHeight;
         }
-        if (serverProcessing) ensureResumeIndicator();
+        if (serverProcessing) ensureResumeIndicator(window._serverLastProgress || '');
         else clearResumeIndicator();
     }).catch(function(){});
 }
@@ -712,7 +909,7 @@ function loadMessages() {
                 }
             }
         });
-        if (serverProcessing) ensureResumeIndicator();
+        if (serverProcessing) ensureResumeIndicator(window._serverLastProgress || '');
         c.scrollTop = c.scrollHeight;
     }).catch(function(){});
 }
@@ -724,8 +921,21 @@ function makeMsgEl(role, content, ts, durationMs) {
     meta.className = 'msg-meta';
     var metaText = (role === 'user' ? 'You' : '🤖 Assistant') + ' · ' + (ts ? new Date(ts).toLocaleTimeString() : '');
     if (role === 'assistant' && durationMs && durationMs > 0) {
-        var secs = (durationMs / 1000).toFixed(1);
-        metaText += ' · ⏱ ' + secs + 's';
+        var totalSecs = durationMs / 1000;
+        var durStr;
+        if (totalSecs >= 3600) {
+            var h = Math.floor(totalSecs / 3600);
+            var m = Math.floor((totalSecs % 3600) / 60);
+            var s = Math.round(totalSecs % 60);
+            durStr = h + 'h ' + m + 'm ' + s + 's';
+        } else if (totalSecs >= 60) {
+            var m = Math.floor(totalSecs / 60);
+            var s = (totalSecs % 60).toFixed(1);
+            durStr = m + 'm ' + s + 's';
+        } else {
+            durStr = totalSecs.toFixed(1) + 's';
+        }
+        metaText += ' · ⏱ ' + durStr;
     }
     meta.textContent = metaText;
     var bubble = document.createElement('div');
@@ -749,6 +959,7 @@ function sendMsg() {
     c.appendChild(makeMsgEl('user', txt, new Date().toISOString()));
     c.scrollTop = c.scrollHeight;
     inp.value = '';
+    if (window._resetInputHeight) window._resetInputHeight();
 
     var controller = new AbortController();
     window._activeAbortController = controller;
@@ -828,6 +1039,7 @@ function sendAgentTask() {
     c.appendChild(makeMsgEl('user', txt, new Date().toISOString()));
     c.scrollTop = c.scrollHeight;
     inp.value = '';
+    if (window._resetInputHeight) window._resetInputHeight();
 
     var agentBtn = document.getElementById('agentBtn');
 
@@ -938,6 +1150,122 @@ function sendAgentTask() {
         syncBusyUI();
         loadStatus();
         inp.focus();
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Run & Fix mode
+// ═══════════════════════════════════════════════════════════════
+function sendRunFix() {
+    var inp = document.getElementById('msgInput');
+    // Use input text as optional context for the LLM; do NOT clear it.
+    var task = inp ? inp.value.trim() : '';
+
+    var c = document.getElementById('messages');
+    var label = task ? ('🔧 Run & Fix: ' + task) : '🔧 Run & Fix';
+    c.appendChild(makeMsgEl('user', label, new Date().toISOString()));
+    c.scrollTop = c.scrollHeight;
+
+    var controller = new AbortController();
+    window._activeAbortController = controller;
+    serverProcessing = true;
+    serverTaskKind = 'agent';
+    syncBusyUI();
+
+    var tid = 'typing_runfix_' + Date.now();
+    var typing = document.createElement('div');
+    typing.className = 'msg assistant';
+    typing.id = tid;
+    typing.innerHTML = '<div class="bubble"><div class="typing"><div class="dot"></div><div class="dot"></div><div class="dot"></div><span>Run &amp; Fix running…</span></div><pre id="runfix_log" class="runfix-log"></pre></div>';
+    c.appendChild(typing);
+    c.scrollTop = c.scrollHeight;
+
+    function setStatus(text) {
+        var log = document.getElementById('runfix_log');
+        if (log) { log.textContent += text + '\n'; log.scrollTop = log.scrollHeight; }
+        c.scrollTop = c.scrollHeight;
+    }
+
+    function finish(d) {
+        var logEl = document.getElementById('runfix_log');
+        var logText = logEl ? logEl.textContent.trim() : '';
+        var t = document.getElementById(tid); if (t) t.remove();
+        var msgEl;
+        if (d.success && d.message) {
+            msgEl = makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms);
+        } else {
+            msgEl = makeMsgEl('assistant', '\u274c Run & Fix error: ' + (d.error || 'unknown'), new Date().toISOString());
+        }
+        if (logText) {
+            var bubble = msgEl.querySelector('.bubble');
+            if (bubble) {
+                var details = document.createElement('details');
+                details.className = 'runfix-history';
+                var summary = document.createElement('summary');
+                summary.textContent = 'Show attempt log';
+                var pre = document.createElement('pre');
+                pre.className = 'runfix-log';
+                pre.textContent = logText;
+                details.appendChild(summary);
+                details.appendChild(pre);
+                bubble.appendChild(details);
+            }
+        }
+        c.appendChild(msgEl);
+        c.scrollTop = c.scrollHeight;
+        loadStatus();
+        loadFiles();
+        window._activeAbortController = null;
+        serverProcessing = false;
+        serverTaskKind = '';
+        syncBusyUI();
+        if (inp) inp.focus();
+    }
+
+    fetch('/api/agent/fixstream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task: task }),
+        signal: controller.signal
+    }).then(function(resp) {
+        if (!resp.ok || !resp.body) {
+            return resp.text().then(function(t) { finish({ success: false, error: t || resp.statusText }); });
+        }
+        var reader = resp.body.getReader();
+        var decoder = new TextDecoder();
+        var buf = '';
+        function pump() {
+            return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var lines = buf.split('\n');
+                buf = lines.pop();
+                lines.forEach(function(line) {
+                    if (!line.startsWith('data: ')) return;
+                    try {
+                        var ev = JSON.parse(line.slice(6));
+                        if (ev.type === 'status') { setStatus(ev.text); }
+                        else if (ev.type === 'done') { finish(ev); }
+                    } catch(e) {}
+                });
+                return pump();
+            });
+        }
+        return pump();
+    }).catch(function(e) {
+        var t = document.getElementById(tid); if (t) t.remove();
+        if (e.name === 'AbortError') {
+            c.appendChild(makeMsgEl('assistant', '⏹ Run & Fix cancelled.', new Date().toISOString()));
+        } else {
+            c.appendChild(makeMsgEl('assistant', '❌ Run & Fix network error: ' + e.message, new Date().toISOString()));
+        }
+        c.scrollTop = c.scrollHeight;
+        window._activeAbortController = null;
+        serverProcessing = false;
+        serverTaskKind = '';
+        syncBusyUI();
+        loadStatus();
+        if (inp) inp.focus();
     });
 }
 
@@ -1755,8 +2083,14 @@ function openHelpModal() {
 function closeHelpModal() {
     document.getElementById('helpModal').classList.add('hidden');
 }
+function toggleBtnInfo() {
+    document.getElementById('btnInfoPopup').classList.toggle('hidden');
+}
+function closeBtnInfo() {
+    document.getElementById('btnInfoPopup').classList.add('hidden');
+}
 document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape') { closeHelpModal(); }
+    if (e.key === 'Escape') { closeHelpModal(); closeBtnInfo(); }
 });
 
 function toggleDiff(uid) {
