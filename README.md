@@ -60,39 +60,18 @@ ls /tmp/local-agent-on-steroids/
 # session_20260317_123456.json  session_20260317_130012.json  ...
 ```
 
-## \# Configuration
-
-Create `.agent/config.yaml` (see [examples/config.yaml](examples/config.yaml)):
-
-```yaml
-agent:
-  token_limit: 8000       # match OLLAMA_CONTEXT_LENGTH (default: 4000)
-  concurrent_files: 5     # match OLLAMA_NUM_PARALLEL (default: 1)
-
-llm:
-  model: "wizardlm2:7b"
-  temperature: 0.1        # 0.0–0.3 for code, 0.4–0.7 for docs
-
-filters:
-  respect_gitignore: true
-  deny_patterns: ["node_modules/**", ".git/**"]
-  allow_patterns: ["*.go", "*.js", "*.md"]  # if set, only these are included
-
-security:
-  skip_binaries: true
-  max_depth: 20
-```
-
 ## \# UI Buttons
 
 | Button | Action |
 |---|---|
 | **⚡ Agent** | Agent mode — scans all files, plans changes, and applies them autonomously. Triggered by pressing `Enter`. |
+| **🔧 Run & Fix** | Runs the project, feeds build errors to the LLM, applies fixes, and retries — up to 5 attempts. |
 | **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. |
 | **Clear** | Clears the current chat conversation history (same behavior as typing `clear` in chat). |
 | **Help** | Opens the in-app help modal listing all available chat commands and keyboard shortcuts. |
 | **⏹ Stop** | Aborts the current Agent or Send operation mid-stream. Only visible while a request is in progress. |
 | **🔒 Auto Off** | Toggles auto-apply mode. When **OFF** (default), each file change requires an explicit **⚡ Apply** confirmation. When **ON**, changes are applied immediately. Does **not** affect the Agent's planning phase — planning always runs regardless. |
+
 
 ## \# Chat Commands
 
@@ -113,6 +92,7 @@ There are three distinct system prompts used internally, each targeting a differ
 | `webui/prompts/chat.md` | **Send** button — plain conversation, no file writes |
 | `webui/prompts/agent_edit.md` | **⚡ Agent** button — applied per-file in a parallel loop |
 | `webui/prompts/agent_create.md` | Agent sub-step when a new file needs to be created from scratch |
+| `webui/prompts/agent_fix.md` | **🔧 Run & Fix** button — language-agnostic fix prompt used in each repair iteration |
 
 All three prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, and session changelog) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
 
@@ -169,3 +149,26 @@ curl -s -X POST http://localhost:5050/api/ext/send \
 ```
 
 > `agentResults` is only present in agent mode responses.
+
+## \# Configuration
+
+Create `.agent/config.yaml` (see [examples/config.yaml](examples/config.yaml)):
+
+```yaml
+agent:
+  token_limit: 8000       # match OLLAMA_CONTEXT_LENGTH (default: 4000)
+  concurrent_files: 5     # match OLLAMA_NUM_PARALLEL (default: 1)
+
+llm:
+  model: "wizardlm2:7b"
+  temperature: 0.1        # 0.0–0.3 for code, 0.4–0.7 for docs
+
+filters:
+  respect_gitignore: true
+  deny_patterns: ["node_modules/**", ".git/**"]
+  allow_patterns: ["*.go", "*.js", "*.md"]  # if set, only these are included
+
+security:
+  skip_binaries: true
+  max_depth: 20
+```

@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -39,6 +41,7 @@ var (
 	promptChat        = mustPrompt("prompts/chat.md")
 	promptAgentEdit   = mustPrompt("prompts/agent_edit.md")
 	promptAgentCreate = mustPrompt("prompts/agent_create.md")
+	promptAgentFix    = mustPrompt("prompts/agent_fix.md")
 )
 
 // AgentLogEntry records a single file operation performed by the agent.
@@ -52,23 +55,25 @@ type AgentLogEntry struct {
 
 // Server represents the web UI server
 type Server struct {
-	directory    string
-	model        string
-	endpoint     string
-	indexTmpl    *template.Template
-	scanResult   *types.ScanResult
-	focusedPath  string
-	cfg          *config.Config
-	llmClient    *llm.OllamaClient
-	messages     []Message
-	agentLog     []AgentLogEntry     // structured changelog injected into agent prompts
-	taskCancel   context.CancelFunc  // cancels the current in-flight LLM request (Stop button)
-	taskToken    *struct{}           // unique identity token to avoid cross-task cancel races
-	taskRunning  bool                // true while chat/agent work is executing
-	taskKind     string              // "chat" | "agent"
-	scanFilter   *filter.Filter      // filter snapshot from startup; reused by rescan so agent-created files (e.g. .gitignore) don't hide themselves
-	writtenFiles map[string]struct{} // rel paths written via /api/file/write; always shown on rescan
-	mu           sync.RWMutex
+	directory        string
+	model            string
+	endpoint         string
+	indexTmpl        *template.Template
+	scanResult       *types.ScanResult
+	focusedPath      string
+	cfg              *config.Config
+	llmClient        *llm.OllamaClient
+	messages         []Message
+	agentLog         []AgentLogEntry     // structured changelog injected into agent prompts
+	taskCancel       context.CancelFunc  // cancels the current in-flight LLM request (Stop button)
+	taskToken        *struct{}           // unique identity token to avoid cross-task cancel races
+	taskRunning      bool                // true while chat/agent work is executing
+	taskKind         string              // "chat" | "agent"
+	lastProgressText string              // last progress message from the running agent task
+	planProgressText string              // sticky plan line (kept while a task runs)
+	scanFilter       *filter.Filter      // filter snapshot from startup; reused by rescan so agent-created files (e.g. .gitignore) don't hide themselves
+	writtenFiles     map[string]struct{} // rel paths written via /api/file/write; always shown on rescan
+	mu               sync.RWMutex
 }
 
 // Message represents a chat message
@@ -96,12 +101,14 @@ type ChatResponse struct {
 
 // StatusResponse represents the current status
 type StatusResponse struct {
-	Directory   string `json:"directory"`
-	Model       string `json:"model"`
-	TotalFiles  int    `json:"totalFiles"`
-	FocusedPath string `json:"focusedPath,omitempty"`
-	Processing  bool   `json:"processing"`
-	TaskKind    string `json:"taskKind,omitempty"`
+	Directory    string `json:"directory"`
+	Model        string `json:"model"`
+	TotalFiles   int    `json:"totalFiles"`
+	FocusedPath  string `json:"focusedPath,omitempty"`
+	Processing   bool   `json:"processing"`
+	TaskKind     string `json:"taskKind,omitempty"`
+	LastProgress string `json:"lastProgress,omitempty"`
+	PlanProgress string `json:"planProgress,omitempty"`
 }
 
 // NewServer creates a new web UI server
@@ -159,6 +166,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/agent/run", s.handleAgentRun)
 	mux.HandleFunc("/api/agent/stream", s.handleAgentStream)
 	mux.HandleFunc("/api/agent/commit", s.handleAgentCommit)
+	mux.HandleFunc("/api/agent/fixstream", s.handleFixStream)
 	mux.HandleFunc("/api/ext/send", s.handleExtSend)
 
 	addr := fmt.Sprintf(":%d", port)
@@ -177,12 +185,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 
 	status := StatusResponse{
-		Directory:   s.directory,
-		Model:       s.model,
-		TotalFiles:  s.scanResult.TotalFiles,
-		FocusedPath: s.focusedPath,
-		Processing:  s.taskRunning,
-		TaskKind:    s.taskKind,
+		Directory:    s.directory,
+		Model:        s.model,
+		TotalFiles:   s.scanResult.TotalFiles,
+		FocusedPath:  s.focusedPath,
+		Processing:   s.taskRunning,
+		TaskKind:     s.taskKind,
+		LastProgress: s.lastProgressText,
+		PlanProgress: s.planProgressText,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1054,6 +1064,12 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	progress := func(text string) {
 		sseMu.Lock()
 		defer sseMu.Unlock()
+		s.mu.Lock()
+		s.lastProgressText = text
+		if strings.Contains(text, "\U0001F4CB Plan:") {
+			s.planProgressText = text
+		}
+		s.mu.Unlock()
 		sseWrite(w, flusher, map[string]any{"type": "status", "text": text})
 	}
 
@@ -1084,6 +1100,8 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 			s.taskToken = nil
 			s.taskRunning = false
 			s.taskKind = ""
+			s.lastProgressText = ""
+			s.planProgressText = ""
 		}
 		s.mu.Unlock()
 		cancel()
@@ -1976,6 +1994,25 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 		}
 	}
 
+	// If every file returned NO_CHANGE (no errors), the LLM determined that no
+	// existing file needs modification for this task — this usually means the
+	// task is asking for something new that doesn't exist yet (e.g. "write a
+	// key/value database"). Fall back to runAgentCreate so the LLM can generate
+	// new files instead of silently producing zero changes.
+	if changedCount == 0 && len(results) > 0 {
+		noErrors := true
+		for _, r := range results {
+			if r.Error != "" {
+				noErrors = false
+				break
+			}
+		}
+		if noErrors {
+			progress("🔄 No existing files need changes — routing to file creation…")
+			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
+		}
+	}
+
 	// Build summary line for the chat message.
 	var sb strings.Builder
 	if dryRun {
@@ -2429,13 +2466,24 @@ func agentInferExtension(name, content string) string {
 //  2. Response contains ``` somewhere (model wrote explanation then a fence) —
 //     extract only the content of the *first* fenced block.
 //  3. No fences — return the response as-is (model obeyed raw-content instruction).
+//
+// agentTrimSeparator removes a trailing === separator that models sometimes
+// append at the end of the last file block (leaking the multi-file format).
+func agentTrimSeparator(s string) string {
+	t := strings.TrimRight(s, " \t\r\n")
+	if strings.HasSuffix(t, "===") {
+		t = strings.TrimRight(t[:len(t)-3], " \t\r\n")
+	}
+	return t
+}
+
 func agentStripFences(s string) string {
 	s = strings.TrimSpace(s)
 
 	fenceIdx := strings.Index(s, "```")
 	if fenceIdx < 0 {
 		// No fences at all — treat the whole response as file content.
-		return s
+		return agentTrimSeparator(s)
 	}
 
 	// Find the newline that ends the opening fence line (e.g. ```go).
@@ -2449,10 +2497,10 @@ func agentStripFences(s string) string {
 	closeIdx := strings.Index(s[blockStart:], "```")
 	if closeIdx < 0 {
 		// Unclosed fence — return everything after the opening line.
-		return strings.TrimSpace(s[blockStart:])
+		return agentTrimSeparator(strings.TrimSpace(s[blockStart:]))
 	}
 
-	return strings.TrimSpace(s[blockStart : blockStart+closeIdx])
+	return agentTrimSeparator(strings.TrimSpace(s[blockStart : blockStart+closeIdx]))
 }
 
 // FileEntry is the JSON shape returned by /api/files
@@ -2598,4 +2646,324 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// ── Run & Fix ─────────────────────────────────────────────────────────────────
+
+const maxFixAttempts = 5
+
+// FixStreamRequest is the JSON body for POST /api/agent/fixstream.
+type FixStreamRequest struct {
+	Task string `json:"task"`
+}
+
+// handleFixStream runs the project, captures errors, asks the LLM to fix them,
+// and iterates up to maxFixAttempts times. Progress is streamed as SSE events.
+func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	var req FixStreamRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": "invalid request body"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	task := strings.TrimSpace(req.Task)
+
+	// Store user message so it appears in the chat history.
+	userLabel := "🔧 Run & Fix"
+	if task != "" {
+		userLabel = "🔧 Run & Fix: " + task
+	}
+	s.mu.Lock()
+	s.messages = append(s.messages, Message{Role: "user", Content: userLabel, Timestamp: time.Now()})
+	s.mu.Unlock()
+
+	var sseMu sync.Mutex
+	progress := func(text string) {
+		sseMu.Lock()
+		defer sseMu.Unlock()
+		sseWrite(w, flusher, map[string]any{"type": "status", "text": text})
+	}
+
+	taskCtx, cancel := context.WithCancel(context.Background())
+	taskToken := new(struct{})
+	s.mu.Lock()
+	if s.taskCancel != nil {
+		s.taskCancel()
+	}
+	s.taskCancel = cancel
+	s.taskToken = taskToken
+	s.taskRunning = true
+	s.taskKind = "agent"
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.taskToken == taskToken {
+			s.taskCancel = nil
+			s.taskToken = nil
+			s.taskRunning = false
+			s.taskKind = ""
+		}
+		s.mu.Unlock()
+		cancel()
+	}()
+
+	fixStart := time.Now()
+	summary, err := s.runFixLoop(taskCtx, task, progress)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
+		return
+	}
+
+	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(fixStart).Milliseconds()}
+	s.mu.Lock()
+	s.messages = append(s.messages, msg)
+	s.mu.Unlock()
+
+	sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
+}
+
+// runFixLoop detects the project's run/build command, executes it, and if it
+// fails sends the error to the LLM for a fix. Iterates up to maxFixAttempts.
+func (s *Server) runFixLoop(ctx context.Context, task string, progress func(string)) (string, error) {
+	files := s.getActiveFilesSnapshot()
+
+	runCmd, runArgs, detectErr := s.detectRunCommand(files)
+	if detectErr != nil {
+		return fmt.Sprintf("❌ **Run & Fix**: %v\n\nMake sure the project has a recognisable entry point (go.mod, package.json, main.py, Makefile, etc.).", detectErr), nil
+	}
+
+	cmdLabel := runCmd + " " + strings.Join(runArgs, " ")
+	progress(fmt.Sprintf("🔍 Detected runner: `%s`", cmdLabel))
+
+	for attempt := 1; attempt <= maxFixAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+
+		progress(fmt.Sprintf("▶️  Attempt %d/%d — running `%s`…", attempt, maxFixAttempts, cmdLabel))
+
+		buildCtx, buildCancel := context.WithTimeout(ctx, 2*time.Minute)
+		stdout, stderr, exitCode := execCommand(buildCtx, s.directory, runCmd, runArgs...)
+		buildCancel()
+
+		combined := strings.TrimSpace(stdout + "\n" + stderr)
+
+		if exitCode == 0 {
+			progress("✅ No errors — build/run succeeded!")
+			snippet := combined
+			if len(snippet) > 2000 {
+				snippet = snippet[:2000] + "\n…[truncated]"
+			}
+			result := fmt.Sprintf("✅ **Run & Fix**: succeeded after %d attempt(s).", attempt)
+			if snippet != "" {
+				result += "\n\n```\n" + snippet + "\n```"
+			}
+			return result, nil
+		}
+
+		// Truncate error output sent to user/LLM.
+		errSnippet := combined
+		if len(errSnippet) > 3000 {
+			errSnippet = errSnippet[:3000] + "\n…[truncated]"
+		}
+
+		// Show the error clearly.
+		progress(fmt.Sprintf("❌ Error:\n%s", errSnippet))
+
+		if attempt == maxFixAttempts {
+			return fmt.Sprintf("❌ **Run & Fix**: still failing after %d attempt(s).\n\nLast error:\n```\n%s\n```", maxFixAttempts, errSnippet), nil
+		}
+
+		progress(fmt.Sprintf("🤖 Asking LLM to propose a fix (attempt %d/%d)…", attempt, maxFixAttempts))
+
+		// Refresh files snapshot so we send the latest content to the LLM.
+		files = s.getActiveFilesSnapshot()
+		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt)
+		if llmErr != nil {
+			return "", llmErr
+		}
+
+		if len(fixedBlocks) == 0 {
+			return fmt.Sprintf("❌ **Run & Fix**: LLM found no changes to make.\n\nError:\n```\n%s\n```", errSnippet), nil
+		}
+
+		// Report proposed fix before writing.
+		var fixedNames []string
+		for _, block := range fixedBlocks {
+			if block.name != "" {
+				fixedNames = append(fixedNames, block.name)
+			}
+		}
+		progress(fmt.Sprintf("📝 Proposed fix: %s", strings.Join(fixedNames, ", ")))
+
+		cleanDir := filepath.Clean(s.directory)
+		for _, block := range fixedBlocks {
+			if block.name == "" {
+				continue
+			}
+			absPath := filepath.Clean(filepath.Join(s.directory, block.name))
+			rel, relErr := filepath.Rel(cleanDir, absPath)
+			if relErr != nil || strings.HasPrefix(rel, "..") {
+				continue // security: skip paths outside working directory
+			}
+			if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+				progress(fmt.Sprintf("⚠️  Could not create directory for %s: %v", block.name, err))
+				continue
+			}
+			if err := os.WriteFile(absPath, []byte(block.content), 0o644); err != nil {
+				progress(fmt.Sprintf("⚠️  Could not write %s: %v", block.name, err))
+				continue
+			}
+			s.markWrittenFile(block.name)
+			s.mu.Lock()
+			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: block.name, Task: "(auto-fix)"})
+			s.mu.Unlock()
+		}
+		progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(fixedNames, ", ")))
+
+		// Rescan so the next iteration sees up-to-date file contents.
+		if scanned, scanErr := s.performRescan(); scanErr == nil {
+			s.mu.Lock()
+			s.scanResult = scanned
+			s.mu.Unlock()
+		}
+	}
+
+	return "❌ Max fix attempts reached.", nil
+}
+
+// runFixLLM calls the LLM with the current file contents + error output.
+// The model is asked to return only files that need to change, using the same
+// FILE:/---/=== format as agent_create, so we can reuse parseAgentCreateResponse.
+func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int) ([]agentFileBlock, error) {
+	var prompt strings.Builder
+	if task != "" {
+		fmt.Fprintf(&prompt, "Original task: %s\n\n", task)
+	}
+	if attempt > 1 {
+		fmt.Fprintf(&prompt, "IMPORTANT: This is fix attempt %d. The previous fix(es) did not resolve the error. You MUST try a structurally different approach — do NOT repeat the same change.\n\n", attempt)
+	}
+	prompt.WriteString("Current source files:\n\n")
+	for _, f := range files {
+		if f == nil || !f.IsReadable {
+			continue
+		}
+		absPath := filepath.Clean(filepath.Join(s.directory, f.RelPath))
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n\n", f.RelPath, string(data))
+	}
+	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\nFix the error(s) above. Return only the files that need to change.", errorOutput)
+
+	chatReq := &llm.ChatRequest{
+		Model: s.cfg.LLM.Model,
+		Messages: []llm.Message{
+			{Role: "system", Content: promptAgentFix},
+			{Role: "user", Content: prompt.String()},
+		},
+		Temperature: agentTemperature(s.cfg.LLM.Temperature),
+	}
+
+	resp, err := s.llmClient.Chat(ctx, chatReq)
+	if err != nil {
+		return nil, fmt.Errorf("LLM fix request failed: %w", err)
+	}
+
+	return parseAgentCreateResponse(resp.Message.Content), nil
+}
+
+// detectRunCommand inspects the project files and returns the appropriate
+// build/run command. Returns an error when no recognisable entry point is found.
+func (s *Server) detectRunCommand(files []*types.FileInfo) (cmd string, args []string, err error) {
+	// Check the workspace directory directly for manifest files so that
+	// filtered-out files (e.g. vendor/) don't confuse detection.
+	check := func(relPath string) bool {
+		_, statErr := os.Stat(filepath.Join(s.directory, relPath))
+		return statErr == nil
+	}
+
+	// Go module
+	if check("go.mod") {
+		return "go", []string{"build", "./..."}, nil
+	}
+	// Rust
+	if check("Cargo.toml") {
+		return "cargo", []string{"build"}, nil
+	}
+	// Node.js / TypeScript — prefer npm run build, fall back to npm install
+	if check("package.json") {
+		if check("tsconfig.json") {
+			return "npx", []string{"tsc", "--noEmit"}, nil
+		}
+		return "npm", []string{"run", "build", "--if-present"}, nil
+	}
+	// Python: look for a clear entry-point file
+	for _, candidate := range []string{"main.py", "app.py", "run.py", "server.py"} {
+		if check(candidate) {
+			return "python3", []string{"-m", "py_compile", candidate}, nil
+		}
+	}
+	// Java (Maven or Gradle)
+	if check("pom.xml") {
+		return "mvn", []string{"compile", "-q"}, nil
+	}
+	if check("build.gradle") || check("build.gradle.kts") {
+		return "gradle", []string{"build"}, nil
+	}
+	// Makefile
+	if check("Makefile") || check("makefile") {
+		return "make", nil, nil
+	}
+	// Shell scripts — any .sh in the root
+	for _, f := range files {
+		if f != nil && filepath.Dir(f.RelPath) == "." && filepath.Ext(f.RelPath) == ".sh" {
+			return "bash", []string{"-n", f.RelPath}, nil
+		}
+	}
+	// Generic Python fallback: any .py file
+	for _, f := range files {
+		if f != nil && filepath.Ext(f.RelPath) == ".py" {
+			return "python3", []string{"-m", "py_compile", f.RelPath}, nil
+		}
+	}
+
+	return "", nil, fmt.Errorf("no recognisable entry point found (go.mod, Cargo.toml, package.json, main.py, Makefile, etc.)")
+}
+
+// execCommand runs name with args inside dir, captures combined stdout+stderr,
+// and returns the exit code. A non-zero code always means failure.
+func execCommand(ctx context.Context, dir, name string, args ...string) (stdout, stderr string, exitCode int) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if runErr := cmd.Run(); runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			return outBuf.String(), errBuf.String(), exitErr.ExitCode()
+		}
+		return outBuf.String(), errBuf.String() + "\n" + runErr.Error(), 1
+	}
+	return outBuf.String(), errBuf.String(), 0
 }
