@@ -171,9 +171,9 @@ const htmlTemplate = `<!DOCTYPE html>
         .chat-resizer:hover, .chat-resizer.dragging { background: var(--accent); border-color: var(--accent); }
         /* Input area */
         .input-area { padding: 0.85rem 1.25rem 3rem; background: var(--bg2); border-top: none; flex-shrink: 0; }
-        .input-row { display: flex; gap: 0.65rem; align-items: flex-end; }
-        .btn-group { display: flex; gap: 0.65rem; align-items: center; flex-wrap: wrap; align-self: flex-end; flex-shrink: 0; }
-        .input-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+        .input-row { display: flex; flex-direction: column; gap: 0.5rem; }
+        .btn-group { display: flex; gap: 0.65rem; align-items: center; flex-wrap: wrap; }
+        .input-col { display: flex; flex-direction: column; min-width: 0; width: 100%; }
         .msg-input {
             width: 100%; padding: 0.65rem 0.9rem; background: var(--bg3); border: 1px solid var(--border);
             border-radius: 8px 8px 0 0; color: var(--text); font-size: 0.88rem; font-family: inherit;
@@ -246,7 +246,7 @@ const htmlTemplate = `<!DOCTYPE html>
         }
         .btn-auto:hover:not(:disabled) { opacity: 0.85; }
         .btn-auto:disabled { opacity: 0.4; cursor: not-allowed; }
-        .input-hint { font-size: 0.73rem; color: var(--text2); margin-top: 0.35rem; }
+        .input-hint { font-size: 0.73rem; color: var(--text2); margin-bottom: 0.35rem; }
         .input-hint code { background: var(--bg3); padding: 0.1rem 0.3rem; border-radius: 3px; color: var(--accent); font-size: 0.9em; }
         /* Typing indicator */
         .typing { display: flex; align-items: center; gap: 0.35rem; color: var(--text2); font-size: 0.83rem; }
@@ -336,6 +336,12 @@ const htmlTemplate = `<!DOCTYPE html>
         .ibtn.github-btn svg {
             width: 13px; height: 13px; display: block; fill: #f8fafc;
         }
+        body.light .ibtn.github-btn .gh-mark {
+            background: #e5e7eb;
+        }
+        body.light .ibtn.github-btn svg {
+            fill: #1f2328;
+        }
         .app-copyright {
             position: fixed;
             bottom: 0.55rem;
@@ -411,6 +417,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 <div class="chat-resizer" id="chatResizer"></div>
                 <div class="input-area">
                     <div class="input-row">
+                        <div class="input-hint">💡 <code>Enter</code> = ⚡ Agent &nbsp;•&nbsp; <code>Shift+Enter</code> = new line &nbsp;•&nbsp; <code>Send</code> = chat only</div>
                         <div class="input-col">
                         <textarea class="msg-input" id="msgInput" rows="2" placeholder="begin your journey here..."></textarea>
                         <div class="input-resizer" id="inputResizer"></div>
@@ -418,7 +425,7 @@ const htmlTemplate = `<!DOCTYPE html>
                         <div class="btn-group">
                         <button class="btn-info" id="btnInfoBtn" onclick="toggleBtnInfo()" title="Button reference">ℹ</button>
                         <button class="btn-agent" id="agentBtn" title="Agent mode: analyses all files, proposes changes or creates new code">⚡ Agent</button>
-                        <button class="btn-runfix" id="runFixBtn" title="Run the project and auto-fix compilation/build errors with LLM (up to 5 attempts)">🔧 Run &amp; Fix</button>
+                        <button class="btn-runfix" id="runFixBtn" title="Run the project and auto-fix compilation/build errors with LLM (up to 3 attempts)">🔧 Run &amp; Fix</button>
                         <button class="send-btn" id="sendBtn">Send</button>
                         <button class="btn-help" id="clearBtn" title="Clear conversation history">Clear</button>
                         <button class="stop-btn hidden" id="stopBtn">⏹ Stop</button>
@@ -426,7 +433,6 @@ const htmlTemplate = `<!DOCTYPE html>
                         <button class="btn-auto" id="autoApplyBtn" title="Auto-apply is OFF — explicit ⚡ Apply required. Click to enable (use with caution).">🔒 Auto Off</button>
                         </div>
                     </div>
-                    <div class="input-hint">💡 <code>Enter</code> = ⚡ Agent &nbsp;•&nbsp; <code>Shift+Enter</code> = new line &nbsp;•&nbsp; <code>Send</code> = chat only</div>
                 </div>
             </div>
 
@@ -1196,23 +1202,9 @@ function sendRunFix() {
         } else {
             msgEl = makeMsgEl('assistant', '\u274c Run & Fix error: ' + (d.error || 'unknown'), new Date().toISOString());
         }
-        if (logText) {
-            var bubble = msgEl.querySelector('.bubble');
-            if (bubble) {
-                var details = document.createElement('details');
-                details.className = 'runfix-history';
-                var summary = document.createElement('summary');
-                summary.textContent = 'Show attempt log';
-                var pre = document.createElement('pre');
-                pre.className = 'runfix-log';
-                pre.textContent = logText;
-                details.appendChild(summary);
-                details.appendChild(pre);
-                bubble.appendChild(details);
-            }
-        }
         c.appendChild(msgEl);
         c.scrollTop = c.scrollHeight;
+        _lastMsgCount += 2; // user msg + assistant msg added server-side; prevent pollMessages from re-rendering
         loadStatus();
         loadFiles();
         window._activeAbortController = null;
@@ -2239,6 +2231,7 @@ function toggleAutoApply() {
     }).catch(function(){});
     applyAutoApplyUI();
 }
+
 </script>
 </body>
 </html>

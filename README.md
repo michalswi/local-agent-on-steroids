@@ -29,6 +29,9 @@ make build
 # Remote Ollama
 ./local-agent-on-steroids --interactive --dir ./myproject --host 192.168.1.100:11434
 
+# Custom session-log directory (default: ~/Downloads/local-agent-on-steroids)
+./local-agent-on-steroids --dir ./myproject --homedir /tmp/local-agent-on-steroids
+
 # Utility
 ./local-agent-on-steroids --health
 ./local-agent-on-steroids --list-models
@@ -53,11 +56,17 @@ ollama serve
 
 ## \# Session Logs
 
-Every chat and agent interaction is saved as a JSON record under `/tmp/local-agent-on-steroids/`.
+Every chat and agent interaction is saved as a JSON record under `~/Downloads/local-agent-on-steroids/` (default).
+Override the location with the `--homedir` flag:
 
 ```bash
+# default location
+ls ~/Downloads/local-agent-on-steroids/
+# local-agent-20260317-123456.json  local-agent-20260317-130012.json  ...
+
+# custom location
+./local-agent-on-steroids --dir . --homedir /tmp/local-agent-on-steroids
 ls /tmp/local-agent-on-steroids/
-# session_20260317_123456.json  session_20260317_130012.json  ...
 ```
 
 ## \# UI Buttons
@@ -65,7 +74,7 @@ ls /tmp/local-agent-on-steroids/
 | Button | Action |
 |---|---|
 | **⚡ Agent** | Agent mode — scans all files, plans changes, and applies them autonomously. Triggered by pressing `Enter`. |
-| **🔧 Run & Fix** | Runs the project, feeds build errors to the LLM, applies fixes, and retries — up to 5 attempts. |
+| **🔧 Run & Fix** | Runs the project, feeds build errors to the LLM, applies fixes, and retries — up to 3 attempts. |
 | **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. |
 | **Clear** | Clears the current chat conversation history (same behavior as typing `clear` in chat). |
 | **Help** | Opens the in-app help modal listing all available chat commands and keyboard shortcuts. |
@@ -172,3 +181,7 @@ security:
   skip_binaries: true
   max_depth: 20
 ```
+
+## \# AI chat
+
+If you are looking for Ollama based AI chat check this app [scoutai](https://github.com/michalswi/scoutai) or visit [home page](https://scoutai.azurewebsites.net/).

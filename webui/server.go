@@ -2650,7 +2650,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 // ── Run & Fix ─────────────────────────────────────────────────────────────────
 
-const maxFixAttempts = 5
+const maxFixAttempts = 3
 
 // FixStreamRequest is the JSON body for POST /api/agent/fixstream.
 type FixStreamRequest struct {
@@ -2694,9 +2694,11 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	var sseMu sync.Mutex
+	var logLines []string
 	progress := func(text string) {
 		sseMu.Lock()
 		defer sseMu.Unlock()
+		logLines = append(logLines, text)
 		sseWrite(w, flusher, map[string]any{"type": "status", "text": text})
 	}
 
@@ -2733,6 +2735,9 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(logLines) > 0 {
+		summary += "\n\n**Attempt log:**\n```\n" + strings.Join(logLines, "\n") + "\n```"
+	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(fixStart).Milliseconds()}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
@@ -2753,6 +2758,8 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 
 	cmdLabel := runCmd + " " + strings.Join(runArgs, " ")
 	progress(fmt.Sprintf("🔍 Detected runner: `%s`", cmdLabel))
+
+	var prevErrSnippet string
 
 	for attempt := 1; attempt <= maxFixAttempts; attempt++ {
 		if ctx.Err() != nil {
@@ -2789,6 +2796,12 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 		// Show the error clearly.
 		progress(fmt.Sprintf("❌ Error:\n%s", errSnippet))
 
+		sameError := errSnippet == prevErrSnippet && prevErrSnippet != ""
+		if sameError {
+			progress("⚠️  Same error as previous attempt.")
+		}
+		prevErrSnippet = errSnippet
+
 		if attempt == maxFixAttempts {
 			return fmt.Sprintf("❌ **Run & Fix**: still failing after %d attempt(s).\n\nLast error:\n```\n%s\n```", maxFixAttempts, errSnippet), nil
 		}
@@ -2797,13 +2810,18 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 
 		// Refresh files snapshot so we send the latest content to the LLM.
 		files = s.getActiveFilesSnapshot()
-		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt)
+		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt, sameError)
 		if llmErr != nil {
 			return "", llmErr
 		}
 
 		if len(fixedBlocks) == 0 {
-			return fmt.Sprintf("❌ **Run & Fix**: LLM found no changes to make.\n\nError:\n```\n%s\n```", errSnippet), nil
+			if sameError {
+				// Same error, LLM has no new ideas — no point continuing.
+				return fmt.Sprintf("❌ **Run & Fix**: same error persists and LLM could not find a fix.\n\nError:\n```\n%s\n```", errSnippet), nil
+			}
+			progress(fmt.Sprintf("⚠️  LLM found no changes to make on attempt %d/%d — retrying…", attempt, maxFixAttempts))
+			continue
 		}
 
 		// Report proposed fix before writing.
@@ -2854,12 +2872,14 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 // runFixLLM calls the LLM with the current file contents + error output.
 // The model is asked to return only files that need to change, using the same
 // FILE:/---/=== format as agent_create, so we can reuse parseAgentCreateResponse.
-func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int) ([]agentFileBlock, error) {
+func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int, sameError bool) ([]agentFileBlock, error) {
 	var prompt strings.Builder
 	if task != "" {
 		fmt.Fprintf(&prompt, "Original task: %s\n\n", task)
 	}
-	if attempt > 1 {
+	if attempt > 1 && sameError {
+		fmt.Fprintf(&prompt, "CRITICAL: This is fix attempt %d. The SAME error occurred again — your previous fix had NO effect. You MUST take a completely different approach. Do NOT repeat any change you already made.\n\n", attempt)
+	} else if attempt > 1 {
 		fmt.Fprintf(&prompt, "IMPORTANT: This is fix attempt %d. The previous fix(es) did not resolve the error. You MUST try a structurally different approach — do NOT repeat the same change.\n\n", attempt)
 	}
 	prompt.WriteString("Current source files:\n\n")
