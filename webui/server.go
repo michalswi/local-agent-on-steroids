@@ -78,11 +78,12 @@ type Server struct {
 
 // Message represents a chat message
 type Message struct {
-	Role         string            `json:"role"`
-	Content      string            `json:"content"`
-	Timestamp    time.Time         `json:"timestamp"`
-	DurationMs   int64             `json:"duration_ms,omitempty"`
-	AgentResults []AgentFileResult `json:"agentResults,omitempty"`
+	Role           string            `json:"role"`
+	Content        string            `json:"content"`
+	Timestamp      time.Time         `json:"timestamp"`
+	DurationMs     int64             `json:"duration_ms,omitempty"`
+	PromptEvalCount int              `json:"prompt_eval_count,omitempty"`
+	AgentResults   []AgentFileResult `json:"agentResults,omitempty"`
 }
 
 // ChatRequest represents an incoming chat message
@@ -315,10 +316,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg := Message{
-		Role:       "assistant",
-		Content:    answer,
-		Timestamp:  time.Now(),
-		DurationMs: duration.Milliseconds(),
+		Role:            "assistant",
+		Content:         answer,
+		Timestamp:       time.Now(),
+		DurationMs:      duration.Milliseconds(),
+		PromptEvalCount: resp.PromptEvalCount,
 	}
 
 	s.mu.Lock()
@@ -862,10 +864,11 @@ type AgentFileResult struct {
 	Deleted bool `json:"deleted,omitempty"`
 	// Pending is true when the result is a proposed change that has NOT yet
 	// been written to disk — the user must confirm via /api/agent/commit.
-	Pending    bool   `json:"pending,omitempty"`
-	OldContent string `json:"oldContent,omitempty"`
-	NewContent string `json:"newContent,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Pending        bool   `json:"pending,omitempty"`
+	OldContent     string `json:"oldContent,omitempty"`
+	NewContent     string `json:"newContent,omitempty"`
+	Error          string `json:"error,omitempty"`
+	PromptEvalCount int   `json:"prompt_eval_count,omitempty"`
 }
 
 // AgentCommitRequest is the JSON body for POST /api/agent/commit.
@@ -990,7 +993,11 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results}
+	var agentPromptEvalCount int
+	for _, r := range results {
+		agentPromptEvalCount += r.PromptEvalCount
+	}
+	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: agentPromptEvalCount}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
 	s.mu.Unlock()
@@ -1139,7 +1146,11 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(streamAgentStart).Milliseconds(), AgentResults: results}
+	var streamAgentPromptEvalCount int
+	for _, r := range results {
+		streamAgentPromptEvalCount += r.PromptEvalCount
+	}
+	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(streamAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: streamAgentPromptEvalCount}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
 	s.mu.Unlock()
@@ -1434,7 +1445,11 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(extAgentStart).Milliseconds(), AgentResults: results}
+		var extAgentPromptEvalCount int
+		for _, r := range results {
+			extAgentPromptEvalCount += r.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(extAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extAgentPromptEvalCount}
 		s.mu.Lock()
 		s.messages = append(s.messages, msg)
 		s.mu.Unlock()
@@ -1447,7 +1462,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	default: // "chat"
 		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
-		_, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
+		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
@@ -1458,7 +1473,11 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds()}
+		var promptEvalCount int
+		if resp != nil {
+			promptEvalCount = resp.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
 		s.mu.Lock()
 		s.messages = append(s.messages, msg)
 		s.mu.Unlock()
@@ -1623,7 +1642,11 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results}
+		var extStreamAgentPromptEvalCount int
+		for _, r := range results {
+			extStreamAgentPromptEvalCount += r.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extStreamAgentPromptEvalCount}
 		s.mu.Lock()
 		s.messages = append(s.messages, msg)
 		s.mu.Unlock()
@@ -1639,7 +1662,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 
 	default: // "chat"
 		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
-		_, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
+		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
 		if err != nil {
 			if errors.Is(err, taskCtx.Err()) {
 				return // stopped
@@ -1648,7 +1671,11 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds()}
+		var promptEvalCount int
+		if resp != nil {
+			promptEvalCount = resp.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
 		s.mu.Lock()
 		s.messages = append(s.messages, msg)
 		s.mu.Unlock()
@@ -2123,7 +2150,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			// Handle explicit no-change sentinel.
 			if strings.TrimSpace(newContent) == "NO_CHANGE" {
 				progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
-				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false, PromptEvalCount: resp.PromptEvalCount}}
 				return
 			}
 
@@ -2143,18 +2170,19 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
 				}
 				resultsCh <- indexedResult{idx, AgentFileResult{
-					File:       f.RelPath,
-					Changed:    true,
-					Deleted:    true,
-					Pending:    dryRun,
-					OldContent: oldContent,
+					File:            f.RelPath,
+					Changed:         true,
+					Deleted:         true,
+					Pending:         dryRun,
+					OldContent:      oldContent,
+					PromptEvalCount: resp.PromptEvalCount,
 				}}
 				return
 			}
 
 			if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
 				progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
-				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false, PromptEvalCount: resp.PromptEvalCount}}
 				return
 			}
 
@@ -2173,11 +2201,12 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				progress(fmt.Sprintf("📋 %s — proposed (awaiting confirmation)", f.RelPath))
 			}
 			resultsCh <- indexedResult{idx, AgentFileResult{
-				File:       f.RelPath,
-				Changed:    true,
-				Pending:    dryRun,
-				OldContent: oldContent,
-				NewContent: newContent,
+				File:            f.RelPath,
+				Changed:         true,
+				Pending:         dryRun,
+				OldContent:      oldContent,
+				NewContent:      newContent,
+				PromptEvalCount: resp.PromptEvalCount,
 			}}
 		}(fileIdx, f)
 	}
@@ -2538,6 +2567,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			results = append(results, AgentFileResult{
 				File: relSlash, Created: true, Changed: true,
 				Pending: dryRun, OldContent: "", NewContent: fileContent,
+				PromptEvalCount: resp.PromptEvalCount,
 			})
 		}
 	}
@@ -2575,6 +2605,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			return "", nil, fmt.Errorf("agent could not determine filename — try rephrasing, e.g. \"create main.go with a simple web server\"")
 		}
 
+		legacyPromptEvalCount := resp.PromptEvalCount
 		for _, blk := range blocks {
 			fileName := blk.name
 			fileContent := blk.content
@@ -2616,6 +2647,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			results = append(results, AgentFileResult{
 				File: relSlash, Created: true, Changed: true,
 				Pending: dryRun, OldContent: "", NewContent: fileContent,
+				PromptEvalCount: legacyPromptEvalCount,
 			})
 		}
 	}

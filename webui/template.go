@@ -777,7 +777,7 @@ function pollMessages() {
             var c = document.getElementById('messages');
             c.innerHTML = '';
             msgs.forEach(function(m) {
-                c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms));
+                c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms, m.prompt_eval_count));
                 if (m.agentResults && m.agentResults.length) {
                     var hasPending = m.agentResults.some(function(r){ return r.pending; });
                     if (hasPending) { renderAgentPendingResults(m.agentResults, c); }
@@ -905,7 +905,7 @@ function loadMessages() {
         var list = msgs || [];
         _lastMsgCount = list.length;
         list.forEach(function(m) {
-            c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms));
+            c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms, m.prompt_eval_count));
             if (m.agentResults && m.agentResults.length) {
                 var hasPending = m.agentResults.some(function(r){ return r.pending; });
                 if (hasPending) {
@@ -920,7 +920,7 @@ function loadMessages() {
     }).catch(function(){});
 }
 
-function makeMsgEl(role, content, ts, durationMs) {
+function makeMsgEl(role, content, ts, durationMs, promptEvalCount) {
     var wrap   = document.createElement('div');
     wrap.className = 'msg ' + role;
     var meta   = document.createElement('div');
@@ -942,6 +942,9 @@ function makeMsgEl(role, content, ts, durationMs) {
             durStr = totalSecs.toFixed(1) + 's';
         }
         metaText += ' · ⏱ ' + durStr;
+    }
+    if (role === 'assistant' && promptEvalCount && promptEvalCount > 0) {
+        metaText += ' · 🧮 ' + promptEvalCount + ' ctx tokens';
     }
     meta.textContent = metaText;
     var bubble = document.createElement('div');
@@ -991,7 +994,7 @@ function sendMsg() {
         if (d.cleared) {
             document.getElementById('messages').innerHTML = '';
         } else if (d.success && d.message) {
-            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms));
+            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms, d.message.prompt_eval_count));
             c.scrollTop = c.scrollHeight;
             autoApplyCodeBlocks(d.message.content, c, txt);
         } else {
@@ -1084,7 +1087,7 @@ function sendAgentTask() {
         if (d.cleared) {
             document.getElementById('messages').innerHTML = '';
         } else if (d.success && d.message) {
-            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms));
+            c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms, d.message.prompt_eval_count));
             c.scrollTop = c.scrollHeight;
             if (d.agentResults && d.agentResults.length) {
                 var hasPending = d.agentResults.some(function(r){ return r.pending; });
@@ -1198,7 +1201,7 @@ function sendRunFix() {
         var t = document.getElementById(tid); if (t) t.remove();
         var msgEl;
         if (d.success && d.message) {
-            msgEl = makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms);
+            msgEl = makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms, d.message.prompt_eval_count);
         } else {
             msgEl = makeMsgEl('assistant', '\u274c Run & Fix error: ' + (d.error || 'unknown'), new Date().toISOString());
         }
@@ -2172,7 +2175,7 @@ function rescan() {
             loadStatus();
             if (d.success && d.message) {
                 var c = document.getElementById('messages');
-                var el = makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms);
+                var el = makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms, d.message.prompt_eval_count);
                 c.appendChild(el);
                 c.scrollTop = c.scrollHeight;
                 setTimeout(function() {
