@@ -168,6 +168,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/agent/commit", s.handleAgentCommit)
 	mux.HandleFunc("/api/agent/fixstream", s.handleFixStream)
 	mux.HandleFunc("/api/ext/send", s.handleExtSend)
+	mux.HandleFunc("/api/ext/stream", s.handleExtStream)
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("🌐 Web UI available at http://localhost%s\n", addr)
@@ -663,7 +664,12 @@ func (s *Server) processQuestion(ctx context.Context, question string, files []*
 		}
 	}
 
-	systemPrompt := promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	var systemPrompt string
+	if len(filePaths) == 0 {
+		systemPrompt = promptChat + "\nAvailable files: none — the working directory has not been scanned or contains no readable files. Do NOT invent, guess, or fabricate any file contents or code. If the user asks about a specific file, tell them no files are available."
+	} else {
+		systemPrompt = promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	}
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
@@ -829,7 +835,7 @@ type AgentRunRequest struct {
 	Task string `json:"task"`
 }
 
-// ExtSendRequest is the JSON body for POST /api/ext/send.
+// ExtSendRequest is the JSON body for POST /api/ext/send and POST /api/ext/stream.
 // It allows external apps to send messages or agent tasks directly without
 // going through the web UI chat box.
 //
@@ -837,11 +843,14 @@ type AgentRunRequest struct {
 //
 //	Message – the prompt / task text (required)
 //	Mode    – "chat" (default) or "agent"
-//	Auto    – for agent mode: write files immediately (default true)
+//	Model   – optional model override for this request only (e.g. "llama3:8b")
+//
+// Note: agent mode always writes files immediately via the external API.
+// The pending/commit review workflow is exclusively for the browser UI.
 type ExtSendRequest struct {
 	Message string `json:"message"`
-	Mode    string `json:"mode"` // "chat" | "agent"
-	Auto    *bool  `json:"auto"` // nil → true for agent, ignored for chat
+	Mode    string `json:"mode"`  // "chat" | "agent"
+	Model   string `json:"model"` // optional per-request model override
 }
 
 // AgentFileResult describes what the agent did with one file.
@@ -1331,6 +1340,26 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply a per-request model override if provided, then restore on exit.
+	if req.Model != "" {
+		reqModel := strings.TrimSpace(req.Model)
+		s.mu.Lock()
+		prevModel := s.model
+		prevCfgModel := s.cfg.LLM.Model
+		prevClient := s.llmClient
+		s.model = reqModel
+		s.cfg.LLM.Model = reqModel
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			s.model = prevModel
+			s.cfg.LLM.Model = prevCfgModel
+			s.llmClient = prevClient
+			s.mu.Unlock()
+		}()
+	}
+
 	// Store the user message so it shows up in the chat UI immediately.
 	s.mu.Lock()
 	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
@@ -1380,15 +1409,9 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	switch mode {
 	case "agent":
-		// Default auto=true for external API calls (caller wants changes applied).
-		autoApply := true
-		if req.Auto != nil {
-			autoApply = *req.Auto
-		}
-		dryRun := !autoApply
-
+		// External API always writes files immediately — no pending/commit workflow.
 		extAgentStart := time.Now()
-		summary, results, err := s.runAgentTask(taskCtx, text, func(string) {}, dryRun)
+		summary, results, err := s.runAgentTask(taskCtx, text, func(string) {}, false)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
@@ -1399,16 +1422,15 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if !dryRun {
-			for _, res := range results {
-				if res.Changed {
-					if scanned, scanErr := s.performRescan(); scanErr == nil {
-						s.mu.Lock()
-						s.scanResult = scanned
-						s.mu.Unlock()
-					}
-					break
+		// Always rescan after writing — dryRun is always false for the external API.
+		for _, res := range results {
+			if res.Changed {
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
 				}
+				break
 			}
 		}
 
@@ -1442,6 +1464,196 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
+	}
+}
+
+// handleExtStream is the streaming (SSE) variant of handleExtSend.
+// It accepts the same ExtSendRequest body and emits Server-Sent Events so
+// external callers can stream progress in real time without polling.
+//
+// Event types:
+//
+//	{"type":"status","text":"..."}                         — agent progress update (agent mode only)
+//	{"type":"done","success":true,"message":{...},"agentResults":[...]}  — final result
+//	{"type":"done","success":true,"cleared":true}          — after a clear command
+//	{"type":"done","success":false,"error":"..."}          — on failure
+func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	var req ExtSendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": "invalid request body"})
+		return
+	}
+
+	text := strings.TrimSpace(req.Message)
+	if text == "" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": "message is required"})
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "chat"
+	}
+	if mode != "chat" && mode != "agent" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": "mode must be \"chat\" or \"agent\""})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// Apply a per-request model override if provided, then restore on exit.
+	if req.Model != "" {
+		reqModel := strings.TrimSpace(req.Model)
+		s.mu.Lock()
+		prevModel := s.model
+		prevCfgModel := s.cfg.LLM.Model
+		prevClient := s.llmClient
+		s.model = reqModel
+		s.cfg.LLM.Model = reqModel
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			s.model = prevModel
+			s.cfg.LLM.Model = prevCfgModel
+			s.llmClient = prevClient
+			s.mu.Unlock()
+		}()
+	}
+
+	s.mu.Lock()
+	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	s.mu.Unlock()
+
+	// Handle built-in commands (clear, stats, …) before touching the LLM.
+	if response := s.handleCommand(text); response != "" {
+		if response == "__CLEAR__" {
+			sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "cleared": true})
+			return
+		}
+		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
+		return
+	}
+
+	// Acquire a task slot (cancels any previous stale task).
+	taskCtx, cancel := context.WithCancel(context.Background())
+	taskToken := new(struct{})
+	s.mu.Lock()
+	if s.taskCancel != nil {
+		s.taskCancel()
+	}
+	s.taskCancel = cancel
+	s.taskToken = taskToken
+	s.taskRunning = true
+	s.taskKind = mode
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.taskToken == taskToken {
+			s.taskCancel = nil
+			s.taskToken = nil
+			s.taskRunning = false
+			s.taskKind = ""
+			s.lastProgressText = ""
+			s.planProgressText = ""
+		}
+		s.mu.Unlock()
+		cancel()
+	}()
+
+	// sseMu guards concurrent writes to w from the progress callback.
+	var sseMu sync.Mutex
+
+	switch mode {
+	case "agent":
+		// External API always writes files immediately — no pending/commit workflow.
+		progress := func(text string) {
+			sseMu.Lock()
+			defer sseMu.Unlock()
+			s.mu.Lock()
+			s.lastProgressText = text
+			if strings.Contains(text, "\U0001F4CB Plan:") {
+				s.planProgressText = text
+			}
+			s.mu.Unlock()
+			sseWrite(w, flusher, map[string]any{"type": "status", "text": text})
+		}
+
+		agentStart := time.Now()
+		summary, results, err := s.runAgentTask(taskCtx, text, progress, false)
+		if err != nil {
+			if errors.Is(err, taskCtx.Err()) {
+				return // stopped
+			}
+			sseMu.Lock()
+			sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
+			sseMu.Unlock()
+			return
+		}
+
+		// Always rescan after writing — dryRun is always false for the external API.
+		for _, res := range results {
+			if res.Changed {
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
+				}
+				break
+			}
+		}
+
+		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+
+		sseMu.Lock()
+		sseWrite(w, flusher, map[string]any{
+			"type":         "done",
+			"success":      true,
+			"message":      msg,
+			"agentResults": results,
+		})
+		sseMu.Unlock()
+
+	default: // "chat"
+		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
+		_, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
+		if err != nil {
+			if errors.Is(err, taskCtx.Err()) {
+				return // stopped
+			}
+			sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
+			return
+		}
+
+		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds()}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
 	}
 }
 
@@ -1628,7 +1840,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	// language/framework absent from the workspace — route directly to create.
 	if targetFiles == nil {
 		progress("🔍 Technology mismatch detected — routing to file creation…")
-		return s.runAgentCreate(ctx, task, allFiles, progress, true)
+		return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
 	}
 
 	progress(fmt.Sprintf("Scoping: %d file(s) in range…", len(targetFiles)))
@@ -1717,16 +1929,13 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			}
 		}
 		if !hasMatch {
-			// File-creation flows should always be confirm-first in UI so users can
-			// select/tick which proposed files to create.
-			return s.runAgentCreate(ctx, task, allFiles, progress, true)
+			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
 		}
 	}
 
 	// ── No existing files: ask LLM to create a new one ──────────────────────
 	if len(targetFiles) == 0 {
-		// Force confirm-first for initial scaffold generation.
-		return s.runAgentCreate(ctx, task, nil, progress, true)
+		return s.runAgentCreate(ctx, task, nil, progress, dryRun)
 	}
 
 	var results []AgentFileResult

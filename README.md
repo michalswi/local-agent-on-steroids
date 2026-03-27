@@ -86,7 +86,6 @@ ls /tmp/local-agent-on-steroids/
 
 | Command | Action |
 |---|---|
-| `focus <path>` | Limit LLM context to one file |
 | `model <name>` | Switch model |
 | `rescan` | Pick up new/changed files |
 | `clear` | Clear chat history |
@@ -107,15 +106,28 @@ All three prompts are the static base. At runtime the server appends dynamic con
 
 ## \# External API
 
-`POST /api/ext/send` lets any application send messages or agent tasks directly to the running instance without going through the browser UI. Requests and replies are stored in the chat history and appear in the UI on the next refresh.
+Two endpoints are available for programmatic access. Both accept the same request body and store the exchange in the chat history so it appears in the UI on the next refresh.
 
-**Request body:**
+| Endpoint | Transport | Use when |
+|---|---|---|
+| `POST /api/ext/send` | JSON (blocking) | Short tasks; simple scripts |
+| `POST /api/ext/stream` | Server-Sent Events | Long agent tasks; real-time progress |
+
+**Request body** (same for both endpoints):
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `message` | string | required | The prompt or agent task |
 | `mode` | `"chat"` \| `"agent"` | `"chat"` | Chat (Send) or Agent mode |
-| `auto` | bool | `true` | Agent only — write files immediately (`true`) or propose diffs (`false`) |
+| `model` | string | *(server default)* | Optional model override for this request only (e.g. `"llama3:8b"`). Reverts to the server default after the call. |
+
+> Agent mode via the external API always writes files to disk immediately. The pending/confirm workflow is a browser UI feature only.
+
+**Verify app**:
+
+```bash
+curl -s http://localhost:5050/api/status | jq
+```
 
 **Chat mode example** (equivalent to pressing **Send**):
 
@@ -125,23 +137,41 @@ curl -s -X POST http://localhost:5050/api/ext/send \
   -d '{"message": "explain the main.go file", "mode": "chat"}' | jq .
 ```
 
-**Agent mode example with auto-apply ON** (equivalent to pressing **⚡ Agent** with 🔒 Auto On):
+**Agent mode example** (equivalent to pressing **⚡ Agent**):
 
 ```bash
 curl -s -X POST http://localhost:5050/api/ext/send \
   -H 'Content-Type: application/json' \
-  -d '{"message": "add error handling to all functions in utils.go", "mode": "agent", "auto": true}' | jq .
+  -d '{"message": "add error handling to all functions in utils.go", "mode": "agent"}' | jq .
 ```
 
-**Agent mode example with auto-apply OFF** (proposes diffs, no writes):
+**Per-request model override** (reverts to server default after the call):
 
 ```bash
 curl -s -X POST http://localhost:5050/api/ext/send \
   -H 'Content-Type: application/json' \
-  -d '{"message": "refactor main.go", "mode": "agent", "auto": false}' | jq .
+  -d '{"message": "explain the main.go file", "mode": "chat", "model": "gemma3:4b"}' | jq .
 ```
 
-**Response:**
+**Streaming example** — `/api/ext/stream` emits SSE events so you see progress as it happens:
+
+```bash
+curl -s -X POST http://localhost:5050/api/ext/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "refactor main.go", "mode": "agent"}'
+```
+
+SSE events:
+
+```
+data: {"type":"status","text":"⚙ Processing main.go…"}
+
+data: {"type":"done","success":true,"message":{…},"agentResults":[…]}
+```
+
+> `status` events are only emitted in agent mode. The final `done` event has the same shape as the `/api/ext/send` JSON response.
+
+**Response** (`/api/ext/send` only):
 
 ```json
 {
@@ -149,15 +179,25 @@ curl -s -X POST http://localhost:5050/api/ext/send \
   "message": {
     "role": "assistant",
     "content": "...",
-    "timestamp": "2026-03-17T12:00:00Z"
+    "timestamp": "2026-03-17T12:00:00Z",
+    "duration_ms": 3210,
+    "agentResults": [...]
   },
   "agentResults": [
-    { "file": "main.go", "changed": true, "oldContent": "...", "newContent": "..." }
+    {
+      "file": "main.go",
+      "changed": true,
+      "created": false,
+      "oldContent": "...",
+      "newContent": "..."
+    }
   ]
 }
 ```
 
-> `agentResults` is only present in agent mode responses.
+> `agentResults` is only present in agent mode responses. It is included at the top level for convenience and also mirrored inside `message.agentResults`.
+>
+> `AgentFileResult` fields: `file` (path), `changed` (bool), `created` (bool — true when the file was newly created), `deleted` (bool, omitempty — true when the file was removed), `oldContent`/`newContent` (strings, omitempty), `error` (string, omitempty — set when that file's LLM call failed).
 
 ## \# Configuration
 
