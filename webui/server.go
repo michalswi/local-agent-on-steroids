@@ -78,11 +78,12 @@ type Server struct {
 
 // Message represents a chat message
 type Message struct {
-	Role         string            `json:"role"`
-	Content      string            `json:"content"`
-	Timestamp    time.Time         `json:"timestamp"`
-	DurationMs   int64             `json:"duration_ms,omitempty"`
-	AgentResults []AgentFileResult `json:"agentResults,omitempty"`
+	Role           string            `json:"role"`
+	Content        string            `json:"content"`
+	Timestamp      time.Time         `json:"timestamp"`
+	DurationMs     int64             `json:"duration_ms,omitempty"`
+	PromptEvalCount int              `json:"prompt_eval_count,omitempty"`
+	AgentResults   []AgentFileResult `json:"agentResults,omitempty"`
 }
 
 // ChatRequest represents an incoming chat message
@@ -168,6 +169,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/agent/commit", s.handleAgentCommit)
 	mux.HandleFunc("/api/agent/fixstream", s.handleFixStream)
 	mux.HandleFunc("/api/ext/send", s.handleExtSend)
+	mux.HandleFunc("/api/ext/stream", s.handleExtStream)
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("🌐 Web UI available at http://localhost%s\n", addr)
@@ -314,10 +316,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg := Message{
-		Role:       "assistant",
-		Content:    answer,
-		Timestamp:  time.Now(),
-		DurationMs: duration.Milliseconds(),
+		Role:            "assistant",
+		Content:         answer,
+		Timestamp:       time.Now(),
+		DurationMs:      duration.Milliseconds(),
+		PromptEvalCount: resp.PromptEvalCount,
 	}
 
 	s.mu.Lock()
@@ -663,7 +666,12 @@ func (s *Server) processQuestion(ctx context.Context, question string, files []*
 		}
 	}
 
-	systemPrompt := promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	var systemPrompt string
+	if len(filePaths) == 0 {
+		systemPrompt = promptChat + "\nAvailable files: none — the working directory has not been scanned or contains no readable files. Do NOT invent, guess, or fabricate any file contents or code. If the user asks about a specific file, tell them no files are available."
+	} else {
+		systemPrompt = promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	}
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
@@ -829,7 +837,7 @@ type AgentRunRequest struct {
 	Task string `json:"task"`
 }
 
-// ExtSendRequest is the JSON body for POST /api/ext/send.
+// ExtSendRequest is the JSON body for POST /api/ext/send and POST /api/ext/stream.
 // It allows external apps to send messages or agent tasks directly without
 // going through the web UI chat box.
 //
@@ -837,11 +845,14 @@ type AgentRunRequest struct {
 //
 //	Message – the prompt / task text (required)
 //	Mode    – "chat" (default) or "agent"
-//	Auto    – for agent mode: write files immediately (default true)
+//	Model   – optional model override for this request only (e.g. "llama3:8b")
+//
+// Note: agent mode always writes files immediately via the external API.
+// The pending/commit review workflow is exclusively for the browser UI.
 type ExtSendRequest struct {
 	Message string `json:"message"`
-	Mode    string `json:"mode"` // "chat" | "agent"
-	Auto    *bool  `json:"auto"` // nil → true for agent, ignored for chat
+	Mode    string `json:"mode"`  // "chat" | "agent"
+	Model   string `json:"model"` // optional per-request model override
 }
 
 // AgentFileResult describes what the agent did with one file.
@@ -853,10 +864,11 @@ type AgentFileResult struct {
 	Deleted bool `json:"deleted,omitempty"`
 	// Pending is true when the result is a proposed change that has NOT yet
 	// been written to disk — the user must confirm via /api/agent/commit.
-	Pending    bool   `json:"pending,omitempty"`
-	OldContent string `json:"oldContent,omitempty"`
-	NewContent string `json:"newContent,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Pending        bool   `json:"pending,omitempty"`
+	OldContent     string `json:"oldContent,omitempty"`
+	NewContent     string `json:"newContent,omitempty"`
+	Error          string `json:"error,omitempty"`
+	PromptEvalCount int   `json:"prompt_eval_count,omitempty"`
 }
 
 // AgentCommitRequest is the JSON body for POST /api/agent/commit.
@@ -981,7 +993,11 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results}
+	var agentPromptEvalCount int
+	for _, r := range results {
+		agentPromptEvalCount += r.PromptEvalCount
+	}
+	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: agentPromptEvalCount}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
 	s.mu.Unlock()
@@ -1130,7 +1146,11 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(streamAgentStart).Milliseconds(), AgentResults: results}
+	var streamAgentPromptEvalCount int
+	for _, r := range results {
+		streamAgentPromptEvalCount += r.PromptEvalCount
+	}
+	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(streamAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: streamAgentPromptEvalCount}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
 	s.mu.Unlock()
@@ -1331,6 +1351,26 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply a per-request model override if provided, then restore on exit.
+	if req.Model != "" {
+		reqModel := strings.TrimSpace(req.Model)
+		s.mu.Lock()
+		prevModel := s.model
+		prevCfgModel := s.cfg.LLM.Model
+		prevClient := s.llmClient
+		s.model = reqModel
+		s.cfg.LLM.Model = reqModel
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			s.model = prevModel
+			s.cfg.LLM.Model = prevCfgModel
+			s.llmClient = prevClient
+			s.mu.Unlock()
+		}()
+	}
+
 	// Store the user message so it shows up in the chat UI immediately.
 	s.mu.Lock()
 	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
@@ -1380,15 +1420,9 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	switch mode {
 	case "agent":
-		// Default auto=true for external API calls (caller wants changes applied).
-		autoApply := true
-		if req.Auto != nil {
-			autoApply = *req.Auto
-		}
-		dryRun := !autoApply
-
+		// External API always writes files immediately — no pending/commit workflow.
 		extAgentStart := time.Now()
-		summary, results, err := s.runAgentTask(taskCtx, text, func(string) {}, dryRun)
+		summary, results, err := s.runAgentTask(taskCtx, text, func(string) {}, false)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
@@ -1399,20 +1433,23 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if !dryRun {
-			for _, res := range results {
-				if res.Changed {
-					if scanned, scanErr := s.performRescan(); scanErr == nil {
-						s.mu.Lock()
-						s.scanResult = scanned
-						s.mu.Unlock()
-					}
-					break
+		// Always rescan after writing — dryRun is always false for the external API.
+		for _, res := range results {
+			if res.Changed {
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
 				}
+				break
 			}
 		}
 
-		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(extAgentStart).Milliseconds(), AgentResults: results}
+		var extAgentPromptEvalCount int
+		for _, r := range results {
+			extAgentPromptEvalCount += r.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(extAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extAgentPromptEvalCount}
 		s.mu.Lock()
 		s.messages = append(s.messages, msg)
 		s.mu.Unlock()
@@ -1425,7 +1462,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	default: // "chat"
 		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
-		_, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
+		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
@@ -1436,12 +1473,214 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds()}
+		var promptEvalCount int
+		if resp != nil {
+			promptEvalCount = resp.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
 		s.mu.Lock()
 		s.messages = append(s.messages, msg)
 		s.mu.Unlock()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
+	}
+}
+
+// handleExtStream is the streaming (SSE) variant of handleExtSend.
+// It accepts the same ExtSendRequest body and emits Server-Sent Events so
+// external callers can stream progress in real time without polling.
+//
+// Event types:
+//
+//	{"type":"status","text":"..."}                         — agent progress update (agent mode only)
+//	{"type":"done","success":true,"message":{...},"agentResults":[...]}  — final result
+//	{"type":"done","success":true,"cleared":true}          — after a clear command
+//	{"type":"done","success":false,"error":"..."}          — on failure
+func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	var req ExtSendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": "invalid request body"})
+		return
+	}
+
+	text := strings.TrimSpace(req.Message)
+	if text == "" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": "message is required"})
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "chat"
+	}
+	if mode != "chat" && mode != "agent" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": "mode must be \"chat\" or \"agent\""})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// Apply a per-request model override if provided, then restore on exit.
+	if req.Model != "" {
+		reqModel := strings.TrimSpace(req.Model)
+		s.mu.Lock()
+		prevModel := s.model
+		prevCfgModel := s.cfg.LLM.Model
+		prevClient := s.llmClient
+		s.model = reqModel
+		s.cfg.LLM.Model = reqModel
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			s.model = prevModel
+			s.cfg.LLM.Model = prevCfgModel
+			s.llmClient = prevClient
+			s.mu.Unlock()
+		}()
+	}
+
+	s.mu.Lock()
+	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	s.mu.Unlock()
+
+	// Handle built-in commands (clear, stats, …) before touching the LLM.
+	if response := s.handleCommand(text); response != "" {
+		if response == "__CLEAR__" {
+			sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "cleared": true})
+			return
+		}
+		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
+		return
+	}
+
+	// Acquire a task slot (cancels any previous stale task).
+	taskCtx, cancel := context.WithCancel(context.Background())
+	taskToken := new(struct{})
+	s.mu.Lock()
+	if s.taskCancel != nil {
+		s.taskCancel()
+	}
+	s.taskCancel = cancel
+	s.taskToken = taskToken
+	s.taskRunning = true
+	s.taskKind = mode
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.taskToken == taskToken {
+			s.taskCancel = nil
+			s.taskToken = nil
+			s.taskRunning = false
+			s.taskKind = ""
+			s.lastProgressText = ""
+			s.planProgressText = ""
+		}
+		s.mu.Unlock()
+		cancel()
+	}()
+
+	// sseMu guards concurrent writes to w from the progress callback.
+	var sseMu sync.Mutex
+
+	switch mode {
+	case "agent":
+		// External API always writes files immediately — no pending/commit workflow.
+		progress := func(text string) {
+			sseMu.Lock()
+			defer sseMu.Unlock()
+			s.mu.Lock()
+			s.lastProgressText = text
+			if strings.Contains(text, "\U0001F4CB Plan:") {
+				s.planProgressText = text
+			}
+			s.mu.Unlock()
+			sseWrite(w, flusher, map[string]any{"type": "status", "text": text})
+		}
+
+		agentStart := time.Now()
+		summary, results, err := s.runAgentTask(taskCtx, text, progress, false)
+		if err != nil {
+			if errors.Is(err, taskCtx.Err()) {
+				return // stopped
+			}
+			sseMu.Lock()
+			sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
+			sseMu.Unlock()
+			return
+		}
+
+		// Always rescan after writing — dryRun is always false for the external API.
+		for _, res := range results {
+			if res.Changed {
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
+				}
+				break
+			}
+		}
+
+		var extStreamAgentPromptEvalCount int
+		for _, r := range results {
+			extStreamAgentPromptEvalCount += r.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extStreamAgentPromptEvalCount}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+
+		sseMu.Lock()
+		sseWrite(w, flusher, map[string]any{
+			"type":         "done",
+			"success":      true,
+			"message":      msg,
+			"agentResults": results,
+		})
+		sseMu.Unlock()
+
+	default: // "chat"
+		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
+		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
+		if err != nil {
+			if errors.Is(err, taskCtx.Err()) {
+				return // stopped
+			}
+			sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
+			return
+		}
+
+		var promptEvalCount int
+		if resp != nil {
+			promptEvalCount = resp.PromptEvalCount
+		}
+		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
+		s.mu.Lock()
+		s.messages = append(s.messages, msg)
+		s.mu.Unlock()
+
+		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
 	}
 }
 
@@ -1628,7 +1867,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	// language/framework absent from the workspace — route directly to create.
 	if targetFiles == nil {
 		progress("🔍 Technology mismatch detected — routing to file creation…")
-		return s.runAgentCreate(ctx, task, allFiles, progress, true)
+		return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
 	}
 
 	progress(fmt.Sprintf("Scoping: %d file(s) in range…", len(targetFiles)))
@@ -1717,16 +1956,13 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			}
 		}
 		if !hasMatch {
-			// File-creation flows should always be confirm-first in UI so users can
-			// select/tick which proposed files to create.
-			return s.runAgentCreate(ctx, task, allFiles, progress, true)
+			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
 		}
 	}
 
 	// ── No existing files: ask LLM to create a new one ──────────────────────
 	if len(targetFiles) == 0 {
-		// Force confirm-first for initial scaffold generation.
-		return s.runAgentCreate(ctx, task, nil, progress, true)
+		return s.runAgentCreate(ctx, task, nil, progress, dryRun)
 	}
 
 	var results []AgentFileResult
@@ -1914,7 +2150,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			// Handle explicit no-change sentinel.
 			if strings.TrimSpace(newContent) == "NO_CHANGE" {
 				progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
-				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false, PromptEvalCount: resp.PromptEvalCount}}
 				return
 			}
 
@@ -1934,18 +2170,19 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
 				}
 				resultsCh <- indexedResult{idx, AgentFileResult{
-					File:       f.RelPath,
-					Changed:    true,
-					Deleted:    true,
-					Pending:    dryRun,
-					OldContent: oldContent,
+					File:            f.RelPath,
+					Changed:         true,
+					Deleted:         true,
+					Pending:         dryRun,
+					OldContent:      oldContent,
+					PromptEvalCount: resp.PromptEvalCount,
 				}}
 				return
 			}
 
 			if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
 				progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
-				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+				resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false, PromptEvalCount: resp.PromptEvalCount}}
 				return
 			}
 
@@ -1964,11 +2201,12 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				progress(fmt.Sprintf("📋 %s — proposed (awaiting confirmation)", f.RelPath))
 			}
 			resultsCh <- indexedResult{idx, AgentFileResult{
-				File:       f.RelPath,
-				Changed:    true,
-				Pending:    dryRun,
-				OldContent: oldContent,
-				NewContent: newContent,
+				File:            f.RelPath,
+				Changed:         true,
+				Pending:         dryRun,
+				OldContent:      oldContent,
+				NewContent:      newContent,
+				PromptEvalCount: resp.PromptEvalCount,
 			}}
 		}(fileIdx, f)
 	}
@@ -2329,6 +2567,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			results = append(results, AgentFileResult{
 				File: relSlash, Created: true, Changed: true,
 				Pending: dryRun, OldContent: "", NewContent: fileContent,
+				PromptEvalCount: resp.PromptEvalCount,
 			})
 		}
 	}
@@ -2366,6 +2605,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			return "", nil, fmt.Errorf("agent could not determine filename — try rephrasing, e.g. \"create main.go with a simple web server\"")
 		}
 
+		legacyPromptEvalCount := resp.PromptEvalCount
 		for _, blk := range blocks {
 			fileName := blk.name
 			fileContent := blk.content
@@ -2407,6 +2647,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			results = append(results, AgentFileResult{
 				File: relSlash, Created: true, Changed: true,
 				Pending: dryRun, OldContent: "", NewContent: fileContent,
+				PromptEvalCount: legacyPromptEvalCount,
 			})
 		}
 	}
@@ -2435,6 +2676,97 @@ func agentTemperature(configured float64) float64 {
 		return minAgentTemp
 	}
 	return configured
+}
+
+// fixTemperature returns the temperature to use for a fix attempt.
+// When the same error keeps recurring we raise the temperature to push the model
+// off its local minimum and force genuinely different solutions.
+func fixTemperature(configured float64, attempt int, sameError bool) float64 {
+	base := agentTemperature(configured)
+	if sameError && attempt > 1 {
+		// Each repeated failure nudges temperature up by 0.15, capped at 1.0.
+		bump := 0.15 * float64(attempt-1)
+		if t := base + bump; t < 1.0 {
+			return t
+		}
+		return 1.0
+	}
+	return base
+}
+
+// extractErrorSnippets parses compiler/interpreter error output for
+// "file:line: message" references and returns a formatted string that shows
+// the exact source lines together with their error annotations.
+// workDir is the project root used to resolve relative paths.
+func extractErrorSnippets(workDir, errorOutput string) string {
+	// Matches: ./path/file.go:42:5: some error message
+	//          path/file.go:42: some error
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+\.\w+):(\d+)(?::\d+)?:\s+(.+)$`)
+	type annotation struct {
+		file    string
+		lineNum int
+		msg     string
+	}
+	var annotations []annotation
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		ln, err := strconv.Atoi(m[2])
+		if err != nil {
+			continue
+		}
+		annotations = append(annotations, annotation{file: m[1], lineNum: ln, msg: m[3]})
+	}
+	if len(annotations) == 0 {
+		return ""
+	}
+
+	// Group annotations by file and load each file once.
+	type fileEntry struct {
+		lines []string
+		annos []annotation
+	}
+	fileMap := map[string]*fileEntry{}
+	for _, a := range annotations {
+		fe, ok := fileMap[a.file]
+		if !ok {
+			abs := filepath.Clean(filepath.Join(workDir, a.file))
+			rel, relErr := filepath.Rel(filepath.Clean(workDir), abs)
+			if relErr != nil || strings.HasPrefix(rel, "..") {
+				continue // security: skip paths outside workDir
+			}
+			data, readErr := os.ReadFile(abs)
+			if readErr != nil {
+				continue
+			}
+			fe = &fileEntry{lines: strings.Split(string(data), "\n")}
+			fileMap[a.file] = fe
+		}
+		fe.annos = append(fe.annos, a)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Highlighted error locations (context ±3 lines):\n")
+	for fname, fe := range fileMap {
+		fmt.Fprintf(&sb, "\n--- %s ---\n", fname)
+		for _, a := range fe.annos {
+			start := a.lineNum - 4
+			if start < 0 {
+				start = 0
+			}
+			end := a.lineNum + 3
+			if end > len(fe.lines) {
+				end = len(fe.lines)
+			}
+			for i := start; i < end; i++ {
+				lineMarker := " "
+				if i+1 == a.lineNum {
+					lineMarker = ">"
+				}
+				fmt.Fprintf(&sb, "%s %4d | %s\n", lineMarker, i+1, fe.lines[i])
+			}
+			fmt.Fprintf(&sb, "       ^ ERROR: %s\n\n", a.msg)
+		}
+	}
+	return sb.String()
 }
 
 // agentInferExtension appends a file extension to name based on content
@@ -2650,7 +2982,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 // ── Run & Fix ─────────────────────────────────────────────────────────────────
 
-const maxFixAttempts = 5
+const maxFixAttempts = 3
 
 // FixStreamRequest is the JSON body for POST /api/agent/fixstream.
 type FixStreamRequest struct {
@@ -2694,9 +3026,11 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	var sseMu sync.Mutex
+	var logLines []string
 	progress := func(text string) {
 		sseMu.Lock()
 		defer sseMu.Unlock()
+		logLines = append(logLines, text)
 		sseWrite(w, flusher, map[string]any{"type": "status", "text": text})
 	}
 
@@ -2733,12 +3067,23 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(logLines) > 0 {
+		summary += "\n\n**Attempt log:**\n```\n" + strings.Join(logLines, "\n") + "\n```"
+	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(fixStart).Milliseconds()}
 	s.mu.Lock()
 	s.messages = append(s.messages, msg)
 	s.mu.Unlock()
 
 	sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
+}
+
+// prevFixAttempt records what the LLM wrote and what error followed, so subsequent
+// attempts can see exactly what was tried and why it did not help.
+type prevFixAttempt struct {
+	attempt      int
+	errorOutput  string
+	changedFiles []agentFileBlock
 }
 
 // runFixLoop detects the project's run/build command, executes it, and if it
@@ -2753,6 +3098,9 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 
 	cmdLabel := runCmd + " " + strings.Join(runArgs, " ")
 	progress(fmt.Sprintf("🔍 Detected runner: `%s`", cmdLabel))
+
+	var prevErrSnippet string
+	var history []prevFixAttempt
 
 	for attempt := 1; attempt <= maxFixAttempts; attempt++ {
 		if ctx.Err() != nil {
@@ -2789,6 +3137,12 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 		// Show the error clearly.
 		progress(fmt.Sprintf("❌ Error:\n%s", errSnippet))
 
+		sameError := errSnippet == prevErrSnippet && prevErrSnippet != ""
+		if sameError {
+			progress("⚠️  Same error as previous attempt.")
+		}
+		prevErrSnippet = errSnippet
+
 		if attempt == maxFixAttempts {
 			return fmt.Sprintf("❌ **Run & Fix**: still failing after %d attempt(s).\n\nLast error:\n```\n%s\n```", maxFixAttempts, errSnippet), nil
 		}
@@ -2797,13 +3151,18 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 
 		// Refresh files snapshot so we send the latest content to the LLM.
 		files = s.getActiveFilesSnapshot()
-		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt)
+		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt, sameError, history)
 		if llmErr != nil {
 			return "", llmErr
 		}
 
 		if len(fixedBlocks) == 0 {
-			return fmt.Sprintf("❌ **Run & Fix**: LLM found no changes to make.\n\nError:\n```\n%s\n```", errSnippet), nil
+			if sameError {
+				// Same error, LLM has no new ideas — no point continuing.
+				return fmt.Sprintf("❌ **Run & Fix**: same error persists and LLM could not find a fix.\n\nError:\n```\n%s\n```", errSnippet), nil
+			}
+			progress(fmt.Sprintf("⚠️  LLM found no changes to make on attempt %d/%d — retrying…", attempt, maxFixAttempts))
+			continue
 		}
 
 		// Report proposed fix before writing.
@@ -2840,6 +3199,13 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 		}
 		progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(fixedNames, ", ")))
 
+		// Record this attempt so the next iteration can see what was tried.
+		history = append(history, prevFixAttempt{
+			attempt:      attempt,
+			errorOutput:  errSnippet,
+			changedFiles: fixedBlocks,
+		})
+
 		// Rescan so the next iteration sees up-to-date file contents.
 		if scanned, scanErr := s.performRescan(); scanErr == nil {
 			s.mu.Lock()
@@ -2854,14 +3220,37 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 // runFixLLM calls the LLM with the current file contents + error output.
 // The model is asked to return only files that need to change, using the same
 // FILE:/---/=== format as agent_create, so we can reuse parseAgentCreateResponse.
-func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int) ([]agentFileBlock, error) {
+func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int, sameError bool, history []prevFixAttempt) ([]agentFileBlock, error) {
 	var prompt strings.Builder
 	if task != "" {
 		fmt.Fprintf(&prompt, "Original task: %s\n\n", task)
 	}
-	if attempt > 1 {
-		fmt.Fprintf(&prompt, "IMPORTANT: This is fix attempt %d. The previous fix(es) did not resolve the error. You MUST try a structurally different approach — do NOT repeat the same change.\n\n", attempt)
+
+	// Include history of previous failed attempts so the LLM knows exactly
+	// what it already tried and can avoid repeating the same broken fix.
+	if len(history) > 0 {
+		prompt.WriteString("=== PREVIOUS FAILED ATTEMPTS ===\n")
+		for _, h := range history {
+			fmt.Fprintf(&prompt, "--- Attempt %d ---\n", h.attempt)
+			fmt.Fprintf(&prompt, "Error after applying the fix:\n```\n%s\n```\n", h.errorOutput)
+			if len(h.changedFiles) > 0 {
+				prompt.WriteString("Files written (which did NOT fix the error):\n")
+				for _, f := range h.changedFiles {
+					fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n", f.name, f.content)
+				}
+			} else {
+				prompt.WriteString("(LLM produced no file changes)\n")
+			}
+			prompt.WriteString("\n")
+		}
+		if sameError {
+			fmt.Fprintf(&prompt, "CRITICAL: Attempt %d produced the SAME error as before. The fixes above had NO effect. You MUST take a completely different approach.\n\n", attempt)
+		} else {
+			prompt.WriteString("IMPORTANT: The fixes above did not resolve the error. You MUST try a structurally different approach — do not repeat anything that was already attempted.\n\n")
+		}
+		prompt.WriteString("=== END OF PREVIOUS ATTEMPTS ===\n\n")
 	}
+
 	prompt.WriteString("Current source files:\n\n")
 	for _, f := range files {
 		if f == nil || !f.IsReadable {
@@ -2874,7 +3263,15 @@ func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.File
 		}
 		fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n\n", f.RelPath, string(data))
 	}
-	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\nFix the error(s) above. Return only the files that need to change.", errorOutput)
+	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\n", errorOutput)
+
+	// Append annotated source snippets so the model sees the exact broken lines.
+	if snippets := extractErrorSnippets(s.directory, errorOutput); snippets != "" {
+		prompt.WriteString(snippets)
+		prompt.WriteString("\n")
+	}
+
+	prompt.WriteString("Fix the error(s) above. Return only the files that need to change.")
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
@@ -2882,7 +3279,7 @@ func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.File
 			{Role: "system", Content: promptAgentFix},
 			{Role: "user", Content: prompt.String()},
 		},
-		Temperature: agentTemperature(s.cfg.LLM.Temperature),
+		Temperature: fixTemperature(s.cfg.LLM.Temperature, attempt, sameError),
 	}
 
 	resp, err := s.llmClient.Chat(ctx, chatReq)
