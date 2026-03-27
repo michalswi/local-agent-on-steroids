@@ -2678,6 +2678,97 @@ func agentTemperature(configured float64) float64 {
 	return configured
 }
 
+// fixTemperature returns the temperature to use for a fix attempt.
+// When the same error keeps recurring we raise the temperature to push the model
+// off its local minimum and force genuinely different solutions.
+func fixTemperature(configured float64, attempt int, sameError bool) float64 {
+	base := agentTemperature(configured)
+	if sameError && attempt > 1 {
+		// Each repeated failure nudges temperature up by 0.15, capped at 1.0.
+		bump := 0.15 * float64(attempt-1)
+		if t := base + bump; t < 1.0 {
+			return t
+		}
+		return 1.0
+	}
+	return base
+}
+
+// extractErrorSnippets parses compiler/interpreter error output for
+// "file:line: message" references and returns a formatted string that shows
+// the exact source lines together with their error annotations.
+// workDir is the project root used to resolve relative paths.
+func extractErrorSnippets(workDir, errorOutput string) string {
+	// Matches: ./path/file.go:42:5: some error message
+	//          path/file.go:42: some error
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+\.\w+):(\d+)(?::\d+)?:\s+(.+)$`)
+	type annotation struct {
+		file    string
+		lineNum int
+		msg     string
+	}
+	var annotations []annotation
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		ln, err := strconv.Atoi(m[2])
+		if err != nil {
+			continue
+		}
+		annotations = append(annotations, annotation{file: m[1], lineNum: ln, msg: m[3]})
+	}
+	if len(annotations) == 0 {
+		return ""
+	}
+
+	// Group annotations by file and load each file once.
+	type fileEntry struct {
+		lines []string
+		annos []annotation
+	}
+	fileMap := map[string]*fileEntry{}
+	for _, a := range annotations {
+		fe, ok := fileMap[a.file]
+		if !ok {
+			abs := filepath.Clean(filepath.Join(workDir, a.file))
+			rel, relErr := filepath.Rel(filepath.Clean(workDir), abs)
+			if relErr != nil || strings.HasPrefix(rel, "..") {
+				continue // security: skip paths outside workDir
+			}
+			data, readErr := os.ReadFile(abs)
+			if readErr != nil {
+				continue
+			}
+			fe = &fileEntry{lines: strings.Split(string(data), "\n")}
+			fileMap[a.file] = fe
+		}
+		fe.annos = append(fe.annos, a)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Highlighted error locations (context ±3 lines):\n")
+	for fname, fe := range fileMap {
+		fmt.Fprintf(&sb, "\n--- %s ---\n", fname)
+		for _, a := range fe.annos {
+			start := a.lineNum - 4
+			if start < 0 {
+				start = 0
+			}
+			end := a.lineNum + 3
+			if end > len(fe.lines) {
+				end = len(fe.lines)
+			}
+			for i := start; i < end; i++ {
+				lineMarker := " "
+				if i+1 == a.lineNum {
+					lineMarker = ">"
+				}
+				fmt.Fprintf(&sb, "%s %4d | %s\n", lineMarker, i+1, fe.lines[i])
+			}
+			fmt.Fprintf(&sb, "       ^ ERROR: %s\n\n", a.msg)
+		}
+	}
+	return sb.String()
+}
+
 // agentInferExtension appends a file extension to name based on content
 // heuristics. Called when the LLM returns a filename with no extension.
 func agentInferExtension(name, content string) string {
@@ -2987,6 +3078,14 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 	sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
 }
 
+// prevFixAttempt records what the LLM wrote and what error followed, so subsequent
+// attempts can see exactly what was tried and why it did not help.
+type prevFixAttempt struct {
+	attempt      int
+	errorOutput  string
+	changedFiles []agentFileBlock
+}
+
 // runFixLoop detects the project's run/build command, executes it, and if it
 // fails sends the error to the LLM for a fix. Iterates up to maxFixAttempts.
 func (s *Server) runFixLoop(ctx context.Context, task string, progress func(string)) (string, error) {
@@ -3001,6 +3100,7 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 	progress(fmt.Sprintf("🔍 Detected runner: `%s`", cmdLabel))
 
 	var prevErrSnippet string
+	var history []prevFixAttempt
 
 	for attempt := 1; attempt <= maxFixAttempts; attempt++ {
 		if ctx.Err() != nil {
@@ -3051,7 +3151,7 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 
 		// Refresh files snapshot so we send the latest content to the LLM.
 		files = s.getActiveFilesSnapshot()
-		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt, sameError)
+		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt, sameError, history)
 		if llmErr != nil {
 			return "", llmErr
 		}
@@ -3099,6 +3199,13 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 		}
 		progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(fixedNames, ", ")))
 
+		// Record this attempt so the next iteration can see what was tried.
+		history = append(history, prevFixAttempt{
+			attempt:      attempt,
+			errorOutput:  errSnippet,
+			changedFiles: fixedBlocks,
+		})
+
 		// Rescan so the next iteration sees up-to-date file contents.
 		if scanned, scanErr := s.performRescan(); scanErr == nil {
 			s.mu.Lock()
@@ -3113,16 +3220,37 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 // runFixLLM calls the LLM with the current file contents + error output.
 // The model is asked to return only files that need to change, using the same
 // FILE:/---/=== format as agent_create, so we can reuse parseAgentCreateResponse.
-func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int, sameError bool) ([]agentFileBlock, error) {
+func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int, sameError bool, history []prevFixAttempt) ([]agentFileBlock, error) {
 	var prompt strings.Builder
 	if task != "" {
 		fmt.Fprintf(&prompt, "Original task: %s\n\n", task)
 	}
-	if attempt > 1 && sameError {
-		fmt.Fprintf(&prompt, "CRITICAL: This is fix attempt %d. The SAME error occurred again — your previous fix had NO effect. You MUST take a completely different approach. Do NOT repeat any change you already made.\n\n", attempt)
-	} else if attempt > 1 {
-		fmt.Fprintf(&prompt, "IMPORTANT: This is fix attempt %d. The previous fix(es) did not resolve the error. You MUST try a structurally different approach — do NOT repeat the same change.\n\n", attempt)
+
+	// Include history of previous failed attempts so the LLM knows exactly
+	// what it already tried and can avoid repeating the same broken fix.
+	if len(history) > 0 {
+		prompt.WriteString("=== PREVIOUS FAILED ATTEMPTS ===\n")
+		for _, h := range history {
+			fmt.Fprintf(&prompt, "--- Attempt %d ---\n", h.attempt)
+			fmt.Fprintf(&prompt, "Error after applying the fix:\n```\n%s\n```\n", h.errorOutput)
+			if len(h.changedFiles) > 0 {
+				prompt.WriteString("Files written (which did NOT fix the error):\n")
+				for _, f := range h.changedFiles {
+					fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n", f.name, f.content)
+				}
+			} else {
+				prompt.WriteString("(LLM produced no file changes)\n")
+			}
+			prompt.WriteString("\n")
+		}
+		if sameError {
+			fmt.Fprintf(&prompt, "CRITICAL: Attempt %d produced the SAME error as before. The fixes above had NO effect. You MUST take a completely different approach.\n\n", attempt)
+		} else {
+			prompt.WriteString("IMPORTANT: The fixes above did not resolve the error. You MUST try a structurally different approach — do not repeat anything that was already attempted.\n\n")
+		}
+		prompt.WriteString("=== END OF PREVIOUS ATTEMPTS ===\n\n")
 	}
+
 	prompt.WriteString("Current source files:\n\n")
 	for _, f := range files {
 		if f == nil || !f.IsReadable {
@@ -3135,7 +3263,15 @@ func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.File
 		}
 		fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n\n", f.RelPath, string(data))
 	}
-	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\nFix the error(s) above. Return only the files that need to change.", errorOutput)
+	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\n", errorOutput)
+
+	// Append annotated source snippets so the model sees the exact broken lines.
+	if snippets := extractErrorSnippets(s.directory, errorOutput); snippets != "" {
+		prompt.WriteString(snippets)
+		prompt.WriteString("\n")
+	}
+
+	prompt.WriteString("Fix the error(s) above. Return only the files that need to change.")
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
@@ -3143,7 +3279,7 @@ func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.File
 			{Role: "system", Content: promptAgentFix},
 			{Role: "user", Content: prompt.String()},
 		},
-		Temperature: agentTemperature(s.cfg.LLM.Temperature),
+		Temperature: fixTemperature(s.cfg.LLM.Temperature, attempt, sameError),
 	}
 
 	resp, err := s.llmClient.Chat(ctx, chatReq)

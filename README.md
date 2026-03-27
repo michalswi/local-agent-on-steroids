@@ -15,6 +15,8 @@
 > **Default LLM:** `wizardlm2:7b`.
 > Change it in `config/config.go` under `LLMConfig.Model`, or run app with `--model <model>` flag or switch on app's chat with `model <model>`.
 
+If you are looking for Ollama based **AI chat** check this app [scoutai](https://github.com/michalswi/scoutai) or visit it's [home page](https://scoutai.azurewebsites.net/).
+
 ## \# Quick Start
 
 ```bash
@@ -221,7 +223,3 @@ security:
   skip_binaries: true
   max_depth: 20
 ```
-
-## \# AI chat
-
-If you are looking for Ollama based AI chat check this app [scoutai](https://github.com/michalswi/scoutai) or visit [home page](https://scoutai.azurewebsites.net/).
