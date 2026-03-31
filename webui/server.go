@@ -1830,6 +1830,108 @@ func agentIsDeleteTask(task string) bool {
 	return false
 }
 
+// agentFileMentionsFromTask returns filename-like tokens found in the task,
+// normalized and deduplicated while preserving order.
+func agentFileMentionsFromTask(task string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range agentFilenameRe.FindAllString(task, -1) {
+		name := agentSanitizeFilename(strings.TrimSpace(m))
+		if name == "" {
+			continue
+		}
+		if filepath.Ext(name) == "" {
+			continue
+		}
+		if knownNonFilenames[strings.ToLower(name)] {
+			continue
+		}
+		key := strings.ToLower(filepath.ToSlash(filepath.Clean(name)))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// agentIsSingleFileMergeTask detects intents like "merge X and Y into one file".
+// It is language-agnostic and keyed on user wording, not file extensions.
+func agentIsSingleFileMergeTask(task string) bool {
+	lower := strings.ToLower(task)
+	hasMergeWord := false
+	for _, w := range []string{"merge", "combine", "consolidate", "unify", "fuse"} {
+		if strings.Contains(lower, w) {
+			hasMergeWord = true
+			break
+		}
+	}
+	if !hasMergeWord {
+		return false
+	}
+
+	for _, h := range []string{"single file", "one file", "single-file", "into one", "into a single", "as one file", "in one file"} {
+		if strings.Contains(lower, h) {
+			return true
+		}
+	}
+
+	return len(agentFileMentionsFromTask(task)) >= 2
+}
+
+// agentMergeDestinationFromTask extracts an explicit destination from phrases
+// like "into app.ts". Returns "" when no explicit destination is present.
+func agentMergeDestinationFromTask(task string) string {
+	rx := regexp.MustCompile(`(?i)\b(?:into|to|in)\s+([\w\-./]+\.\w{2,})\b`)
+	m := rx.FindStringSubmatch(task)
+	if len(m) == 2 {
+		return agentSanitizeFilename(strings.TrimSpace(m[1]))
+	}
+	return ""
+}
+
+// agentChooseMergeTargetFile picks the surviving destination file for a merge.
+// It prefers explicit "into <file>", then first mentioned file in task,
+// then the first scoped file.
+func agentChooseMergeTargetFile(task string, targetFiles []*types.FileInfo) string {
+	if explicit := agentMergeDestinationFromTask(task); explicit != "" {
+		return filepath.ToSlash(filepath.Clean(explicit))
+	}
+
+	byRel := map[string]string{}
+	byBase := map[string]string{}
+	for _, f := range targetFiles {
+		if f == nil {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(f.RelPath))
+		byRel[strings.ToLower(rel)] = rel
+		base := strings.ToLower(filepath.Base(rel))
+		if _, exists := byBase[base]; !exists {
+			byBase[base] = rel
+		}
+	}
+
+	for _, mention := range agentFileMentionsFromTask(task) {
+		clean := filepath.ToSlash(filepath.Clean(mention))
+		if rel, ok := byRel[strings.ToLower(clean)]; ok {
+			return rel
+		}
+		if rel, ok := byBase[strings.ToLower(filepath.Base(clean))]; ok {
+			return rel
+		}
+	}
+
+	for _, f := range targetFiles {
+		if f != nil {
+			return filepath.ToSlash(filepath.Clean(f.RelPath))
+		}
+	}
+
+	return ""
+}
+
 func promptTokens(s string) []string {
 	parts := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
 		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
@@ -1941,6 +2043,21 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			}
 		}
 		return sb.String(), results, nil
+	}
+
+	// ── Detect "merge into a single file" intent ──────────────────────────
+	// This operation is multi-file by nature, so per-file independent edits tend
+	// to produce split outputs. Route to a dedicated consolidation flow that
+	// generates one surviving destination file and deletes the merged sources.
+	if agentIsSingleFileMergeTask(task) && len(targetFiles) >= 2 {
+		allCount := len(allFiles)
+		scopedCount := len(targetFiles)
+		if scopedCount == allCount && len(agentFileMentionsFromTask(task)) < 2 {
+			errMsg := "⚠️ Could not identify which files to merge. Please mention exact filenames (e.g. \"merge main.go and config.go into one file\")."
+			return errMsg, nil, nil
+		}
+		progress("🧩 Merge intent detected — consolidating scoped files into one file…")
+		return s.runAgentMergeSingleFile(ctx, task, targetFiles, progress, dryRun)
 	}
 
 	// ── Detect "create new file" intent ─────────────────────────────────────
@@ -2275,6 +2392,185 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	return sb.String(), results, nil
 }
 
+// runAgentMergeSingleFile consolidates multiple scoped files into one
+// destination file and deletes the merged source files.
+func (s *Server) runAgentMergeSingleFile(ctx context.Context, task string, targetFiles []*types.FileInfo, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
+	if len(targetFiles) < 2 {
+		return "", nil, fmt.Errorf("merge flow requires at least two scoped files")
+	}
+
+	destination := agentChooseMergeTargetFile(task, targetFiles)
+	if destination == "" {
+		return "", nil, fmt.Errorf("could not determine merge destination file")
+	}
+
+	cleanDir := filepath.Clean(s.directory)
+	destAbs := filepath.Clean(filepath.Join(s.directory, destination))
+	destRel, relErr := filepath.Rel(cleanDir, destAbs)
+	if relErr != nil || strings.HasPrefix(destRel, "..") {
+		return "", nil, fmt.Errorf("merge destination is outside working directory: %s", destination)
+	}
+	destination = filepath.ToSlash(destRel)
+
+	targetByRel := map[string]*types.FileInfo{}
+	for _, f := range targetFiles {
+		if f == nil {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(f.RelPath))
+		targetByRel[rel] = f
+	}
+
+	var ctxBuf strings.Builder
+	sourceContents := map[string]string{}
+	for rel, f := range targetByRel {
+		if f == nil || !f.IsReadable {
+			continue
+		}
+		absPath := filepath.Clean(filepath.Join(s.directory, rel))
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		sourceContents[rel] = content
+		fmt.Fprintf(&ctxBuf, "=== %s ===\n%s\n\n", rel, content)
+	}
+
+	if ctxBuf.Len() == 0 {
+		return "", nil, fmt.Errorf("none of the scoped files were readable for merge")
+	}
+
+	oldDestContent := sourceContents[destination]
+	if oldDestContent == "" {
+		if data, err := os.ReadFile(destAbs); err == nil {
+			oldDestContent = string(data)
+		}
+	}
+
+	systemPrompt := "You are a coding agent. Consolidate multiple source files into a single destination file. " +
+		"Output ONLY the complete destination file content (raw text, no markdown, no commentary)."
+	if changelog := s.agentChangelogPrompt(); changelog != "" {
+		systemPrompt += "\n\n" + changelog
+	}
+
+	userPrompt := fmt.Sprintf(
+		"Task: %s\n\nDestination file (the only surviving file): %s\n\nSource files to merge:\n\n%s\nRules:\n- Return only the full content of %s.\n- Do not output filename headers or markdown fences.\n- The other scoped files will be removed after merge.",
+		task, destination, ctxBuf.String(), destination,
+	)
+
+	chatReq := &llm.ChatRequest{
+		Model: s.cfg.LLM.Model,
+		Messages: []llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Temperature: agentTemperature(s.cfg.LLM.Temperature),
+	}
+
+	progress(fmt.Sprintf("⚙️  Consolidating into %s…", destination))
+	resp, err := s.llmClient.Chat(ctx, chatReq)
+	if err != nil {
+		return "", nil, fmt.Errorf("merge generation failed: %w", err)
+	}
+
+	newDestContent := agentStripFences(strings.TrimSpace(resp.Message.Content))
+	if strings.TrimSpace(newDestContent) == "NO_CHANGE" {
+		newDestContent = oldDestContent
+	}
+	if strings.TrimSpace(newDestContent) == "" {
+		return "", nil, fmt.Errorf("merge generation returned empty destination content")
+	}
+
+	destChanged := strings.TrimSpace(newDestContent) != strings.TrimSpace(oldDestContent)
+
+	deleteList := make([]string, 0, len(targetByRel))
+	for rel := range targetByRel {
+		if rel == destination {
+			continue
+		}
+		deleteList = append(deleteList, rel)
+	}
+	sort.Strings(deleteList)
+
+	if !dryRun {
+		if err := os.MkdirAll(filepath.Dir(destAbs), 0o755); err != nil {
+			return "", nil, fmt.Errorf("failed to create destination directory: %w", err)
+		}
+		if destChanged || oldDestContent == "" {
+			if err := os.WriteFile(destAbs, []byte(newDestContent), 0o644); err != nil {
+				return "", nil, fmt.Errorf("failed to write merge destination %s: %w", destination, err)
+			}
+			s.markWrittenFile(destination)
+			s.mu.Lock()
+			op := "modified"
+			if oldDestContent == "" {
+				op = "created"
+			}
+			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: op, File: destination, Task: task})
+			s.mu.Unlock()
+		}
+
+		for _, rel := range deleteList {
+			abs := filepath.Clean(filepath.Join(s.directory, rel))
+			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+				return "", nil, fmt.Errorf("failed to delete merged source %s: %w", rel, err)
+			}
+			s.mu.Lock()
+			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: rel, Task: task})
+			s.mu.Unlock()
+		}
+	}
+
+	var results []AgentFileResult
+	if destChanged || oldDestContent == "" || dryRun {
+		results = append(results, AgentFileResult{
+			File:            destination,
+			Changed:         destChanged || oldDestContent == "",
+			Created:         oldDestContent == "",
+			Pending:         dryRun,
+			OldContent:      oldDestContent,
+			NewContent:      newDestContent,
+			PromptEvalCount: resp.PromptEvalCount,
+		})
+	}
+	for _, rel := range deleteList {
+		results = append(results, AgentFileResult{
+			File:       rel,
+			Changed:    true,
+			Deleted:    true,
+			Pending:    dryRun,
+			OldContent: sourceContents[rel],
+		})
+	}
+
+	var sb strings.Builder
+	if dryRun {
+		fmt.Fprintf(&sb, "🤖 **Agent**: consolidated %d file(s) into %s — confirm or deny below.\n", len(targetByRel), destination)
+	} else {
+		fmt.Fprintf(&sb, "🤖 **Agent**: consolidated %d file(s) into %s.\n", len(targetByRel), destination)
+	}
+
+	if destChanged || oldDestContent == "" {
+		if dryRun {
+			fmt.Fprintf(&sb, "• 📋 %s — pending confirmation\n", destination)
+		} else {
+			fmt.Fprintf(&sb, "• ✅ %s — updated\n", destination)
+		}
+	} else {
+		fmt.Fprintf(&sb, "• — %s — unchanged\n", destination)
+	}
+	for _, rel := range deleteList {
+		if dryRun {
+			fmt.Fprintf(&sb, "• 📋 %s — delete pending\n", rel)
+		} else {
+			fmt.Fprintf(&sb, "• 🗑️  %s — deleted\n", rel)
+		}
+	}
+
+	return sb.String(), results, nil
+}
+
 // agentFileBlock holds a parsed filename + content pair from the LLM create response.
 type agentFileBlock struct {
 	name    string
@@ -2310,17 +2606,33 @@ func parseAgentCreateResponse(raw string) []agentFileBlock {
 		if sec == "" {
 			continue
 		}
-		// Find the first \n---\n separator within this section.
-		sepIdx := strings.Index(sec, "\n---\n")
-		if sepIdx < 0 {
+		rawName := ""
+		content := ""
+
+		// Preferred format: "<name>\n---\n<content>".
+		if sepIdx := strings.Index(sec, "\n---\n"); sepIdx >= 0 {
+			rawName = strings.TrimSpace(sec[:sepIdx])
+			content = agentStripFences(sec[sepIdx+5:])
+		} else {
+			// Tolerate malformed-but-common model output: "<name>/---\n<content>".
+			firstLine, rest, ok := strings.Cut(sec, "\n")
+			if !ok {
+				continue
+			}
+			line := strings.TrimSpace(firstLine)
+			if strings.HasSuffix(line, "/---") {
+				rawName = strings.TrimSpace(strings.TrimSuffix(line, "/---"))
+				content = agentStripFences(rest)
+			}
+		}
+
+		if rawName == "" || content == "" {
 			continue
 		}
-		rawName := strings.TrimSpace(sec[:sepIdx])
 		// Strip optional "FILE:" prefix (case-insensitive) the model might add.
 		if len(rawName) > 5 && strings.EqualFold(rawName[:5], "file:") {
 			rawName = strings.TrimSpace(rawName[5:])
 		}
-		content := agentStripFences(sec[sepIdx+5:])
 		if rawName != "" && content != "" {
 			blocks = append(blocks, agentFileBlock{name: rawName, content: content})
 		}
@@ -3204,6 +3516,9 @@ func detectDeterministicCodeRepairTarget(runCmd, errorOutput string) (string, bo
 	if runCmd == "go" && (strings.Contains(errorOutput, "imported and not used") || strings.Contains(errorOutput, "declared and not used")) {
 		return "go-unused", true
 	}
+	if runCmd == "go" && strings.Contains(errorOutput, "found packages ") {
+		return "go-package-mismatch", true
+	}
 	return "", false
 }
 
@@ -3211,9 +3526,235 @@ func attemptDeterministicCodeRepair(workDir, target, errorOutput string) (bool, 
 	switch target {
 	case "go-unused":
 		return attemptAutoRepairGoUnusedDiagnostics(workDir, errorOutput)
+	case "go-package-mismatch":
+		return attemptAutoRepairGoPackageMismatch(workDir, errorOutput)
 	default:
 		return false, fmt.Sprintf("Auto-repair skipped: deterministic code strategy for %s is not implemented", target), nil
 	}
+}
+
+type goPackageConflict struct {
+	dirRel string
+	fileA  string
+	pkgA   string
+	fileB  string
+	pkgB   string
+}
+
+func attemptAutoRepairGoPackageMismatch(workDir, errorOutput string) (bool, string, []string) {
+	conflicts := parseGoPackageConflicts(workDir, errorOutput)
+	if len(conflicts) == 0 {
+		return false, "Auto-repair skipped: no deterministic go package-mismatch diagnostics found", nil
+	}
+
+	changedSet := map[string]bool{}
+	for _, c := range conflicts {
+		absDir := filepath.Clean(filepath.Join(workDir, c.dirRel))
+		pkgByFile := readGoPackagesInDir(absDir)
+		targetPkg := chooseGoTargetPackage(c, pkgByFile)
+		if targetPkg == "" {
+			continue
+		}
+
+		for _, fname := range []string{c.fileA, c.fileB} {
+			if strings.HasSuffix(strings.ToLower(fname), "_test.go") {
+				continue
+			}
+			currentPkg := pkgByFile[fname]
+			if currentPkg == "" {
+				currentPkg = readGoPackageDecl(filepath.Join(absDir, fname))
+			}
+			if currentPkg == "" || currentPkg == targetPkg {
+				continue
+			}
+			changed, err := rewriteGoPackageDecl(filepath.Join(absDir, fname), targetPkg)
+			if err != nil || !changed {
+				continue
+			}
+			rel := filepath.ToSlash(filepath.Clean(filepath.Join(c.dirRel, fname)))
+			if c.dirRel == "." {
+				rel = fname
+			}
+			changedSet[rel] = true
+			pkgByFile[fname] = targetPkg
+		}
+	}
+
+	if len(changedSet) == 0 {
+		return false, "Auto-repair skipped: deterministic package alignment made no safe changes", nil
+	}
+
+	changedFiles := make([]string, 0, len(changedSet))
+	for f := range changedSet {
+		changedFiles = append(changedFiles, f)
+	}
+	sort.Strings(changedFiles)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	args := append([]string{"-w"}, changedFiles...)
+	_, _, _ = execCommand(ctx, workDir, "gofmt", args...)
+
+	return true, fmt.Sprintf("Auto-repaired Go package mismatch in: %s", strings.Join(changedFiles, ", ")), changedFiles
+}
+
+func parseGoPackageConflicts(workDir, errorOutput string) []goPackageConflict {
+	rx := regexp.MustCompile(`(?m)^found packages\s+([A-Za-z_][A-Za-z0-9_]*)\s+\(([^)]+)\)\s+and\s+([A-Za-z_][A-Za-z0-9_]*)\s+\(([^)]+)\)\s+in\s+(.+)$`)
+	var out []goPackageConflict
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		pkgA := strings.TrimSpace(m[1])
+		fileA := filepath.Base(strings.TrimSpace(m[2]))
+		pkgB := strings.TrimSpace(m[3])
+		fileB := filepath.Base(strings.TrimSpace(m[4]))
+		dirRel, ok := resolveConflictDir(workDir, strings.TrimSpace(m[5]), fileA, fileB)
+		if !ok {
+			continue
+		}
+		out = append(out, goPackageConflict{dirRel: dirRel, fileA: fileA, pkgA: pkgA, fileB: fileB, pkgB: pkgB})
+	}
+	return out
+}
+
+func resolveConflictDir(workDir, rawDir, fileA, fileB string) (string, bool) {
+	cleanDir := filepath.Clean(workDir)
+	candidate := strings.TrimSpace(rawDir)
+	if candidate == "" {
+		candidate = "."
+	}
+
+	abs := candidate
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(workDir, abs)
+	}
+	abs = filepath.Clean(abs)
+	rel, relErr := filepath.Rel(cleanDir, abs)
+	if relErr == nil && !strings.HasPrefix(rel, "..") {
+		if st, statErr := os.Stat(abs); statErr == nil && st.IsDir() {
+			if rel == "." {
+				return ".", true
+			}
+			return filepath.ToSlash(rel), true
+		}
+	}
+
+	// Fallback: most ad-hoc runs use workspace root.
+	if _, errA := os.Stat(filepath.Join(workDir, fileA)); errA == nil {
+		if _, errB := os.Stat(filepath.Join(workDir, fileB)); errB == nil {
+			return ".", true
+		}
+	}
+
+	return "", false
+}
+
+func readGoPackagesInDir(absDir string) map[string]string {
+	out := map[string]string{}
+	entries, err := os.ReadDir(absDir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".go") {
+			continue
+		}
+		pkg := readGoPackageDecl(filepath.Join(absDir, name))
+		if pkg != "" {
+			out[name] = pkg
+		}
+	}
+	return out
+}
+
+func chooseGoTargetPackage(c goPackageConflict, pkgByFile map[string]string) string {
+	if strings.EqualFold(c.fileA, "main.go") && c.pkgA == "main" {
+		return "main"
+	}
+	if strings.EqualFold(c.fileB, "main.go") && c.pkgB == "main" {
+		return "main"
+	}
+
+	if pkgByFile["main.go"] == "main" {
+		return "main"
+	}
+
+	counts := map[string]int{}
+	for file, pkg := range pkgByFile {
+		if pkg == "" || strings.HasSuffix(strings.ToLower(file), "_test.go") {
+			continue
+		}
+		counts[pkg]++
+	}
+	if len(counts) == 0 {
+		if c.pkgA == "main" || c.pkgB == "main" {
+			return "main"
+		}
+		if c.pkgA != "" {
+			return c.pkgA
+		}
+		return c.pkgB
+	}
+
+	type kv struct {
+		pkg string
+		n   int
+	}
+	var ranked []kv
+	for pkg, n := range counts {
+		ranked = append(ranked, kv{pkg: pkg, n: n})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].n == ranked[j].n {
+			return ranked[i].pkg < ranked[j].pkg
+		}
+		return ranked[i].n > ranked[j].n
+	})
+	return ranked[0].pkg
+}
+
+func readGoPackageDecl(absPath string) string {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return ""
+	}
+	rx := regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)\b`)
+	for _, line := range strings.Split(string(data), "\n") {
+		if m := rx.FindStringSubmatch(line); len(m) == 2 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+func rewriteGoPackageDecl(absPath, targetPkg string) (bool, error) {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return false, err
+	}
+	lines := strings.Split(string(data), "\n")
+	rx := regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)\b`)
+	for i, line := range lines {
+		m := rx.FindStringSubmatch(line)
+		if len(m) != 2 {
+			continue
+		}
+		if m[1] == targetPkg {
+			return false, nil
+		}
+		lines[i] = "package " + targetPkg
+		updated := strings.Join(lines, "\n")
+		if updated == string(data) {
+			return false, nil
+		}
+		if err := os.WriteFile(absPath, []byte(updated), 0o644); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("package declaration not found")
 }
 
 func attemptAutoRepairGoUnusedDiagnostics(workDir, errorOutput string) (bool, string, []string) {
