@@ -15,17 +15,20 @@ import (
 	"github.com/michalswi/local-agent-on-steroids/filter"
 	"github.com/michalswi/local-agent-on-steroids/llm"
 	"github.com/michalswi/local-agent-on-steroids/security"
+	"github.com/michalswi/local-agent-on-steroids/sessionlog"
 	"github.com/michalswi/local-agent-on-steroids/types"
 	"github.com/michalswi/local-agent-on-steroids/webui"
 )
 
 func main() {
 	// Define CLI flags
+	homeDirDefault := sessionlog.DefaultDir()
 	var (
 		configPath      = flag.String("config", "", "Path to configuration file")
 		directory       = flag.String("dir", ".", "Directory to analyze")
 		model           = flag.String("model", "", "LLM model to use (overrides config)")
 		host            = flag.String("host", "localhost:11434", "Ollama instance host (e.g., localhost:11434, 192.168.1.100:8080, or ollama.example.com:11434)")
+		homedir         = flag.String("homedir", homeDirDefault, "Directory for session logs and saved data")
 		dryRun          = flag.Bool("dry-run", false, "Scan and list files without starting the web UI")
 		noDetectSecrets = flag.Bool("no-detect-secrets", false, "Disable secret/sensitive content detection")
 
@@ -35,6 +38,16 @@ func main() {
 	)
 
 	flag.Parse()
+
+	// Apply homedir (expand ~ just in case the user passed a literal ~).
+	if h := *homedir; h != "" {
+		if strings.HasPrefix(h, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				h = filepath.Join(home, h[2:])
+			}
+		}
+		sessionlog.SetDir(h)
+	}
 
 	// Show version
 	if *showVersion {

@@ -12,7 +12,28 @@ import (
 	"github.com/michalswi/local-agent-on-steroids/types"
 )
 
-const sessionDir = "/tmp/local-agent-on-steroids"
+// sessionDir is the directory where session JSON records are written.
+// It can be overridden at startup via SetDir.
+var sessionDir = defaultSessionDir()
+
+func defaultSessionDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "local-agent-on-steroids")
+	}
+	return filepath.Join(home, "Downloads", "local-agent-on-steroids")
+}
+
+// SetDir overrides the directory used to store session JSON records.
+func SetDir(path string) {
+	sessionDir = path
+}
+
+// DefaultDir returns the default or a temp fallback if
+// the home directory cannot be determined.
+func DefaultDir() string {
+	return defaultSessionDir()
+}
 
 type ScanSummary struct {
 	TotalFiles    int           `json:"total_files"`
