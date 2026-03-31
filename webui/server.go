@@ -3200,6 +3200,110 @@ func buildManifestErrorGuidance(errorOutput string, relatedFiles []string) strin
 	return b.String()
 }
 
+func detectDeterministicCodeRepairTarget(runCmd, errorOutput string) (string, bool) {
+	if runCmd == "go" && (strings.Contains(errorOutput, "imported and not used") || strings.Contains(errorOutput, "declared and not used")) {
+		return "go-unused", true
+	}
+	return "", false
+}
+
+func attemptDeterministicCodeRepair(workDir, target, errorOutput string) (bool, string, []string) {
+	switch target {
+	case "go-unused":
+		return attemptAutoRepairGoUnusedDiagnostics(workDir, errorOutput)
+	default:
+		return false, fmt.Sprintf("Auto-repair skipped: deterministic code strategy for %s is not implemented", target), nil
+	}
+}
+
+func attemptAutoRepairGoUnusedDiagnostics(workDir, errorOutput string) (bool, string, []string) {
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+):(\d+):(\d+):\s+(.+)$`)
+	rxUnusedImport := regexp.MustCompile(`^"[^"]+" imported and not used$`)
+	rxUnusedDecl := regexp.MustCompile(`^declared and not used: [A-Za-z_][A-Za-z0-9_]*$`)
+
+	deletions := map[string]map[int]bool{}
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		lineNum, convErr := strconv.Atoi(m[2])
+		if convErr != nil || lineNum < 1 {
+			continue
+		}
+		msg := strings.TrimSpace(m[4])
+		if !rxUnusedImport.MatchString(msg) && !rxUnusedDecl.MatchString(msg) {
+			continue
+		}
+		relPath := filepath.ToSlash(filepath.Clean(m[1]))
+		if deletions[relPath] == nil {
+			deletions[relPath] = map[int]bool{}
+		}
+		deletions[relPath][lineNum] = true
+	}
+
+	if len(deletions) == 0 {
+		return false, "Auto-repair skipped: no deterministic go unused-symbol diagnostics found", nil
+	}
+
+	cleanDir := filepath.Clean(workDir)
+	var changedFiles []string
+
+	for relPath, lineSet := range deletions {
+		absPath := filepath.Clean(filepath.Join(workDir, relPath))
+		rel, relErr := filepath.Rel(cleanDir, absPath)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		data, readErr := os.ReadFile(absPath)
+		if readErr != nil {
+			continue
+		}
+
+		lines := strings.Split(string(data), "\n")
+		var lineNums []int
+		for n := range lineSet {
+			if n >= 1 && n <= len(lines) {
+				lineNums = append(lineNums, n)
+			}
+		}
+		if len(lineNums) == 0 {
+			continue
+		}
+		sort.Ints(lineNums)
+
+		changed := false
+		for i := len(lineNums) - 1; i >= 0; i-- {
+			idx := lineNums[i] - 1
+			if idx < 0 || idx >= len(lines) {
+				continue
+			}
+			lines = append(lines[:idx], lines[idx+1:]...)
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+
+		updated := strings.Join(lines, "\n")
+		if updated == string(data) {
+			continue
+		}
+		if writeErr := os.WriteFile(absPath, []byte(updated), 0o644); writeErr != nil {
+			continue
+		}
+		changedFiles = append(changedFiles, relPath)
+	}
+
+	if len(changedFiles) == 0 {
+		return false, "Auto-repair skipped: could not safely apply deterministic go unused-symbol edits", nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	args := []string{"-w"}
+	args = append(args, changedFiles...)
+	_, _, _ = execCommand(ctx, workDir, "gofmt", args...)
+
+	return true, fmt.Sprintf("Auto-repaired Go unused imports/variables in: %s", strings.Join(changedFiles, ", ")), changedFiles
+}
+
 // attemptAutoRepairGoMod performs a deterministic rewrite of go.mod when it is
 // syntactically broken. It keeps only valid directives and validates the result
 // with `go mod edit -json` before accepting it.
@@ -3778,6 +3882,7 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 	var prevErrSnippet string
 	var history []prevFixAttempt
 	autoManifestRepairTried := map[string]bool{}
+	autoCodeRepairTried := map[string]bool{}
 
 	for attempt := 1; attempt <= maxFixAttempts; attempt++ {
 		if ctx.Err() != nil {
@@ -3837,6 +3942,29 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 					s.mu.Unlock()
 				}
 				progress(fmt.Sprintf("♻️  Retrying build after deterministic %s repair…", manifestFile))
+				continue
+			}
+		}
+
+		if repairTarget, shouldRepair := detectDeterministicCodeRepairTarget(runCmd, errSnippet); shouldRepair && !autoCodeRepairTried[repairTarget] {
+			autoCodeRepairTried[repairTarget] = true
+			repaired, repairMsg, touchedFiles := attemptDeterministicCodeRepair(s.directory, repairTarget, errSnippet)
+			if repairMsg != "" {
+				progress("🛠️  " + repairMsg)
+			}
+			if repaired {
+				for _, rel := range touchedFiles {
+					s.markWrittenFile(rel)
+					s.mu.Lock()
+					s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: rel, Task: "(auto-fix deterministic)"})
+					s.mu.Unlock()
+				}
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
+				}
+				progress(fmt.Sprintf("♻️  Retrying build after deterministic %s repair…", repairTarget))
 				continue
 			}
 		}
