@@ -78,12 +78,12 @@ type Server struct {
 
 // Message represents a chat message
 type Message struct {
-	Role           string            `json:"role"`
-	Content        string            `json:"content"`
-	Timestamp      time.Time         `json:"timestamp"`
-	DurationMs     int64             `json:"duration_ms,omitempty"`
-	PromptEvalCount int              `json:"prompt_eval_count,omitempty"`
-	AgentResults   []AgentFileResult `json:"agentResults,omitempty"`
+	Role            string            `json:"role"`
+	Content         string            `json:"content"`
+	Timestamp       time.Time         `json:"timestamp"`
+	DurationMs      int64             `json:"duration_ms,omitempty"`
+	PromptEvalCount int               `json:"prompt_eval_count,omitempty"`
+	AgentResults    []AgentFileResult `json:"agentResults,omitempty"`
 }
 
 // ChatRequest represents an incoming chat message
@@ -864,11 +864,11 @@ type AgentFileResult struct {
 	Deleted bool `json:"deleted,omitempty"`
 	// Pending is true when the result is a proposed change that has NOT yet
 	// been written to disk — the user must confirm via /api/agent/commit.
-	Pending        bool   `json:"pending,omitempty"`
-	OldContent     string `json:"oldContent,omitempty"`
-	NewContent     string `json:"newContent,omitempty"`
-	Error          string `json:"error,omitempty"`
-	PromptEvalCount int   `json:"prompt_eval_count,omitempty"`
+	Pending         bool   `json:"pending,omitempty"`
+	OldContent      string `json:"oldContent,omitempty"`
+	NewContent      string `json:"newContent,omitempty"`
+	Error           string `json:"error,omitempty"`
+	PromptEvalCount int    `json:"prompt_eval_count,omitempty"`
 }
 
 // AgentCommitRequest is the JSON body for POST /api/agent/commit.
@@ -2769,7 +2769,682 @@ func extractErrorSnippets(workDir, errorOutput string) string {
 	return sb.String()
 }
 
-// agentInferExtension appends a file extension to name based on content
+// ── Search/Replace patch types ─────────────────────────────────────────────
+
+// fixHunk is a single search→replace pair within a file.
+type fixHunk struct {
+	search  string
+	replace string
+}
+
+// fixPatch describes all hunks to apply to one file.
+type fixPatch struct {
+	name  string
+	hunks []fixHunk
+}
+
+// parseFixPatchResponse parses SEARCH/REPLACE blocks from the LLM fix response.
+//
+// Expected format (one or more per response):
+//
+//	FILE: path/to/file.go
+//	<<<<<<< SEARCH
+//	old code
+//	=======
+//	new code
+//	>>>>>>> REPLACE
+func parseFixPatchResponse(text string) []fixPatch {
+	const (
+		stateTop = iota
+		stateSearch
+		stateReplace
+	)
+	var patches []fixPatch
+	var current *fixPatch
+	state := stateTop
+	var buf []string
+	var currentSearch string
+
+	flushPatch := func() {
+		if current != nil && len(current.hunks) > 0 {
+			patches = append(patches, *current)
+		}
+	}
+
+	for _, line := range strings.Split(text, "\n") {
+		switch state {
+		case stateTop:
+			if strings.HasPrefix(line, "FILE:") {
+				flushPatch()
+				name := strings.TrimSpace(strings.TrimPrefix(line, "FILE:"))
+				current = &fixPatch{name: name}
+			} else if strings.HasPrefix(line, "<<<<<<< SEARCH") || line == "<<<<<<<" {
+				if current != nil {
+					state = stateSearch
+					buf = nil
+				}
+			}
+		case stateSearch:
+			if line == "=======" {
+				currentSearch = strings.Join(buf, "\n")
+				buf = nil
+				state = stateReplace
+			} else {
+				buf = append(buf, line)
+			}
+		case stateReplace:
+			if strings.HasPrefix(line, ">>>>>>> REPLACE") || line == ">>>>>>>" {
+				if current != nil {
+					current.hunks = append(current.hunks, fixHunk{
+						search:  currentSearch,
+						replace: strings.Join(buf, "\n"),
+					})
+				}
+				buf = nil
+				state = stateTop
+			} else {
+				buf = append(buf, line)
+			}
+		}
+	}
+	flushPatch()
+	return patches
+}
+
+// applyFixPatch applies all hunks in patch to the file at workDir/patch.name.
+// Each hunk replaces the first occurrence of search with replace.
+// If search is empty the replace content is written as the entire file.
+// Returns per-hunk warnings (non-fatal) plus any fatal error.
+func applyFixPatch(workDir string, patch fixPatch) (warnings []string, err error) {
+	cleanDir := filepath.Clean(workDir)
+	absPath := filepath.Clean(filepath.Join(workDir, patch.name))
+	rel, relErr := filepath.Rel(cleanDir, absPath)
+	if relErr != nil || strings.HasPrefix(rel, "..") {
+		return nil, fmt.Errorf("path %q is outside working directory", patch.name)
+	}
+
+	var content string
+	existing, readErr := os.ReadFile(absPath)
+	hadExisting := readErr == nil
+	if readErr == nil {
+		content = string(existing)
+	} else if !os.IsNotExist(readErr) {
+		return nil, fmt.Errorf("read %s: %w", patch.name, readErr)
+	}
+
+	originalContent := content
+	appliedAny := false
+
+	for i, h := range patch.hunks {
+		if h.search == "" {
+			if content != h.replace {
+				content = h.replace
+				appliedAny = true
+			}
+			continue
+		}
+		// Strip display metadata the model might have accidentally included.
+		cleanSearch := stripDisplayPrefixes(h.search)
+		applied, ok := fuzzyReplaceHunk(content, cleanSearch, h.replace)
+		if !ok {
+			// Show the first line of what the model searched for to aid debugging.
+			preview := cleanSearch
+			if nl := strings.IndexByte(preview, '\n'); nl != -1 {
+				preview = preview[:nl]
+			}
+			if len(preview) > 80 {
+				preview = preview[:80] + "…"
+			}
+			warnings = append(warnings, fmt.Sprintf("hunk %d: search text not found in %s (searched for: %q)", i+1, patch.name, preview))
+			continue
+		}
+		if applied != content {
+			appliedAny = true
+		}
+		content = applied
+	}
+
+	if !appliedAny {
+		return warnings, fmt.Errorf("patch made no effective changes to %s", patch.name)
+	}
+
+	if content == originalContent {
+		return warnings, fmt.Errorf("patch made no effective changes to %s", patch.name)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		return warnings, fmt.Errorf("mkdir for %s: %w", patch.name, err)
+	}
+	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+		return warnings, fmt.Errorf("write %s: %w", patch.name, err)
+	}
+
+	if validateErr := validatePatchedFile(workDir, rel, content); validateErr != nil {
+		if hadExisting {
+			if rollbackErr := os.WriteFile(absPath, existing, 0o644); rollbackErr != nil {
+				return warnings, fmt.Errorf("%v (rollback failed: %w)", validateErr, rollbackErr)
+			}
+		} else {
+			if rollbackErr := os.Remove(absPath); rollbackErr != nil && !os.IsNotExist(rollbackErr) {
+				return warnings, fmt.Errorf("%v (rollback failed: %w)", validateErr, rollbackErr)
+			}
+		}
+		return warnings, validateErr
+	}
+
+	return warnings, nil
+}
+
+// validatePatchedFile runs lightweight syntax checks for common manifest files.
+// This prevents the fix loop from keeping obviously invalid replacements.
+func validatePatchedFile(workDir, relPath, content string) error {
+	if strings.EqualFold(filepath.Base(relPath), "go.mod") {
+		vctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		stdout, stderr, exitCode := execCommand(vctx, workDir, "go", "mod", "edit", "-json")
+		if exitCode != 0 {
+			diag := strings.TrimSpace(stderr)
+			if diag == "" {
+				diag = strings.TrimSpace(stdout)
+			}
+			if diag == "" {
+				diag = "go mod edit -json failed"
+			}
+			return fmt.Errorf("go.mod validation failed: %s", diag)
+		}
+	}
+
+	if strings.EqualFold(filepath.Ext(relPath), ".json") {
+		var parsed any
+		if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+			return fmt.Errorf("JSON validation failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// stripDisplayPrefixes removes display-only metadata that the LLM may have
+// accidentally included in a SEARCH block when copying from the context output.
+// Removes lines matching `line N | ` prefixes and `^ ERROR:` annotations.
+func stripDisplayPrefixes(s string) string {
+	rxPrefix := regexp.MustCompile(`^line\s+\d+\s+\|\s?`)
+	rxError := regexp.MustCompile(`^\s*\^\s*ERROR:.*$`)
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if rxError.MatchString(line) {
+			continue // drop error annotation lines entirely
+		}
+		out = append(out, rxPrefix.ReplaceAllString(line, ""))
+	}
+	return strings.Join(out, "\n")
+}
+
+// fuzzyReplaceHunk tries to replace the first occurrence of search in content
+// with replace. It first tries an exact match; if that fails it falls back to
+// a line-by-line sliding window that ignores trailing whitespace differences.
+func fuzzyReplaceHunk(content, search, replace string) (result string, ok bool) {
+	// Fast path: exact match.
+	if strings.Contains(content, search) {
+		return strings.Replace(content, search, replace, 1), true
+	}
+
+	// Slow path: normalize trailing whitespace per line and search line-by-line.
+	normLine := func(s string) string { return strings.TrimRight(s, " \t\r") }
+
+	contentLines := strings.Split(content, "\n")
+	searchLines := strings.Split(strings.TrimRight(search, "\n"), "\n")
+	replaceLines := strings.Split(replace, "\n")
+
+	nc := make([]string, len(contentLines))
+	for i, l := range contentLines {
+		nc[i] = normLine(l)
+	}
+	ns := make([]string, len(searchLines))
+	for i, l := range searchLines {
+		ns[i] = normLine(l)
+	}
+
+	for i := 0; i <= len(contentLines)-len(searchLines); i++ {
+		matched := true
+		for j, sl := range ns {
+			if nc[i+j] != sl {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			out := make([]string, 0, len(contentLines)-len(searchLines)+len(replaceLines))
+			out = append(out, contentLines[:i]...)
+			out = append(out, replaceLines...)
+			out = append(out, contentLines[i+len(searchLines):]...)
+			return strings.Join(out, "\n"), true
+		}
+	}
+	return content, false
+}
+
+// buildFixContext builds a focused prompt section for the LLM.
+// For each file referenced in errorOutput it includes:
+//   - the first 30 lines (package declaration + imports)
+//   - ±10 lines around each error location, with error annotations inline
+//
+// This replaces sending full file contents, keeping the prompt small.
+func buildFixContext(workDir, errorOutput string) string {
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+):(\d+)(?::\d+)?:\s+(.+)$`)
+	type anno struct {
+		lineNum int
+		msg     string
+	}
+	fileAnnos := map[string][]anno{}
+	var fileOrder []string
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		ln, err := strconv.Atoi(m[2])
+		if err != nil {
+			continue
+		}
+		if _, seen := fileAnnos[m[1]]; !seen {
+			fileOrder = append(fileOrder, m[1])
+		}
+		fileAnnos[m[1]] = append(fileAnnos[m[1]], anno{lineNum: ln, msg: m[3]})
+	}
+	if len(fileAnnos) == 0 {
+		return ""
+	}
+
+	type lineRange struct{ start, end int }
+
+	var sb strings.Builder
+	for _, fname := range fileOrder {
+		annos := fileAnnos[fname]
+		abs := filepath.Clean(filepath.Join(workDir, fname))
+		rel, relErr := filepath.Rel(filepath.Clean(workDir), abs)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+		srcLines := strings.Split(string(data), "\n")
+		total := len(srcLines)
+
+		// Build ranges: first 30 lines (imports) + ±10 around each error.
+		var ranges []lineRange
+		headerEnd := 30
+		if headerEnd > total {
+			headerEnd = total
+		}
+		ranges = append(ranges, lineRange{0, headerEnd})
+		for _, a := range annos {
+			s := a.lineNum - 11
+			if s < 0 {
+				s = 0
+			}
+			e := a.lineNum + 10
+			if e > total {
+				e = total
+			}
+			ranges = append(ranges, lineRange{s, e})
+		}
+
+		// Sort and merge overlapping ranges.
+		sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+		merged := []lineRange{ranges[0]}
+		for _, r := range ranges[1:] {
+			last := &merged[len(merged)-1]
+			if r.start <= last.end+1 {
+				if r.end > last.end {
+					last.end = r.end
+				}
+			} else {
+				merged = append(merged, r)
+			}
+		}
+
+		// Header note: make it unambiguous that "line N |" is display metadata,
+		// NOT part of the file. The LLM must omit it from SEARCH blocks.
+		fmt.Fprintf(&sb, "FILE: %s  (format: 'line N | RAW_CODE' — use only RAW_CODE in SEARCH blocks)\n", fname)
+		lastEnd := 0
+		for _, r := range merged {
+			if r.start > lastEnd {
+				fmt.Fprintf(&sb, "  ...\n")
+			}
+			for i := r.start; i < r.end; i++ {
+				// Print the raw code line with a line-number prefix.
+				fmt.Fprintf(&sb, "line %d | %s\n", i+1, srcLines[i])
+				// Print error annotation on its own line so it is never
+				// confused with file content.
+				for _, a := range annos {
+					if a.lineNum == i+1 {
+						fmt.Fprintf(&sb, "         ^ ERROR: %s\n", a.msg)
+						break
+					}
+				}
+			}
+			lastEnd = r.end
+		}
+		if lastEnd < total {
+			fmt.Fprintf(&sb, "  ...\n")
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// errorReferencedFiles returns unique file paths mentioned in error output.
+// It accepts any file-like token before :line so it works across ecosystems
+// (e.g. go.mod, Makefile, *.py, *.ts, Cargo.toml).
+func errorReferencedFiles(workDir, errorOutput string) []string {
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+):(\d+)(?::\d+)?:`)
+	seen := map[string]bool{}
+	var out []string
+	cleanDir := filepath.Clean(workDir)
+
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		relPath := filepath.ToSlash(filepath.Clean(m[1]))
+		if seen[relPath] {
+			continue
+		}
+		abs := filepath.Clean(filepath.Join(workDir, relPath))
+		rel, relErr := filepath.Rel(cleanDir, abs)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		st, statErr := os.Stat(abs)
+		if statErr != nil || st.IsDir() {
+			continue
+		}
+		seen[relPath] = true
+		out = append(out, relPath)
+	}
+
+	return out
+}
+
+func detectDeterministicManifestRepairTarget(errorOutput string) (string, bool) {
+	if strings.Contains(errorOutput, "errors parsing go.mod") {
+		return "go.mod", true
+	}
+	return "", false
+}
+
+func attemptDeterministicManifestRepair(workDir, manifestFile string) (bool, string) {
+	switch manifestFile {
+	case "go.mod":
+		return attemptAutoRepairGoMod(workDir)
+	default:
+		return false, fmt.Sprintf("Auto-repair skipped: deterministic strategy for %s is not implemented", manifestFile)
+	}
+}
+
+func buildManifestErrorGuidance(errorOutput string, relatedFiles []string) string {
+	var b strings.Builder
+
+	hasGoMod := strings.Contains(errorOutput, "errors parsing go.mod")
+	if !hasGoMod {
+		for _, rel := range relatedFiles {
+			if strings.EqualFold(filepath.Base(rel), "go.mod") {
+				hasGoMod = true
+				break
+			}
+		}
+	}
+	if hasGoMod {
+		b.WriteString("Manifest parser-error handling (go.mod):\n")
+		b.WriteString("- Return a FULL replacement for go.mod in a FILE/---/=== block (not partial prose).\n")
+		b.WriteString("- The go.mod content must be DIFFERENT from the current file and syntactically valid for `go mod edit -json`.\n")
+		b.WriteString("- Do not repeat any previous rejected or no-op go.mod content shown above.\n")
+	}
+
+	return b.String()
+}
+
+// attemptAutoRepairGoMod performs a deterministic rewrite of go.mod when it is
+// syntactically broken. It keeps only valid directives and validates the result
+// with `go mod edit -json` before accepting it.
+func attemptAutoRepairGoMod(workDir string) (bool, string) {
+	absPath := filepath.Join(workDir, "go.mod")
+	originalBytes, err := os.ReadFile(absPath)
+	if err != nil {
+		return false, fmt.Sprintf("Auto-repair skipped: could not read go.mod (%v)", err)
+	}
+
+	rebuilt := rebuildGoModContent(workDir, string(originalBytes))
+	if strings.TrimSpace(rebuilt) == "" {
+		return false, "Auto-repair skipped: could not derive a valid go.mod structure"
+	}
+	if rebuilt == string(originalBytes) {
+		return false, "Auto-repair skipped: deterministic rewrite produced no changes"
+	}
+
+	if err := os.WriteFile(absPath, []byte(rebuilt), 0o644); err != nil {
+		return false, fmt.Sprintf("Auto-repair failed while writing go.mod (%v)", err)
+	}
+
+	if err := validatePatchedFile(workDir, "go.mod", rebuilt); err != nil {
+		_ = os.WriteFile(absPath, originalBytes, 0o644)
+		return false, fmt.Sprintf("Auto-repair rejected: %v", err)
+	}
+
+	return true, "Auto-repaired go.mod using deterministic parser-safe rewrite"
+}
+
+func rebuildGoModContent(workDir, content string) string {
+	var modulePath string
+	var goVersion string
+	var requireOrder []string
+	requireLines := map[string]string{}
+	var replaceOrder []string
+	replaceSeen := map[string]bool{}
+
+	inRequireBlock := false
+	inReplaceBlock := false
+
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line, "module "):
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && isLikelyModulePath(fields[1]) {
+				modulePath = fields[1]
+			}
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case strings.HasPrefix(line, "go "):
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if v := normalizeGoVersion(fields[1]); v != "" {
+					goVersion = v
+				}
+			}
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case line == "require (":
+			inRequireBlock = true
+			inReplaceBlock = false
+			continue
+
+		case line == "replace (":
+			inReplaceBlock = true
+			inRequireBlock = false
+			continue
+
+		case line == ")":
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case strings.HasPrefix(line, "require "):
+			entry := strings.TrimSpace(strings.TrimPrefix(line, "require"))
+			addRequireEntry(entry, requireLines, &requireOrder)
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case strings.HasPrefix(line, "replace "):
+			entry := strings.TrimSpace(strings.TrimPrefix(line, "replace"))
+			addReplaceEntry(entry, replaceSeen, &replaceOrder)
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+		}
+
+		if inRequireBlock {
+			addRequireEntry(line, requireLines, &requireOrder)
+			continue
+		}
+		if inReplaceBlock {
+			addReplaceEntry(line, replaceSeen, &replaceOrder)
+			continue
+		}
+	}
+
+	if modulePath == "" {
+		modulePath = fallbackModulePath(workDir)
+	}
+	if goVersion == "" {
+		goVersion = detectDefaultGoVersion(workDir)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "module %s\n\n", modulePath)
+	fmt.Fprintf(&b, "go %s\n", goVersion)
+
+	if len(requireOrder) > 0 {
+		b.WriteString("\nrequire (\n")
+		for _, mod := range requireOrder {
+			fmt.Fprintf(&b, "\t%s\n", requireLines[mod])
+		}
+		b.WriteString(")\n")
+	}
+
+	if len(replaceOrder) > 0 {
+		b.WriteString("\nreplace (\n")
+		for _, line := range replaceOrder {
+			fmt.Fprintf(&b, "\t%s\n", line)
+		}
+		b.WriteString(")\n")
+	}
+
+	return b.String()
+}
+
+func addRequireEntry(line string, requireLines map[string]string, requireOrder *[]string) {
+	comment := ""
+	if idx := strings.Index(line, "//"); idx >= 0 {
+		rawComment := strings.TrimSpace(line[idx:])
+		if strings.Contains(strings.ToLower(rawComment), "indirect") {
+			comment = " // indirect"
+		}
+		line = strings.TrimSpace(line[:idx])
+	}
+	fields := strings.Fields(line)
+	if len(fields) != 2 {
+		return
+	}
+	if !isLikelyModulePath(fields[0]) || !isLikelyVersion(fields[1]) {
+		return
+	}
+	if _, exists := requireLines[fields[0]]; !exists {
+		*requireOrder = append(*requireOrder, fields[0])
+	}
+	requireLines[fields[0]] = fields[0] + " " + fields[1] + comment
+}
+
+func addReplaceEntry(line string, replaceSeen map[string]bool, replaceOrder *[]string) {
+	if idx := strings.Index(line, "//"); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	parts := strings.SplitN(line, "=>", 2)
+	if len(parts) != 2 {
+		return
+	}
+	left := strings.Fields(strings.TrimSpace(parts[0]))
+	right := strings.Fields(strings.TrimSpace(parts[1]))
+
+	if !(len(left) == 1 || len(left) == 2) {
+		return
+	}
+	if !(len(right) == 1 || len(right) == 2) {
+		return
+	}
+	if !isLikelyModulePath(left[0]) {
+		return
+	}
+	if len(left) == 2 && !isLikelyVersion(left[1]) {
+		return
+	}
+	if len(right) == 2 && !isLikelyVersion(right[1]) {
+		return
+	}
+
+	normalized := strings.Join(left, " ") + " => " + strings.Join(right, " ")
+	if replaceSeen[normalized] {
+		return
+	}
+	replaceSeen[normalized] = true
+	*replaceOrder = append(*replaceOrder, normalized)
+}
+
+func isLikelyModulePath(s string) bool {
+	if s == "" {
+		return false
+	}
+	rx := regexp.MustCompile(`^[A-Za-z0-9._~\-/]+$`)
+	return rx.MatchString(s)
+}
+
+func isLikelyVersion(s string) bool {
+	if s == "" {
+		return false
+	}
+	return strings.HasPrefix(s, "v")
+}
+
+func normalizeGoVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "go")
+	rx := regexp.MustCompile(`^\d+\.\d+(?:\.\d+)?$`)
+	if rx.MatchString(v) {
+		return v
+	}
+	return ""
+}
+
+func detectDefaultGoVersion(workDir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stdout, stderr, exitCode := execCommand(ctx, workDir, "go", "env", "GOVERSION")
+	if exitCode == 0 {
+		combined := strings.TrimSpace(stdout + stderr)
+		rx := regexp.MustCompile(`go(\d+\.\d+(?:\.\d+)?)`)
+		if m := rx.FindStringSubmatch(combined); len(m) == 2 {
+			return m[1]
+		}
+	}
+	return "1.22.0"
+}
+
+func fallbackModulePath(workDir string) string {
+	base := strings.ToLower(filepath.Base(filepath.Clean(workDir)))
+	rx := regexp.MustCompile(`[^a-z0-9._-]+`)
+	base = rx.ReplaceAllString(base, "-")
+	base = strings.Trim(base, "-.")
+	if base == "" {
+		base = "app"
+	}
+	return "example.com/" + base
+}
+
 // heuristics. Called when the LLM returns a filename with no extension.
 func agentInferExtension(name, content string) string {
 	c := strings.TrimSpace(content)
@@ -3081,9 +3756,10 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 // prevFixAttempt records what the LLM wrote and what error followed, so subsequent
 // attempts can see exactly what was tried and why it did not help.
 type prevFixAttempt struct {
-	attempt      int
-	errorOutput  string
-	changedFiles []agentFileBlock
+	attempt     int
+	errorOutput string
+	patches     []fixPatch
+	applied     bool
 }
 
 // runFixLoop detects the project's run/build command, executes it, and if it
@@ -3101,6 +3777,7 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 
 	var prevErrSnippet string
 	var history []prevFixAttempt
+	autoManifestRepairTried := map[string]bool{}
 
 	for attempt := 1; attempt <= maxFixAttempts; attempt++ {
 		if ctx.Err() != nil {
@@ -3143,67 +3820,103 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 		}
 		prevErrSnippet = errSnippet
 
+		if manifestFile, shouldRepair := detectDeterministicManifestRepairTarget(errSnippet); shouldRepair && !autoManifestRepairTried[manifestFile] {
+			autoManifestRepairTried[manifestFile] = true
+			repaired, repairMsg := attemptDeterministicManifestRepair(s.directory, manifestFile)
+			if repairMsg != "" {
+				progress("🛠️  " + repairMsg)
+			}
+			if repaired {
+				s.markWrittenFile(manifestFile)
+				s.mu.Lock()
+				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: manifestFile, Task: "(auto-fix deterministic)"})
+				s.mu.Unlock()
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
+				}
+				progress(fmt.Sprintf("♻️  Retrying build after deterministic %s repair…", manifestFile))
+				continue
+			}
+		}
+
 		if attempt == maxFixAttempts {
 			return fmt.Sprintf("❌ **Run & Fix**: still failing after %d attempt(s).\n\nLast error:\n```\n%s\n```", maxFixAttempts, errSnippet), nil
 		}
 
 		progress(fmt.Sprintf("🤖 Asking LLM to propose a fix (attempt %d/%d)…", attempt, maxFixAttempts))
 
-		// Refresh files snapshot so we send the latest content to the LLM.
-		files = s.getActiveFilesSnapshot()
-		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt, sameError, history)
+		patches, llmErr := s.runFixLLM(ctx, task, errSnippet, attempt, sameError, history)
 		if llmErr != nil {
-			return "", llmErr
+			if errors.Is(llmErr, context.Canceled) {
+				return "", llmErr
+			}
+			// Non-fatal: surface the message so the user can see the raw LLM output,
+			// then continue to the next attempt.
+			progress(fmt.Sprintf("⚠️  %v", llmErr))
+			history = append(history, prevFixAttempt{attempt: attempt, errorOutput: errSnippet, applied: false})
+			continue
 		}
 
-		if len(fixedBlocks) == 0 {
+		if len(patches) == 0 {
 			if sameError {
-				// Same error, LLM has no new ideas — no point continuing.
 				return fmt.Sprintf("❌ **Run & Fix**: same error persists and LLM could not find a fix.\n\nError:\n```\n%s\n```", errSnippet), nil
 			}
 			progress(fmt.Sprintf("⚠️  LLM found no changes to make on attempt %d/%d — retrying…", attempt, maxFixAttempts))
 			continue
 		}
 
-		// Report proposed fix before writing.
-		var fixedNames []string
-		for _, block := range fixedBlocks {
-			if block.name != "" {
-				fixedNames = append(fixedNames, block.name)
+		// Report and apply patches.
+		var patchedNames []string
+		for _, p := range patches {
+			if p.name != "" {
+				patchedNames = append(patchedNames, p.name)
 			}
 		}
-		progress(fmt.Sprintf("📝 Proposed fix: %s", strings.Join(fixedNames, ", ")))
+		progress(fmt.Sprintf("📝 Proposed fix: %s", strings.Join(patchedNames, ", ")))
 
-		cleanDir := filepath.Clean(s.directory)
-		for _, block := range fixedBlocks {
-			if block.name == "" {
+		var appliedPatches []fixPatch
+		var appliedNames []string
+
+		for _, p := range patches {
+			if p.name == "" {
 				continue
 			}
-			absPath := filepath.Clean(filepath.Join(s.directory, block.name))
-			rel, relErr := filepath.Rel(cleanDir, absPath)
-			if relErr != nil || strings.HasPrefix(rel, "..") {
-				continue // security: skip paths outside working directory
+			warnings, applyErr := applyFixPatch(s.directory, p)
+			for _, w := range warnings {
+				progress("⚠️  " + w)
 			}
-			if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-				progress(fmt.Sprintf("⚠️  Could not create directory for %s: %v", block.name, err))
+			if applyErr != nil {
+				progress(fmt.Sprintf("⚠️  Could not apply patch to %s: %v", p.name, applyErr))
 				continue
 			}
-			if err := os.WriteFile(absPath, []byte(block.content), 0o644); err != nil {
-				progress(fmt.Sprintf("⚠️  Could not write %s: %v", block.name, err))
-				continue
-			}
-			s.markWrittenFile(block.name)
+			appliedPatches = append(appliedPatches, p)
+			appliedNames = append(appliedNames, p.name)
+			s.markWrittenFile(p.name)
 			s.mu.Lock()
-			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: block.name, Task: "(auto-fix)"})
+			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: p.name, Task: "(auto-fix)"})
 			s.mu.Unlock()
 		}
-		progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(fixedNames, ", ")))
+		if len(appliedNames) == 0 {
+			progress("⚠️  No proposed changes were applied (all patches were rejected or invalid).")
+		} else {
+			progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(appliedNames, ", ")))
+		}
+
+		recordedPatches := appliedPatches
+		wereApplied := len(appliedPatches) > 0
+		if !wereApplied {
+			// Preserve rejected/no-op proposals so the next prompt can avoid repeating them.
+			recordedPatches = patches
+		}
 
 		// Record this attempt so the next iteration can see what was tried.
 		history = append(history, prevFixAttempt{
-			attempt:      attempt,
-			errorOutput:  errSnippet,
-			changedFiles: fixedBlocks,
+			attempt:     attempt,
+			errorOutput: errSnippet,
+			patches:     recordedPatches,
+			applied:     wereApplied,
 		})
 
 		// Rescan so the next iteration sees up-to-date file contents.
@@ -3217,61 +3930,70 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 	return "❌ Max fix attempts reached.", nil
 }
 
-// runFixLLM calls the LLM with the current file contents + error output.
-// The model is asked to return only files that need to change, using the same
-// FILE:/---/=== format as agent_create, so we can reuse parseAgentCreateResponse.
-func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int, sameError bool, history []prevFixAttempt) ([]agentFileBlock, error) {
+// runFixLLM calls the LLM with focused context (imports + error locations) and
+// error output. It expects SEARCH/REPLACE blocks back, parsed as []fixPatch.
+func (s *Server) runFixLLM(ctx context.Context, task string, errorOutput string, attempt int, sameError bool, history []prevFixAttempt) ([]fixPatch, error) {
 	var prompt strings.Builder
 	if task != "" {
 		fmt.Fprintf(&prompt, "Original task: %s\n\n", task)
 	}
 
-	// Include history of previous failed attempts so the LLM knows exactly
-	// what it already tried and can avoid repeating the same broken fix.
+	// Show history of previous failed attempts.
 	if len(history) > 0 {
 		prompt.WriteString("=== PREVIOUS FAILED ATTEMPTS ===\n")
 		for _, h := range history {
-			fmt.Fprintf(&prompt, "--- Attempt %d ---\n", h.attempt)
-			fmt.Fprintf(&prompt, "Error after applying the fix:\n```\n%s\n```\n", h.errorOutput)
-			if len(h.changedFiles) > 0 {
-				prompt.WriteString("Files written (which did NOT fix the error):\n")
-				for _, f := range h.changedFiles {
-					fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n", f.name, f.content)
+			fmt.Fprintf(&prompt, "--- Attempt %d error ---\n```\n%s\n```\n", h.attempt, h.errorOutput)
+			if len(h.patches) > 0 {
+				if h.applied {
+					prompt.WriteString("Files written (which did NOT fix the error):\n")
+				} else {
+					prompt.WriteString("Files proposed in previous attempt but rejected/no-op (did NOT fix the error):\n")
+				}
+				for _, p := range h.patches {
+					for _, hunk := range p.hunks {
+						// Reconstruct as FILE/---/=== to match the output format.
+						fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n", p.name, hunk.replace)
+					}
 				}
 			} else {
-				prompt.WriteString("(LLM produced no file changes)\n")
+				prompt.WriteString("(no files produced)\n")
 			}
 			prompt.WriteString("\n")
 		}
 		if sameError {
-			fmt.Fprintf(&prompt, "CRITICAL: Attempt %d produced the SAME error as before. The fixes above had NO effect. You MUST take a completely different approach.\n\n", attempt)
+			fmt.Fprintf(&prompt, "CRITICAL: Attempt %d produced the SAME error. The files above had NO effect. Take a completely different approach.\n\n", attempt)
 		} else {
-			prompt.WriteString("IMPORTANT: The fixes above did not resolve the error. You MUST try a structurally different approach — do not repeat anything that was already attempted.\n\n")
+			prompt.WriteString("IMPORTANT: The files above did not fix the error. Take a structurally different approach.\n\n")
 		}
 		prompt.WriteString("=== END OF PREVIOUS ATTEMPTS ===\n\n")
 	}
 
-	prompt.WriteString("Current source files:\n\n")
-	for _, f := range files {
-		if f == nil || !f.IsReadable {
-			continue
+	// Keep context tight: only send files directly referenced by the error.
+	relatedFiles := errorReferencedFiles(s.directory, errorOutput)
+	if len(relatedFiles) > 0 {
+		prompt.WriteString("Relevant source files referenced by the error:\n\n")
+		for _, relPath := range relatedFiles {
+			abs := filepath.Clean(filepath.Join(s.directory, relPath))
+			data, err := os.ReadFile(abs)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(&prompt, "FILE: %s\n```\n%s\n```\n\n", relPath, string(data))
 		}
-		absPath := filepath.Clean(filepath.Join(s.directory, f.RelPath))
-		data, err := os.ReadFile(absPath)
-		if err != nil {
-			continue
-		}
-		fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n\n", f.RelPath, string(data))
 	}
-	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\n", errorOutput)
 
-	// Append annotated source snippets so the model sees the exact broken lines.
-	if snippets := extractErrorSnippets(s.directory, errorOutput); snippets != "" {
-		prompt.WriteString(snippets)
+	if guidance := buildManifestErrorGuidance(errorOutput, relatedFiles); guidance != "" {
+		prompt.WriteString(guidance)
 		prompt.WriteString("\n")
 	}
 
-	prompt.WriteString("Fix the error(s) above. Return only the files that need to change.")
+	// Append a focused error-location summary.
+	if fixCtx := buildFixContext(s.directory, errorOutput); fixCtx != "" {
+		prompt.WriteString("Error locations (line numbers shown for reference only — do not include them in file output):\n\n")
+		prompt.WriteString(fixCtx)
+	}
+
+	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\nFix the error(s) above. Return only the files that need to change.", errorOutput)
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
@@ -3287,7 +4009,31 @@ func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.File
 		return nil, fmt.Errorf("LLM fix request failed: %w", err)
 	}
 
-	return parseAgentCreateResponse(resp.Message.Content), nil
+	// Primary: FILE/---/=== full-file format (matches the system prompt).
+	if blocks := parseAgentCreateResponse(resp.Message.Content); len(blocks) > 0 {
+		var patches []fixPatch
+		for _, b := range blocks {
+			if b.name != "" {
+				patches = append(patches, fixPatch{
+					name:  b.name,
+					hunks: []fixHunk{{search: "", replace: b.content}},
+				})
+			}
+		}
+		return patches, nil
+	}
+
+	// Fallback: SEARCH/REPLACE format.
+	if patches := parseFixPatchResponse(resp.Message.Content); len(patches) > 0 {
+		return patches, nil
+	}
+
+	// Neither format matched — surface the raw response so the progress log
+	// shows what the model actually said, making failures diagnosable.
+	if strings.TrimSpace(resp.Message.Content) != "" {
+		return nil, fmt.Errorf("LLM response did not contain any fix blocks.\nRaw response:\n%s", resp.Message.Content)
+	}
+	return nil, nil
 }
 
 // detectRunCommand inspects the project files and returns the appropriate
