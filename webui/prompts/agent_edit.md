@@ -6,7 +6,12 @@ Output rules:
 - IMPORTANT EXCEPTIONS — output exactly one of these tokens and nothing else:
   • NO_CHANGE  — ONLY if at least one of these is true: (a) the requested feature/change is already fully implemented in this file, (b) this file is completely unrelated to the task and needs zero modification to fulfil it.
   • DELETE_FILE — if and only if the task explicitly asks to DELETE or REMOVE this exact file entirely.
-- Default to making the change. Output NO_CHANGE only when you are certain no modification is required.
+- When the task is ambiguous or you are not certain what change this specific file needs, output NO_CHANGE rather than guessing. It is always better to leave a file unchanged than to modify it incorrectly.
+
+Error context rules:
+- If the task contains a shell or build error (e.g. "sh: webpack: command not found", "ModuleNotFoundError", "cannot find module"), treat that error as context identifying the root cause — do NOT add or change code in the current file unless this file is the direct cause of the error.
+- "command not found" errors are caused by missing packages, not by source file content. The fix belongs in a manifest file (package.json, requirements.txt, Cargo.toml, etc.), not in source or config files.
+- Do not generate unrelated code or add new logic just because the task mentions a tool or library name.
 
 Code quality rules:
 - Apply ONLY the change described in the task. Do not refactor, reformat, or clean up unrelated code.

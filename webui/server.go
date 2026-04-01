@@ -281,6 +281,29 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// asking the LLM to generate something from scratch.
 	activeFiles := s.scopeFilesToQuestion(userInput, s.getActiveFilesSnapshot())
 
+	// Deterministic guard: if the message is clearly asking to mutate project
+	// files (e.g. "delete webpack from code", "fix sh: webpack: command not
+	// found"), redirect to the Agent without calling the LLM.  The chat prompt
+	// already instructs the LLM to do this, but the LLM can misclassify the
+	// intent; this check is always reliable.
+	if mut, desc := isChatMutationRequest(userInput); mut {
+		redirectContent := fmt.Sprintf(
+			"💡 It looks like you want to %s. **Chat** can only answer questions — it never writes to disk.\n\nUse the **⚡ Agent** button to have me actually apply changes to your project.",
+			desc,
+		)
+		redirectMsg := Message{
+			Role:      "assistant",
+			Content:   redirectContent,
+			Timestamp: time.Now(),
+		}
+		s.mu.Lock()
+		s.messages = append(s.messages, redirectMsg)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{Success: true, Message: &redirectMsg})
+		return
+	}
+
 	// Use a background context so a page refresh does NOT cancel the Ollama
 	// request. Only an explicit Stop press (via /api/stop) cancels it.
 	taskCtx, cancel := context.WithCancel(context.Background())
@@ -507,6 +530,31 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 		rel := strings.ToLower(f.RelPath)
 		if strings.Contains(lower, name) || strings.Contains(lower, rel) {
 			matched = append(matched, f)
+		}
+	}
+	// If the task contains a shell/build error ("command not found", "cannot
+	// find module", etc.) always include manifest files in the scope so the
+	// agent can fix the dependency declaration directly rather than editing
+	// unrelated source files that were matched by keyword.
+	if commandNotFoundRe.MatchString(lower) ||
+		strings.Contains(lower, "cannot find module") ||
+		strings.Contains(lower, "modulenotfounderror") ||
+		strings.Contains(lower, "no module named") {
+		manifestNames := map[string]bool{
+			"package.json": true, "requirements.txt": true, "pyproject.toml": true,
+			"setup.py": true, "cargo.toml": true, "go.mod": true, "pom.xml": true,
+			"build.gradle": true, "gemfile": true,
+		}
+		manifestSet := map[string]bool{}
+		for _, f := range matched {
+			manifestSet[strings.ToLower(filepath.Base(f.RelPath))] = true
+		}
+		for _, f := range all {
+			base := strings.ToLower(filepath.Base(f.RelPath))
+			if manifestNames[base] && !manifestSet[base] {
+				matched = append(matched, f)
+				manifestSet[base] = true
+			}
 		}
 	}
 	if len(matched) > 0 {
@@ -3814,10 +3862,64 @@ func detectDeterministicCodeRepairTarget(runCmd, errorOutput string) (string, bo
 	return "", false
 }
 
+// isChatMutationRequest returns (true, short description) when the user's
+// chat message is clearly asking the agent to mutate project files — e.g.
+// "delete webpack from code" or "fix sh: webpack: command not found".
+// The chat system prompt already instructs the LLM to redirect these, but
+// the LLM can occasionally mis-classify the intent; this deterministic check
+// is always reliable and fires before the LLM is ever called.
+func isChatMutationRequest(input string) (bool, string) {
+	lower := strings.ToLower(input)
+
+	// Deletion/removal of a dependency, package, or tool from the project.
+	deleteWords := []string{"delete ", "remove ", "uninstall ", "get rid of ", "strip out "}
+	fromWords := []string{
+		"from code", "from the code", "from project", "from my ",
+		"from package", "from all ", "from codebase", "from source",
+	}
+	for _, d := range deleteWords {
+		if strings.Contains(lower, d) {
+			for _, f := range fromWords {
+				if strings.Contains(lower, f) {
+					return true, "delete or remove a dependency/tool from the project"
+				}
+			}
+		}
+	}
+
+	// Modification verb + "command not found" error pattern.
+	if commandNotFoundRe.MatchString(lower) {
+		modWords := []string{"delete", "remove", "fix", "resolve", "handle", "clean", "get rid", "uninstall"}
+		for _, m := range modWords {
+			if strings.Contains(lower, m) {
+				return true, "fix a missing-command error"
+			}
+		}
+	}
+
+	// "fix/resolve" + well-known dependency error keywords.
+	if strings.Contains(lower, "fix ") || strings.Contains(lower, "resolve ") {
+		errorKeywords := []string{
+			"command not found", "cannot find module",
+			"modulenotfounderror", "no module named ",
+		}
+		for _, e := range errorKeywords {
+			if strings.Contains(lower, e) {
+				return true, "fix a dependency or build error"
+			}
+		}
+	}
+
+	return false, ""
+}
+
 // hasMissingDependencyErrors returns true when the error output contains
 // patterns from known toolchains indicating a package must be installed.
 // It is intentionally language-agnostic: new patterns can be added here
 // without touching any other code path.
+// commandNotFoundRe matches shell "command not found" messages from bash, sh, and zsh.
+var commandNotFoundRe = regexp.MustCompile(`(?:sh|bash|zsh): (?:line \d+: )?([\w.-]+): command not found|command not found: ([\w.-]+)`)
+
 func hasMissingDependencyErrors(errorOutput string) bool {
 	// TypeScript / tsc: missing module or Node.js built-in type declarations.
 	if strings.Contains(errorOutput, "Cannot find module '") ||
@@ -3828,6 +3930,10 @@ func hasMissingDependencyErrors(errorOutput string) bool {
 	// Python: missing import at runtime or compile time.
 	if strings.Contains(errorOutput, "ModuleNotFoundError: No module named '") ||
 		strings.Contains(errorOutput, "ImportError: No module named '") {
+		return true
+	}
+	// Shell: a CLI tool required by the build script is not installed.
+	if commandNotFoundRe.MatchString(errorOutput) {
 		return true
 	}
 	return false
@@ -3853,6 +3959,94 @@ type dependencyInstallPlan struct {
 	describe string   // human-readable summary for progress messages
 }
 
+// npmToolPackages maps known CLI tool binaries to the npm package(s) that
+// provide them. Used when a tool is invoked in scripts but not declared as
+// a dependency, so we know exactly what to install.
+var npmToolPackages = map[string][]string{
+	"webpack":        {"webpack", "webpack-cli"},
+	"webpack-cli":    {"webpack-cli"},
+	"vite":           {"vite"},
+	"esbuild":        {"esbuild"},
+	"rollup":         {"rollup"},
+	"parcel":         {"parcel"},
+	"tsc":            {"typescript"},
+	"ts-node":        {"ts-node"},
+	"ts-node-esm":    {"ts-node"},
+	"eslint":         {"eslint"},
+	"prettier":       {"prettier"},
+	"jest":           {"jest"},
+	"vitest":         {"vitest"},
+	"mocha":          {"mocha"},
+	"nodemon":        {"nodemon"},
+	"concurrently":   {"concurrently"},
+}
+
+// isCommandDeclaredInPackageJSON returns true when the command is explicitly
+// listed as a key in dependencies or devDependencies (not just referenced in
+// a script value), meaning `npm install` is sufficient to restore it.
+func isCommandDeclaredInPackageJSON(pkgJSONPath, cmd string) bool {
+	data, err := os.ReadFile(pkgJSONPath)
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if json.Unmarshal(data, &pkg) != nil {
+		return false
+	}
+	if _, ok := pkg.Dependencies[cmd]; ok {
+		return true
+	}
+	if _, ok := pkg.DevDependencies[cmd]; ok {
+		return true
+	}
+	// Also check mapped package names (e.g. cmd=webpack → package=webpack).
+	if pkgs, known := npmToolPackages[cmd]; known {
+		for _, p := range pkgs {
+			if _, ok := pkg.Dependencies[p]; ok {
+				return true
+			}
+			if _, ok := pkg.DevDependencies[p]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isCommandInPackageJSON returns true if the given command name appears in any
+// scripts value or as a key in dependencies/devDependencies in the given
+// package.json file. This confirms the missing tool is npm-managed rather than
+// a system utility.
+func isCommandInPackageJSON(pkgJSONPath, cmd string) bool {
+	data, err := os.ReadFile(pkgJSONPath)
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Scripts         map[string]string `json:"scripts"`
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if json.Unmarshal(data, &pkg) != nil {
+		return false
+	}
+	for _, script := range pkg.Scripts {
+		if strings.Contains(script, cmd) {
+			return true
+		}
+	}
+	if _, ok := pkg.Dependencies[cmd]; ok {
+		return true
+	}
+	if _, ok := pkg.DevDependencies[cmd]; ok {
+		return true
+	}
+	return false
+}
+
 // buildDependencyInstallPlan inspects the project at workDir and the error
 // output to decide which packages to install and via which package manager.
 // Returns nil if no actionable plan can be built.
@@ -3873,6 +4067,35 @@ func buildDependencyInstallPlan(workDir, errorOutput string) *dependencyInstallP
 
 	// ── npm (TypeScript / JavaScript) ────────────────────────────────────────
 	if hasFile("package.json") {
+		pkgJSONPath := filepath.Join(workDir, "package.json")
+		if m := commandNotFoundRe.FindStringSubmatch(errorOutput); m != nil {
+			missingCmd := m[1]
+			if missingCmd == "" {
+				missingCmd = m[2]
+			}
+			if isCommandInPackageJSON(pkgJSONPath, missingCmd) {
+				if isCommandDeclaredInPackageJSON(pkgJSONPath, missingCmd) {
+					// Tool IS declared as a dep — node_modules just needs restoring.
+					return &dependencyInstallPlan{
+						cmd:      "npm",
+						args:     []string{"install"},
+						describe: "npm install (restores node_modules for missing tool: " + missingCmd + ")",
+					}
+				}
+				// Tool is used in scripts but NOT declared — install it explicitly.
+				pkgsToInstall := []string{missingCmd}
+				if known, ok := npmToolPackages[missingCmd]; ok {
+					pkgsToInstall = known
+				}
+				args := append([]string{"install", "--save-dev"}, pkgsToInstall...)
+				return &dependencyInstallPlan{
+					cmd:      "npm",
+					args:     args,
+					describe: "npm install --save-dev " + strings.Join(pkgsToInstall, " ") + " (missing tool not declared in package.json)",
+				}
+			}
+		}
+
 		seen := map[string]bool{}
 		var pkgs []string
 
