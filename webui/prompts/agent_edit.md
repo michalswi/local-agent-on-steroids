@@ -18,8 +18,11 @@ Code quality rules:
 
 Documentation and README rules:
 - When the task asks to write, create, adjust, update, or improve a README or documentation file, produce a COMPLETE, well-structured document — not a minimal addition. A full rewrite is correct and expected for documentation tasks.
+- Clearly explain what the app is for in plain language (who it helps and the core use case).
 - Derive ALL instructions and values from the actual source files provided as context — filenames, commands, config keys, environment variables, ports, paths, and flags must be real values taken directly from the code. Read the source files carefully before writing any command or value.
 - NEVER use generic placeholders such as [repository_url], [your_value], <project_name>, YOUR_KEY, etc. Every value must be concrete and immediately usable without substitution.
 - If a value is genuinely unknown (e.g. a user-specific secret), name the exact environment variable or config key the user must set and explain what it controls — do not use angle-bracket templates.
 - For README files: always include at minimum — how to build, how to run, any required environment variables or config, and example commands with real values.
+- Include step-by-step shell examples in fenced `bash` blocks and keep wording user-friendly.
+- Include a brief "Possible Improvements" section with practical next enhancements.
 - Preserve any correct, concrete content already present in the file. Do not replace real commands or real values with placeholders.

@@ -1784,6 +1784,205 @@ func agentImpliedExtension(task string) string {
 	return ""
 }
 
+func agentIsDocsIntent(task string) bool {
+	lower := strings.ToLower(task)
+	return strings.Contains(lower, "readme") || strings.Contains(lower, "documentation") || strings.Contains(lower, "docs")
+}
+
+func agentIsDocLikeFile(name string) bool {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(filepath.Clean(name))))
+	ext := strings.ToLower(filepath.Ext(base))
+	// Guard: common dependency/lock manifests are not documentation, even if
+	// they have text-like extensions.
+	nonDocManifests := map[string]bool{
+		"requirements.txt":  true,
+		"constraints.txt":   true,
+		"go.mod":            true,
+		"go.sum":            true,
+		"package-lock.json": true,
+		"yarn.lock":         true,
+		"pnpm-lock.yaml":    true,
+		"pipfile":           true,
+		"pipfile.lock":      true,
+		"poetry.lock":       true,
+		"cargo.lock":        true,
+		"composer.lock":     true,
+	}
+	if nonDocManifests[base] {
+		return false
+	}
+	if strings.HasPrefix(base, "readme") {
+		return true
+	}
+	if strings.HasPrefix(base, "changelog") || strings.HasPrefix(base, "license") || strings.HasPrefix(base, "contributing") {
+		return true
+	}
+	if ext == ".txt" {
+		for _, hint := range []string{"readme", "docs", "documentation", "guide", "manual", "install", "getting-started"} {
+			if strings.Contains(base, hint) {
+				return true
+			}
+		}
+		return false
+	}
+	switch ext {
+	case ".md", ".markdown", ".mdx", ".rst", ".adoc":
+		return true
+	default:
+		return false
+	}
+}
+
+func agentDocumentationInstructions() string {
+	return "Documentation requirements:\n" +
+		"- Start with a short plain-language overview describing what the app is for and who it helps.\n" +
+		"- Include a step-by-step Getting Started section with copy-pasteable shell examples in fenced bash blocks.\n" +
+		"- Include build and run instructions plus required config/environment variables using concrete values from provided files.\n" +
+		"- Include a brief Possible Improvements section with practical future enhancements.\n" +
+		"- Keep wording user-friendly and concise; avoid placeholders."
+}
+
+func agentLastNonEmptyLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func agentDocValidationIssues(content string) []string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return []string{"empty documentation output"}
+	}
+
+	var issues []string
+	lower := strings.ToLower(content)
+
+	if strings.Count(content, "```")%2 != 0 {
+		issues = append(issues, "contains an unclosed code fence")
+	}
+	if !strings.Contains(lower, "getting started") && !strings.Contains(lower, "quick start") {
+		issues = append(issues, "missing a Getting Started or Quick Start section")
+	}
+	if !strings.Contains(lower, "```bash") {
+		issues = append(issues, "missing step-by-step shell examples in fenced bash blocks")
+	}
+	if !strings.Contains(lower, "possible improvements") {
+		issues = append(issues, "missing a Possible Improvements section")
+	}
+
+	placeholderHints := []string{
+		"your-username",
+		"your_project",
+		"your-project",
+		"your-key",
+		"your_key",
+		"your-token",
+		"your_token",
+		"<project_name>",
+		"<your_",
+		"[your_",
+		"github.com/your-",
+	}
+	for _, hint := range placeholderHints {
+		if strings.Contains(lower, hint) {
+			issues = append(issues, "contains generic placeholders instead of project-specific values")
+			break
+		}
+	}
+
+	last := agentLastNonEmptyLine(content)
+	if last != "" {
+		if strings.HasSuffix(last, ":") || strings.HasSuffix(last, ",") {
+			issues = append(issues, "appears truncated at the end")
+		}
+	}
+
+	return issues
+}
+
+func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, oldContent, draft string) (final string, issues []string, err error) {
+	issues = agentDocValidationIssues(draft)
+	if len(issues) == 0 {
+		return draft, nil, nil
+	}
+
+	var issueList strings.Builder
+	for _, it := range issues {
+		fmt.Fprintf(&issueList, "- %s\n", it)
+	}
+
+	systemPrompt := "You are a technical documentation writer. " +
+		"Return ONLY the complete, corrected content of the target documentation file. " +
+		"Do not include markdown fences or commentary."
+
+	userPrompt := fmt.Sprintf(
+		"Task: %s\n\nTarget file: %s\n\nCurrent file content (may be empty):\n%s\n\nDraft that needs correction:\n%s\n\nProblems to fix:\n%s\nUse the documentation requirements below and return a full replacement file.\n\n%s",
+		task,
+		filePath,
+		oldContent,
+		draft,
+		issueList.String(),
+		agentDocumentationInstructions()+"\n\n"+s.agentProjectMetaBlock(),
+	)
+
+	chatReq := &llm.ChatRequest{
+		Model: s.cfg.LLM.Model,
+		Messages: []llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Temperature: agentTemperature(s.cfg.LLM.Temperature),
+	}
+
+	resp, callErr := s.llmClient.Chat(ctx, chatReq)
+	if callErr != nil {
+		return draft, issues, callErr
+	}
+
+	candidate := agentStripFences(strings.TrimSpace(resp.Message.Content))
+	if strings.TrimSpace(candidate) == "" {
+		return draft, issues, nil
+	}
+
+	remaining := agentDocValidationIssues(candidate)
+	if len(remaining) == 0 {
+		return candidate, nil, nil
+	}
+
+	return candidate, remaining, nil
+}
+
+// filterPlannedFilesForDocsIntent keeps only documentation-like planned files,
+// unless a non-doc file was explicitly mentioned in the user task.
+func filterPlannedFilesForDocsIntent(task string, plannedFiles []string) (allowed []string, blocked []string) {
+	mentions := agentFileMentionsFromTask(task)
+	mentionedRel := map[string]bool{}
+	mentionedBase := map[string]bool{}
+	for _, m := range mentions {
+		clean := filepath.ToSlash(filepath.Clean(m))
+		mentionedRel[strings.ToLower(clean)] = true
+		mentionedBase[strings.ToLower(filepath.Base(clean))] = true
+	}
+
+	for _, f := range plannedFiles {
+		clean := filepath.ToSlash(filepath.Clean(f))
+		keyRel := strings.ToLower(clean)
+		keyBase := strings.ToLower(filepath.Base(clean))
+		explicitlyRequested := mentionedRel[keyRel] || mentionedBase[keyBase]
+		if agentIsDocLikeFile(clean) || explicitlyRequested {
+			allowed = append(allowed, f)
+		} else {
+			blocked = append(blocked, f)
+		}
+	}
+	return allowed, blocked
+}
+
 // runAgentTask sends one LLM request per relevant file.
 // For each file the LLM is asked to return the complete updated content.
 // Changes are written to disk immediately.
@@ -2079,6 +2278,11 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 
 	// ── No existing files: ask LLM to create a new one ──────────────────────
 	if len(targetFiles) == 0 {
+		if agentIsDocsIntent(task) {
+			// For docs tasks, always include project context so commands and
+			// descriptions are derived from real files instead of generic templates.
+			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
+		}
 		return s.runAgentCreate(ctx, task, nil, progress, dryRun)
 	}
 
@@ -2245,6 +2449,10 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			} else {
 				userPrompt = fmt.Sprintf("File: %s\n\n%s\n\nTask: %s", f.RelPath, oldContent, task)
 			}
+			if agentIsDocLikeFile(f.RelPath) {
+				userPrompt += "\n\n" + agentDocumentationInstructions()
+				userPrompt += "\n\n" + s.agentProjectMetaBlock()
+			}
 			chatReq := &llm.ChatRequest{
 				Model: s.cfg.LLM.Model,
 				Messages: []llm.Message{
@@ -2295,6 +2503,18 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					PromptEvalCount: resp.PromptEvalCount,
 				}}
 				return
+			}
+
+			if agentIsDocLikeFile(f.RelPath) {
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, f.RelPath, oldContent, newContent)
+				if refineErr != nil {
+					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", f.RelPath, refineErr))
+				} else {
+					newContent = refined
+					if len(issues) > 0 {
+						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", f.RelPath, strings.Join(issues, "; ")))
+					}
+				}
 			}
 
 			if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
@@ -2646,29 +2866,33 @@ func parseAgentCreateResponse(raw string) []agentFileBlock {
 // treated as multi-file creation requests so they go through runAgentPlan.
 // If none is clearly present, it returns "".
 func agentExplicitFilenameFromTask(task string) string {
-	// Long tasks describe multi-file projects — don't try to extract a single
-	// filename from prose ("e.g., React, Vue..." would otherwise match "e.g").
-	if len(task) > 200 {
+	lower := strings.ToLower(task)
+	isDocsTask := strings.Contains(lower, "readme") || strings.Contains(lower, "documentation") || strings.Contains(lower, "docs")
+
+	// Keep conservative behaviour for long generic prompts (project scaffolding),
+	// but still allow explicit doc targets like README.md.
+	if len(task) > 200 && !isDocsTask {
 		return ""
 	}
-	match := agentFilenameRe.FindString(task)
-	if match == "" {
+
+	mentions := agentFileMentionsFromTask(task)
+	if len(mentions) == 0 {
 		return ""
 	}
-	name := agentSanitizeFilename(match)
-	ext := filepath.Ext(name)
-	if name == "" || strings.Contains(name, " ") || ext == "" {
-		return ""
+	if len(mentions) == 1 {
+		return mentions[0]
 	}
-	// Require at least a 2-character extension (e.g. ".go", not ".g").
-	if len(ext) < 3 {
-		return ""
+
+	// Multi-file mention: for docs requests, prefer an explicit README target.
+	if isDocsTask {
+		for _, name := range mentions {
+			if strings.HasPrefix(strings.ToLower(filepath.Base(name)), "readme.") {
+				return name
+			}
+		}
 	}
-	// Block known prose abbreviations that match the filename pattern.
-	if knownNonFilenames[strings.ToLower(name)] {
-		return ""
-	}
-	return name
+
+	return ""
 }
 
 // runAgentPlan asks the LLM which files need to be created for the task.
@@ -2760,6 +2984,22 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			progress("⚠️  Planning returned no files — falling back to single-file mode…")
 			plannedFiles = nil
 		} else {
+			if agentIsDocsIntent(task) {
+				filtered, blocked := filterPlannedFilesForDocsIntent(task, plannedFiles)
+				if len(blocked) > 0 {
+					progress(fmt.Sprintf("🛡️  Docs guard blocked non-doc planned files: %s", strings.Join(blocked, ", ")))
+				}
+				plannedFiles = filtered
+				if len(plannedFiles) == 0 {
+					if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
+						plannedFiles = []string{explicit}
+					} else {
+						plannedFiles = []string{"README.md"}
+					}
+					progress(fmt.Sprintf("📋 Plan: docs fallback target %s", plannedFiles[0]))
+				}
+			}
+
 			var planBuf strings.Builder
 			fmt.Fprintf(&planBuf, "📋 Plan: %d file(s) to create\n", len(plannedFiles))
 			for _, f := range plannedFiles {
@@ -2794,6 +3034,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 
 		for i, fileName := range plannedFiles {
 			progress(fmt.Sprintf("⚙️  Generating %s (%d/%d)…", fileName, i+1, len(plannedFiles)))
+			isDocFile := agentIsDocLikeFile(fileName)
 
 			// Build a focused prompt for this single file.
 			var userMsg strings.Builder
@@ -2809,10 +3050,22 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 					fmt.Fprintf(&userMsg, "=== %s ===\n%s\n\n", name, content)
 				}
 			}
+			if isDocFile {
+				userMsg.WriteString("\n")
+				userMsg.WriteString(agentDocumentationInstructions())
+				userMsg.WriteString("\n\n")
+				userMsg.WriteString(s.agentProjectMetaBlock())
+				userMsg.WriteString("\n")
+			}
 
 			sysPrompt := "You are a coding agent. " +
 				"Generate ONLY the complete content of the single file specified. " +
 				"Output raw file content — no markdown fences, no commentary, no filename header."
+			if isDocFile {
+				sysPrompt = "You are a technical documentation writer and coding agent. " +
+					"Generate ONLY the complete content of the single documentation file specified. " +
+					"Output raw file content — no markdown fences, no commentary, no filename header."
+			}
 			if changelog != "" {
 				sysPrompt += "\n\n" + changelog
 			}
@@ -2857,6 +3110,23 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				return "", nil, fmt.Errorf("agent tried to write outside working directory: %s", fileName)
 			}
 			relSlash := filepath.ToSlash(rel)
+
+			if isDocFile {
+				existingDoc := ""
+				if data, readErr := os.ReadFile(absPath); readErr == nil {
+					existingDoc = string(data)
+				}
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent)
+				if refineErr != nil {
+					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
+				} else {
+					fileContent = refined
+					if len(issues) > 0 {
+						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", relSlash, strings.Join(issues, "; ")))
+					}
+				}
+			}
+
 			alreadyGenerated[relSlash] = fileContent
 
 			if !dryRun {
@@ -2939,6 +3209,23 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				return "", nil, fmt.Errorf("agent tried to write outside working directory: %s", fileName)
 			}
 			relSlash := filepath.ToSlash(rel)
+
+			if agentIsDocLikeFile(fileName) {
+				existingDoc := ""
+				if data, readErr := os.ReadFile(absPath); readErr == nil {
+					existingDoc = string(data)
+				}
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent)
+				if refineErr != nil {
+					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
+				} else {
+					fileContent = refined
+					if len(issues) > 0 {
+						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", relSlash, strings.Join(issues, "; ")))
+					}
+				}
+			}
+
 			if !dryRun {
 				if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 					return "", nil, fmt.Errorf("failed to create directory for %s: %w", relSlash, err)
@@ -3519,7 +3806,31 @@ func detectDeterministicCodeRepairTarget(runCmd, errorOutput string) (string, bo
 	if runCmd == "go" && strings.Contains(errorOutput, "found packages ") {
 		return "go-package-mismatch", true
 	}
+	// Language-agnostic: detect "missing module / package" errors whose root
+	// cause is an absent dependency rather than a source-code bug.
+	if hasMissingDependencyErrors(errorOutput) {
+		return "missing-dependency", true
+	}
 	return "", false
+}
+
+// hasMissingDependencyErrors returns true when the error output contains
+// patterns from known toolchains indicating a package must be installed.
+// It is intentionally language-agnostic: new patterns can be added here
+// without touching any other code path.
+func hasMissingDependencyErrors(errorOutput string) bool {
+	// TypeScript / tsc: missing module or Node.js built-in type declarations.
+	if strings.Contains(errorOutput, "Cannot find module '") ||
+		strings.Contains(errorOutput, "Cannot find name '__dirname'") ||
+		strings.Contains(errorOutput, "Cannot find name '__filename'") {
+		return true
+	}
+	// Python: missing import at runtime or compile time.
+	if strings.Contains(errorOutput, "ModuleNotFoundError: No module named '") ||
+		strings.Contains(errorOutput, "ImportError: No module named '") {
+		return true
+	}
+	return false
 }
 
 func attemptDeterministicCodeRepair(workDir, target, errorOutput string) (bool, string, []string) {
@@ -3528,9 +3839,119 @@ func attemptDeterministicCodeRepair(workDir, target, errorOutput string) (bool, 
 		return attemptAutoRepairGoUnusedDiagnostics(workDir, errorOutput)
 	case "go-package-mismatch":
 		return attemptAutoRepairGoPackageMismatch(workDir, errorOutput)
+	case "missing-dependency":
+		return attemptAutoRepairMissingDependency(workDir, errorOutput)
 	default:
 		return false, fmt.Sprintf("Auto-repair skipped: deterministic code strategy for %s is not implemented", target), nil
 	}
+}
+
+// dependencyInstallPlan holds the command needed to install missing packages.
+type dependencyInstallPlan struct {
+	cmd      string   // e.g. "npm" or "pip"
+	args     []string // full argument list including package names
+	describe string   // human-readable summary for progress messages
+}
+
+// buildDependencyInstallPlan inspects the project at workDir and the error
+// output to decide which packages to install and via which package manager.
+// Returns nil if no actionable plan can be built.
+// Adding support for a new language/toolchain only requires extending this function.
+func buildDependencyInstallPlan(workDir, errorOutput string) *dependencyInstallPlan {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return nil
+	}
+	hasFile := func(name string) bool {
+		for _, e := range entries {
+			if !e.IsDir() && strings.EqualFold(e.Name(), name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// ── npm (TypeScript / JavaScript) ────────────────────────────────────────
+	if hasFile("package.json") {
+		seen := map[string]bool{}
+		var pkgs []string
+
+		// node: built-ins and globals (__dirname, __filename) all resolved by @types/node.
+		nodeBuiltinRe := regexp.MustCompile(`Cannot find module 'node:[^']*'`)
+		if nodeBuiltinRe.MatchString(errorOutput) ||
+			strings.Contains(errorOutput, "Cannot find name '__dirname'") ||
+			strings.Contains(errorOutput, "Cannot find name '__filename'") {
+			if !seen["@types/node"] {
+				pkgs = append(pkgs, "@types/node")
+				seen["@types/node"] = true
+			}
+		}
+
+		// Other missing modules: "Cannot find module 'X'" → try @types/X.
+		// Skip relative paths (start with '.') — those are source-code bugs.
+		otherRe := regexp.MustCompile(`Cannot find module '([^'.][^']*)'`)
+		for _, m := range otherRe.FindAllStringSubmatch(errorOutput, -1) {
+			name := m[1]
+			if strings.HasPrefix(name, "node:") {
+				continue // already covered above
+			}
+			typePkg := "@types/" + strings.TrimPrefix(name, "@")
+			if !seen[typePkg] {
+				pkgs = append(pkgs, typePkg)
+				seen[typePkg] = true
+			}
+		}
+
+		if len(pkgs) > 0 {
+			args := append([]string{"install", "--save-dev"}, pkgs...)
+			return &dependencyInstallPlan{
+				cmd:      "npm",
+				args:     args,
+				describe: "npm install --save-dev " + strings.Join(pkgs, " "),
+			}
+		}
+	}
+
+	// ── pip (Python) ─────────────────────────────────────────────────────────
+	if hasFile("requirements.txt") || hasFile("pyproject.toml") || hasFile("setup.py") || hasFile("setup.cfg") {
+		moduleRe := regexp.MustCompile(`(?:ModuleNotFoundError|ImportError): No module named '([^']+)'`)
+		seen := map[string]bool{}
+		var pkgs []string
+		for _, m := range moduleRe.FindAllStringSubmatch(errorOutput, -1) {
+			name := strings.SplitN(m[1], ".", 2)[0] // top-level package only
+			if !seen[name] {
+				pkgs = append(pkgs, name)
+				seen[name] = true
+			}
+		}
+		if len(pkgs) > 0 {
+			args := append([]string{"install"}, pkgs...)
+			return &dependencyInstallPlan{
+				cmd:      "pip",
+				args:     args,
+				describe: "pip install " + strings.Join(pkgs, " "),
+			}
+		}
+	}
+
+	return nil
+}
+
+// attemptAutoRepairMissingDependency resolves "missing module" errors from any
+// supported toolchain by detecting the project type and installing the required
+// packages. No source files are modified.
+func attemptAutoRepairMissingDependency(workDir, errorOutput string) (bool, string, []string) {
+	plan := buildDependencyInstallPlan(workDir, errorOutput)
+	if plan == nil {
+		return false, "Auto-repair skipped: could not determine missing packages or package manager", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, stderr, code := execCommand(ctx, workDir, plan.cmd, plan.args...)
+	if code != 0 {
+		return false, fmt.Sprintf("Auto-repair: `%s` failed: %s", plan.describe, strings.TrimSpace(stderr)), nil
+	}
+	return true, fmt.Sprintf("Auto-repair: ran `%s`", plan.describe), nil
 }
 
 type goPackageConflict struct {
@@ -4726,6 +5147,32 @@ func (s *Server) detectRunCommand(files []*types.FileInfo) (cmd string, args []s
 	// Node.js / TypeScript — prefer npm run build, fall back to npm install
 	if check("package.json") {
 		if check("tsconfig.json") {
+			// If package.json has a "build" script, use it — it likely runs tsc
+			// with the correct flags and also produces dist/ output.
+			if pkgJSON, readErr := os.ReadFile(filepath.Join(s.directory, "package.json")); readErr == nil {
+				var pkgMeta struct {
+					Scripts map[string]string `json:"scripts"`
+				}
+				if json.Unmarshal(pkgJSON, &pkgMeta) == nil {
+					if _, hasBuild := pkgMeta.Scripts["build"]; hasBuild {
+						return "npm", []string{"run", "build"}, nil
+					}
+				}
+			}
+			// No build script: check tsconfig.json for outDir. If one is set
+			// the project expects compiled output, so run tsc without --noEmit
+			// so that dist/ is actually populated. If outDir is absent, type-
+			// check only is fine.
+			if tsconfig, readErr := os.ReadFile(filepath.Join(s.directory, "tsconfig.json")); readErr == nil {
+				var tsMeta struct {
+					CompilerOptions map[string]interface{} `json:"compilerOptions"`
+				}
+				if json.Unmarshal(tsconfig, &tsMeta) == nil {
+					if outDir, ok := tsMeta.CompilerOptions["outDir"]; ok && outDir != "" {
+						return "npx", []string{"tsc"}, nil
+					}
+				}
+			}
 			return "npx", []string{"tsc", "--noEmit"}, nil
 		}
 		return "npm", []string{"run", "build", "--if-present"}, nil
@@ -4765,6 +5212,39 @@ func (s *Server) detectRunCommand(files []*types.FileInfo) (cmd string, args []s
 
 // execCommand runs name with args inside dir, captures combined stdout+stderr,
 // and returns the exit code. A non-zero code always means failure.
+// agentFetchGitRemoteURL returns the "origin" remote URL of the git
+// repository rooted at dir, or an empty string if there is no remote or no
+// git repository.
+func agentFetchGitRemoteURL(dir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stdout, _, code := execCommand(ctx, dir, "git", "remote", "get-url", "origin")
+	if code != 0 {
+		return ""
+	}
+	return strings.TrimSpace(stdout)
+}
+
+// agentProjectMetaBlock returns a small context block with repository-specific
+// facts (directory name, remote URL) that the LLM should use when writing
+// README / documentation files, so it never falls back to generic placeholders.
+func (s *Server) agentProjectMetaBlock() string {
+	dirName := filepath.Base(filepath.Clean(s.directory))
+	remoteURL := agentFetchGitRemoteURL(s.directory)
+
+	var b strings.Builder
+	b.WriteString("Project metadata for documentation (use these exact values):\n")
+	fmt.Fprintf(&b, "- Local directory name: %s\n", dirName)
+	if remoteURL != "" {
+		fmt.Fprintf(&b, "- Repository URL: %s\n", remoteURL)
+		fmt.Fprintf(&b, "  Use this URL for the git clone step, e.g.: git clone %s\n", remoteURL)
+		fmt.Fprintf(&b, "  Then: cd %s\n", dirName)
+	} else {
+		b.WriteString("- No remote repository found. Do NOT include a \"git clone\" step; the user already has the source code.\n")
+	}
+	return b.String()
+}
+
 func execCommand(ctx context.Context, dir, name string, args ...string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
