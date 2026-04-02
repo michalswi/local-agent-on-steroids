@@ -42,8 +42,8 @@ make build
 ## \# Ollama Setup
 
 ```bash
-# Recommended: match OLLAMA_NUM_PARALLEL with AGENT_CONCURRENT_FILES,
-#              match OLLAMA_CONTEXT_LENGTH with AGENT_TOKEN_LIMIT
+# match OLLAMA_NUM_PARALLEL with AGENT_CONCURRENT_FILES,
+# match OLLAMA_CONTEXT_LENGTH with AGENT_TOKEN_LIMIT
 OLLAMA_CONTEXT_LENGTH=8192 OLLAMA_NUM_PARALLEL=5 ollama serve
 
 AGENT_TOKEN_LIMIT=8000 AGENT_CONCURRENT_FILES=5 ./local-agent-on-steroids --dir . --interactive
@@ -53,8 +53,10 @@ ollama serve
 ./local-agent-on-steroids --dir . --interactive
 ```
 
-> **`AGENT_CONCURRENT_FILES`** controls parallel LLM calls when **editing/analyzing existing files** (agent task mode).
+> **`AGENT_CONCURRENT_FILES`** controls parallel LLM calls when **editing/analyzing existing files** (agent task mode) and when **reviewing/analyzing files via Send** (Smart Send mode — active when `AGENT_CONCURRENT_FILES > 1` and more than one file is in scope).
 > It does **not** apply when **generating new files** from scratch — those are produced sequentially.
+
+> **`AGENT_TOKEN_LIMIT`** sets the maximum file size (in tokens) that the scanner will read. Files exceeding this limit are marked unreadable and excluded from all prompts. Match it to `OLLAMA_CONTEXT_LENGTH` to avoid sending more content than the model's context window can handle.
 
 ## \# Session Logs
 
@@ -77,7 +79,7 @@ ls /tmp/local-agent-on-steroids/
 |---|---|
 | **⚡ Agent** | Agent mode — scans all files, plans changes, and applies them autonomously. Triggered by pressing `Enter`. |
 | **🔧 Run & Fix** | Runs the project, feeds build errors to the LLM, applies fixes, and retries — up to 3 attempts. |
-| **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. |
+| **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. When `AGENT_CONCURRENT_FILES > 1` and multiple files are in scope, automatically switches to **Smart Send**: one parallel LLM call per file, results combined into a single response. |
 | **Clear** | Clears the current chat conversation history (same behavior as typing `clear` in chat). |
 | **Help** | Opens the in-app help modal listing all available chat commands and keyboard shortcuts. |
 | **⏹ Stop** | Aborts the current Agent or Send operation mid-stream. Only visible while a request is in progress. |

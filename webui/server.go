@@ -37,6 +37,14 @@ func mustPrompt(name string) string {
 	return strings.TrimSpace(string(data))
 }
 
+// maxMessages is the maximum number of messages kept in the in-memory chat
+// history. Entries beyond this limit are dropped from the front of the slice.
+const maxMessages = 200
+
+// maxAgentLogEntries caps the agent changelog that is injected into every
+// agent prompt. Older entries are dropped first to bound prompt token usage.
+const maxAgentLogEntries = 50
+
 var (
 	promptChat        = mustPrompt("prompts/chat.md")
 	promptAgentEdit   = mustPrompt("prompts/agent_edit.md")
@@ -134,7 +142,7 @@ func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, 
 		s.scanFilter = f
 	}
 
-	s.messages = append(s.messages, Message{
+	s.appendMessageLocked(Message{
 		Role: "assistant",
 		Content: fmt.Sprintf("🤖 Interactive mode started!\n\nScanned: %s\nFiles found: %d\nModel: %s\n\nConcurrent Files: %d\nTemperature: %.2f\n\nType your questions or commands.",
 			directory, scanResult.TotalFiles, model, cfg.Agent.ConcurrentFiles, cfg.LLM.Temperature),
@@ -245,7 +253,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Add user message
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{
+	s.appendMessageLocked(Message{
 		Role:      "user",
 		Content:   userInput,
 		Timestamp: time.Now(),
@@ -265,7 +273,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Content:   response,
 			Timestamp: time.Now(),
 		}
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -297,7 +305,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Timestamp: time.Now(),
 		}
 		s.mu.Lock()
-		s.messages = append(s.messages, redirectMsg)
+		s.appendMessageLocked(redirectMsg)
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(ChatResponse{Success: true, Message: &redirectMsg})
@@ -329,13 +337,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		cancel()
 	}()
 
-	resp, answer, duration, err := s.processQuestion(taskCtx, userInput, activeFiles)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return // stopped — keep the user message, no reply to store
+	s.mu.RLock()
+	chatConcurrency := s.cfg.Agent.ConcurrentFiles
+	s.mu.RUnlock()
+
+	var answer string
+	var duration time.Duration
+	var promptEvalCount int
+	if len(activeFiles) > 1 && chatConcurrency > 1 {
+		var parallelErr error
+		answer, duration, parallelErr = s.processQuestionParallel(taskCtx, userInput, activeFiles)
+		if parallelErr != nil {
+			if errors.Is(parallelErr, context.Canceled) {
+				return // stopped — keep the user message, no reply to store
+			}
+			sendError(w, parallelErr.Error())
+			return
 		}
-		sendError(w, err.Error())
-		return
+	} else {
+		var resp *llm.ChatResponse
+		var singleErr error
+		resp, answer, duration, singleErr = s.processQuestion(taskCtx, userInput, activeFiles)
+		if singleErr != nil {
+			if errors.Is(singleErr, context.Canceled) {
+				return // stopped — keep the user message, no reply to store
+			}
+			sendError(w, singleErr.Error())
+			return
+		}
+		if resp != nil {
+			promptEvalCount = resp.PromptEvalCount
+		}
+		s.saveSession(userInput, answer, resp, duration)
 	}
 
 	msg := Message{
@@ -343,14 +376,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Content:         answer,
 		Timestamp:       time.Now(),
 		DurationMs:      duration.Milliseconds(),
-		PromptEvalCount: resp.PromptEvalCount,
+		PromptEvalCount: promptEvalCount,
 	}
 
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
-
-	s.saveSession(userInput, answer, resp, duration)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ChatResponse{
@@ -561,6 +592,18 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 		return matched
 	}
 
+	// Read-only review / analysis with no specific file mentioned — the user
+	// wants feedback on the whole project, not a subset.
+	if strings.Contains(lower, "review") ||
+		strings.Contains(lower, "analyze") ||
+		strings.Contains(lower, "analyse") ||
+		strings.Contains(lower, "audit") ||
+		strings.Contains(lower, "assess") ||
+		strings.Contains(lower, "check the code") ||
+		strings.Contains(lower, "go through the code") {
+		return all
+	}
+
 	// No explicit file mentions: pick a conservative, likely-relevant subset.
 	// This prevents generic follow-up prompts (e.g. "add auth") from modifying
 	// README/config/generated artifacts unintentionally.
@@ -579,21 +622,6 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 	// 2) Technology mismatch check: if the task explicitly requests a language
 	// or framework that is NOT present in the workspace, return nil so the
 	// caller routes to runAgentCreate rather than overwriting unrelated files.
-	techMap := map[string][]string{
-		".ts":    {"typescript", " ts ", ".ts "},
-		".tsx":   {"react", ".tsx"},
-		".vue":   {"vue"},
-		".js":    {"javascript", " js ", ".js ", "nodejs", "node.js"},
-		".py":    {"python", ".py "},
-		".rs":    {"rust", ".rs "},
-		".rb":    {"ruby", ".rb "},
-		".java":  {"java "},
-		".kt":    {"kotlin"},
-		".cs":    {"c# ", "csharp", ".net"},
-		".swift": {"swift"},
-		".php":   {"php"},
-	}
-	// Collect extensions present in the workspace.
 	workspaceExts := map[string]bool{}
 	for _, f := range all {
 		if f == nil {
@@ -601,12 +629,12 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 		}
 		workspaceExts[strings.ToLower(filepath.Ext(f.RelPath))] = true
 	}
-	for ext, keywords := range techMap {
-		for _, kw := range keywords {
+	for _, e := range types.LangRegistry {
+		for _, kw := range e.TechKW {
 			if strings.Contains(lower, kw) {
 				// Task mentions this technology; if the workspace has none of
 				// these files, signal that new files must be created.
-				if !workspaceExts[ext] {
+				if !workspaceExts[e.Ext] {
 					return nil
 				}
 			}
@@ -615,11 +643,11 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 
 	// 3) Prefer dominant source extension among code files (e.g. .py in a
 	// generated Python app), capped to a small set.
-	codeExts := map[string]bool{
-		".py": true, ".go": true, ".js": true, ".ts": true, ".tsx": true,
-		".java": true, ".rs": true, ".rb": true, ".php": true, ".cs": true,
-		".cpp": true, ".c": true, ".h": true, ".kt": true, ".scala": true,
-		".swift": true,
+	codeExts := make(map[string]bool)
+	for _, e := range types.LangRegistry {
+		if e.IsCode {
+			codeExts[e.Ext] = true
+		}
 	}
 	extFreq := map[string]int{}
 	for _, f := range all {
@@ -737,6 +765,121 @@ func (s *Server) processQuestion(ctx context.Context, question string, files []*
 	}
 
 	return resp, resp.Message.Content, time.Since(start), nil
+}
+
+// processQuestionParallel is the wide-project variant of processQuestion.
+// Instead of concatenating all files into one prompt (which overflows the
+// context window for large projects), it issues one LLM call per file using
+// up to cfg.Agent.ConcurrentFiles goroutines simultaneously — the same
+// semaphore pattern used by the agent's per-file edit loop.
+// Results are assembled in the original file order and returned as a single
+// combined answer with per-file section headers.
+func (s *Server) processQuestionParallel(ctx context.Context, question string, files []*types.FileInfo) (string, time.Duration, error) {
+	s.mu.RLock()
+	concurrency := s.cfg.Agent.ConcurrentFiles
+	model := s.cfg.LLM.Model
+	temp := s.cfg.LLM.Temperature
+	s.mu.RUnlock()
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	// Collect readable files; keep their original index for ordered output.
+	readable := make([]*types.FileInfo, 0, len(files))
+	for _, f := range files {
+		if f != nil && f.IsReadable && len(f.Content) > 0 {
+			readable = append(readable, f)
+		}
+	}
+	if len(readable) == 0 {
+		return "", 0, nil
+	}
+
+	// Build a full file-path list for the system prompt so the LLM knows the
+	// project shape even though each call only receives one file's content.
+	var filePaths []string
+	for _, f := range files {
+		if f != nil {
+			filePaths = append(filePaths, f.RelPath)
+		}
+	}
+	systemPrompt := promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+
+	type result struct {
+		idx    int
+		answer string
+		err    error
+	}
+
+	resCh := make(chan result, len(readable))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i, f := range readable {
+		wg.Add(1)
+		go func(idx int, f *types.FileInfo) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				resCh <- result{idx: idx, err: ctx.Err()}
+				return
+			}
+			userPrompt := fmt.Sprintf("Task/Question: %s\n\nFile: %s\n\n%s", question, f.RelPath, f.Content)
+			chatReq := &llm.ChatRequest{
+				Model: model,
+				Messages: []llm.Message{
+					{Role: "system", Content: systemPrompt},
+					{Role: "user", Content: userPrompt},
+				},
+				Temperature: temp,
+			}
+			resp, err := s.llmClient.Chat(ctx, chatReq)
+			if err != nil {
+				resCh <- result{idx: idx, err: err}
+				return
+			}
+			resCh <- result{idx: idx, answer: resp.Message.Content}
+		}(i, f)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	type indexed struct {
+		idx    int
+		file   string
+		answer string
+	}
+	var answers []indexed
+	var firstErr error
+	for r := range resCh {
+		if r.err != nil {
+			if errors.Is(r.err, context.Canceled) {
+				return "", 0, r.err
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
+		}
+		answers = append(answers, indexed{r.idx, readable[r.idx].RelPath, r.answer})
+	}
+	if firstErr != nil && len(answers) == 0 {
+		return "", 0, firstErr
+	}
+
+	sort.Slice(answers, func(i, j int) bool { return answers[i].idx < answers[j].idx })
+
+	var sb strings.Builder
+	for _, a := range answers {
+		fmt.Fprintf(&sb, "### %s\n\n%s\n\n", a.file, a.answer)
+	}
+	return sb.String(), time.Since(start), nil
 }
 
 func (s *Server) saveSession(question, answer string, resp *llm.ChatResponse, duration time.Duration) {
@@ -968,7 +1111,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: task, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: task, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Commands (clear, help, stats, …) should work regardless of which button
@@ -981,7 +1124,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(AgentRunResponse{Success: true, Message: &msg})
@@ -1047,7 +1190,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: agentPromptEvalCount}
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1099,7 +1242,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: task, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: task, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Handle built-in commands (clear, help, …) before touching the LLM.
@@ -1110,7 +1253,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		sseWrite(w, flusher, map[string]any{
 			"type":    "done",
@@ -1200,7 +1343,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(streamAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: streamAgentPromptEvalCount}
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	sseWrite(w, flusher, map[string]any{
@@ -1272,7 +1415,7 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 			anyWritten = true
 			results = append(results, commitResult{File: f.Path, Success: true})
 			s.mu.Lock()
-			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.Path, Task: "(confirmed via Apply)"})
+			s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: f.Path, Task: "(confirmed via Apply)"})
 			s.mu.Unlock()
 			continue
 		}
@@ -1305,7 +1448,7 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 		if existedBefore {
 			op = "modified"
 		}
-		s.agentLog = append(s.agentLog, AgentLogEntry{Operation: op, File: f.Path, Task: "(confirmed via Apply)"})
+		s.appendAgentLogLocked(AgentLogEntry{Operation: op, File: f.Path, Task: "(confirmed via Apply)"})
 		s.mu.Unlock()
 	}
 
@@ -1421,7 +1564,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	// Store the user message so it shows up in the chat UI immediately.
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: text, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Handle built-in commands (clear, stats, …) regardless of mode.
@@ -1433,7 +1576,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		}
 		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
@@ -1499,7 +1642,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		}
 		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(extAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extAgentPromptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1510,24 +1653,43 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	default: // "chat"
 		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
-		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+		s.mu.RLock()
+		extSendConcurrency := s.cfg.Agent.ConcurrentFiles
+		s.mu.RUnlock()
+		var answer string
+		var chatDuration time.Duration
+		var promptEvalCount int
+		if len(activeFiles) > 1 && extSendConcurrency > 1 {
+			var parallelErr error
+			answer, chatDuration, parallelErr = s.processQuestionParallel(taskCtx, text, activeFiles)
+			if parallelErr != nil {
+				if errors.Is(parallelErr, context.Canceled) {
+					json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": parallelErr.Error()})
 				return
 			}
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
-			return
-		}
-
-		var promptEvalCount int
-		if resp != nil {
-			promptEvalCount = resp.PromptEvalCount
+		} else {
+			resp, singleAnswer, singleDur, singleErr := s.processQuestion(taskCtx, text, activeFiles)
+			if singleErr != nil {
+				if errors.Is(singleErr, context.Canceled) {
+					json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": singleErr.Error()})
+				return
+			}
+			answer, chatDuration = singleAnswer, singleDur
+			if resp != nil {
+				promptEvalCount = resp.PromptEvalCount
+			}
 		}
 		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
@@ -1605,7 +1767,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: text, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Handle built-in commands (clear, stats, …) before touching the LLM.
@@ -1616,7 +1778,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 		}
 		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
 		return
@@ -1696,7 +1858,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 		}
 		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extStreamAgentPromptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		sseMu.Lock()
@@ -1710,22 +1872,39 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 
 	default: // "chat"
 		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
-		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
-		if err != nil {
-			if errors.Is(err, taskCtx.Err()) {
-				return // stopped
-			}
-			sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
-			return
-		}
-
+		s.mu.RLock()
+		extStreamChatConcurrency := s.cfg.Agent.ConcurrentFiles
+		s.mu.RUnlock()
+		var answer string
+		var chatDuration time.Duration
 		var promptEvalCount int
-		if resp != nil {
-			promptEvalCount = resp.PromptEvalCount
+		if len(activeFiles) > 1 && extStreamChatConcurrency > 1 {
+			var parallelErr error
+			answer, chatDuration, parallelErr = s.processQuestionParallel(taskCtx, text, activeFiles)
+			if parallelErr != nil {
+				if errors.Is(parallelErr, taskCtx.Err()) {
+					return // stopped
+				}
+				sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": parallelErr.Error()})
+				return
+			}
+		} else {
+			resp, singleAnswer, singleDur, singleErr := s.processQuestion(taskCtx, text, activeFiles)
+			if singleErr != nil {
+				if errors.Is(singleErr, taskCtx.Err()) {
+					return // stopped
+				}
+				sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": singleErr.Error()})
+				return
+			}
+			answer, chatDuration = singleAnswer, singleDur
+			if resp != nil {
+				promptEvalCount = resp.PromptEvalCount
+			}
 		}
 		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
@@ -1798,35 +1977,14 @@ func agentSanitizeFilename(name string) string {
 // agentImpliedExtension returns the file extension (including dot) that a task
 // implies creating, e.g. ".md" for "prepare md file". Returns "" when the task
 // does not clearly request a new specific file type.
+// Keyword matching is driven by types.LangRegistry — add new languages there.
 func agentImpliedExtension(task string) string {
 	lower := strings.ToLower(task)
-	pairs := [][2]string{
-		{".md", ".md"}, {"md file", ".md"}, {"markdown", ".md"}, {"readme", ".md"},
-		{".yaml", ".yaml"}, {"yaml file", ".yaml"}, {".yml", ".yml"}, {"yml file", ".yml"},
-		{".json", ".json"}, {"json file", ".json"},
-		{".toml", ".toml"}, {"toml file", ".toml"},
-		{".txt", ".txt"}, {"txt file", ".txt"}, {"text file", ".txt"},
-		{".sh", ".sh"}, {"shell script", ".sh"}, {"bash script", ".sh"},
-		{".html", ".html"}, {"html file", ".html"},
-		{".css", ".css"}, {"css file", ".css"},
-		{".env", ".env"}, {"env file", ".env"},
-		{".dockerfile", ""}, {"dockerfile", ""},
-		// TypeScript / JavaScript families
-		{"typescript", ".ts"}, {".ts ", ".ts"}, {".tsx", ".tsx"},
-		{"react", ".tsx"}, {"vue", ".vue"}, {"angular", ".ts"},
-		{"javascript", ".js"}, {".js ", ".js"}, {"node", ".js"},
-		// Python
-		{"python", ".py"}, {".py ", ".py"},
-		// Go
-		{"golang", ".go"}, {" go app", ".go"}, {" go server", ".go"},
-		// Rust / Java / other common languages
-		{"rust", ".rs"}, {"java ", ".java"}, {"kotlin", ".kt"},
-		{"c# ", ".cs"}, {"csharp", ".cs"}, {".net", ".cs"},
-		{"ruby", ".rb"}, {"php", ".php"}, {"swift", ".swift"},
-	}
-	for _, p := range pairs {
-		if strings.Contains(lower, p[0]) {
-			return p[1]
+	for _, e := range types.LangRegistry {
+		for _, kw := range e.ImpliedKW {
+			if strings.Contains(lower, kw) {
+				return e.Ext
+			}
 		}
 	}
 	return ""
@@ -2058,6 +2216,24 @@ func (s *Server) agentChangelogPrompt() string {
 	return b.String()
 }
 
+// appendMessageLocked appends msg to s.messages and trims the slice to at most
+// maxMessages entries (oldest first). Caller must hold s.mu write lock.
+func (s *Server) appendMessageLocked(msg Message) {
+	s.messages = append(s.messages, msg)
+	if len(s.messages) > maxMessages {
+		s.messages = s.messages[len(s.messages)-maxMessages:]
+	}
+}
+
+// appendAgentLogLocked appends entry to s.agentLog and trims to at most
+// maxAgentLogEntries (oldest first). Caller must hold s.mu write lock.
+func (s *Server) appendAgentLogLocked(entry AgentLogEntry) {
+	s.agentLog = append(s.agentLog, entry)
+	if len(s.agentLog) > maxAgentLogEntries {
+		s.agentLog = s.agentLog[len(s.agentLog)-maxAgentLogEntries:]
+	}
+}
+
 // agentIsDeleteTask returns true when the task is clearly asking to delete or
 // remove one or more files entirely (not to delete code inside a file).
 func agentIsDeleteTask(task string) bool {
@@ -2254,7 +2430,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				}
 				progress(fmt.Sprintf("🗑️  %s — deleted", f.RelPath))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
 				s.mu.Unlock()
 			} else {
 				progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
@@ -2537,7 +2713,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					}
 					progress(fmt.Sprintf("🗑️ %s — deleted", f.RelPath))
 					s.mu.Lock()
-					s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
+					s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
 					s.mu.Unlock()
 				} else {
 					progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
@@ -2580,7 +2756,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				s.markWrittenFile(f.RelPath)
 				progress(fmt.Sprintf("✅ %s — modified", f.RelPath))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: f.RelPath, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: f.RelPath, Task: task})
 				s.mu.Unlock()
 			} else {
 				progress(fmt.Sprintf("📋 %s — proposed (awaiting confirmation)", f.RelPath))
@@ -2775,7 +2951,7 @@ func (s *Server) runAgentMergeSingleFile(ctx context.Context, task string, targe
 			if oldDestContent == "" {
 				op = "created"
 			}
-			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: op, File: destination, Task: task})
+			s.appendAgentLogLocked(AgentLogEntry{Operation: op, File: destination, Task: task})
 			s.mu.Unlock()
 		}
 
@@ -2785,7 +2961,7 @@ func (s *Server) runAgentMergeSingleFile(ctx context.Context, task string, targe
 				return "", nil, fmt.Errorf("failed to delete merged source %s: %w", rel, err)
 			}
 			s.mu.Lock()
-			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: rel, Task: task})
+			s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: rel, Task: task})
 			s.mu.Unlock()
 		}
 	}
@@ -3187,7 +3363,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				s.markWrittenFile(relSlash)
 				progress(fmt.Sprintf("✨ %s — created", relSlash))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "created", File: relSlash, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "created", File: relSlash, Task: task})
 				s.mu.Unlock()
 				summaryLines = append(summaryLines, fmt.Sprintf("• ✨ %s — created", relSlash))
 			} else {
@@ -3284,7 +3460,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				s.markWrittenFile(relSlash)
 				progress(fmt.Sprintf("✨ %s — created", relSlash))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "created", File: relSlash, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "created", File: relSlash, Task: task})
 				s.mu.Unlock()
 				summaryLines = append(summaryLines, fmt.Sprintf("• ✨ %s — created", relSlash))
 			} else {
@@ -4047,10 +4223,125 @@ func isCommandInPackageJSON(pkgJSONPath, cmd string) bool {
 	return false
 }
 
-// buildDependencyInstallPlan inspects the project at workDir and the error
-// output to decide which packages to install and via which package manager.
-// Returns nil if no actionable plan can be built.
-// Adding support for a new language/toolchain only requires extending this function.
+// depRepairHandler is a function that tries to build an install plan for a
+// specific toolchain. It receives the project root, a pre-built hasFile
+// helper, and the raw error output. It returns a non-nil plan when it can
+// handle the error, or nil to let the next handler try.
+//
+// To add support for a new toolchain (e.g. cargo, go get, maven), register
+// a new function in depRepairHandlers below — no other code needs to change.
+type depRepairHandler func(workDir string, hasFile func(string) bool, errorOutput string) *dependencyInstallPlan
+
+// depRepairHandlers is the ordered registry of per-toolchain repair handlers.
+// Handlers are tried in order; the first non-nil result wins.
+var depRepairHandlers = []depRepairHandler{
+	depRepairNpm,
+	depRepairPip,
+}
+
+// depRepairNpm handles npm / Node.js / TypeScript missing-dependency errors.
+func depRepairNpm(workDir string, hasFile func(string) bool, errorOutput string) *dependencyInstallPlan {
+	if !hasFile("package.json") {
+		return nil
+	}
+	pkgJSONPath := filepath.Join(workDir, "package.json")
+
+	if m := commandNotFoundRe.FindStringSubmatch(errorOutput); m != nil {
+		missingCmd := m[1]
+		if missingCmd == "" {
+			missingCmd = m[2]
+		}
+		if isCommandInPackageJSON(pkgJSONPath, missingCmd) {
+			if isCommandDeclaredInPackageJSON(pkgJSONPath, missingCmd) {
+				// Tool IS declared as a dep — node_modules just needs restoring.
+				return &dependencyInstallPlan{
+					cmd:      "npm",
+					args:     []string{"install"},
+					describe: "npm install (restores node_modules for missing tool: " + missingCmd + ")",
+				}
+			}
+			// Tool is used in scripts but NOT declared — install it explicitly.
+			pkgsToInstall := []string{missingCmd}
+			if known, ok := npmToolPackages[missingCmd]; ok {
+				pkgsToInstall = known
+			}
+			args := append([]string{"install", "--save-dev"}, pkgsToInstall...)
+			return &dependencyInstallPlan{
+				cmd:      "npm",
+				args:     args,
+				describe: "npm install --save-dev " + strings.Join(pkgsToInstall, " ") + " (missing tool not declared in package.json)",
+			}
+		}
+	}
+
+	seen := map[string]bool{}
+	var pkgs []string
+
+	// node: built-ins and globals (__dirname, __filename) all resolved by @types/node.
+	nodeBuiltinRe := regexp.MustCompile(`Cannot find module 'node:[^']*'`)
+	if nodeBuiltinRe.MatchString(errorOutput) ||
+		strings.Contains(errorOutput, "Cannot find name '__dirname'") ||
+		strings.Contains(errorOutput, "Cannot find name '__filename'") {
+		if !seen["@types/node"] {
+			pkgs = append(pkgs, "@types/node")
+			seen["@types/node"] = true
+		}
+	}
+
+	// Other missing modules: "Cannot find module 'X'" → try @types/X.
+	// Skip relative paths (start with '.') — those are source-code bugs.
+	otherRe := regexp.MustCompile(`Cannot find module '([^'.][^']*)'`)
+	for _, m := range otherRe.FindAllStringSubmatch(errorOutput, -1) {
+		name := m[1]
+		if strings.HasPrefix(name, "node:") {
+			continue // already covered above
+		}
+		typePkg := "@types/" + strings.TrimPrefix(name, "@")
+		if !seen[typePkg] {
+			pkgs = append(pkgs, typePkg)
+			seen[typePkg] = true
+		}
+	}
+
+	if len(pkgs) > 0 {
+		args := append([]string{"install", "--save-dev"}, pkgs...)
+		return &dependencyInstallPlan{
+			cmd:      "npm",
+			args:     args,
+			describe: "npm install --save-dev " + strings.Join(pkgs, " "),
+		}
+	}
+	return nil
+}
+
+// depRepairPip handles Python missing-module errors.
+func depRepairPip(_ string, hasFile func(string) bool, errorOutput string) *dependencyInstallPlan {
+	if !hasFile("requirements.txt") && !hasFile("pyproject.toml") && !hasFile("setup.py") && !hasFile("setup.cfg") {
+		return nil
+	}
+	moduleRe := regexp.MustCompile(`(?:ModuleNotFoundError|ImportError): No module named '([^']+)'`)
+	seen := map[string]bool{}
+	var pkgs []string
+	for _, m := range moduleRe.FindAllStringSubmatch(errorOutput, -1) {
+		name := strings.SplitN(m[1], ".", 2)[0] // top-level package only
+		if !seen[name] {
+			pkgs = append(pkgs, name)
+			seen[name] = true
+		}
+	}
+	if len(pkgs) == 0 {
+		return nil
+	}
+	args := append([]string{"install"}, pkgs...)
+	return &dependencyInstallPlan{
+		cmd:      "pip",
+		args:     args,
+		describe: "pip install " + strings.Join(pkgs, " "),
+	}
+}
+
+// buildDependencyInstallPlan iterates depRepairHandlers and returns the first
+// non-nil plan. To support a new toolchain, add a handler to depRepairHandlers.
 func buildDependencyInstallPlan(workDir, errorOutput string) *dependencyInstallPlan {
 	entries, err := os.ReadDir(workDir)
 	if err != nil {
@@ -4064,99 +4355,11 @@ func buildDependencyInstallPlan(workDir, errorOutput string) *dependencyInstallP
 		}
 		return false
 	}
-
-	// ── npm (TypeScript / JavaScript) ────────────────────────────────────────
-	if hasFile("package.json") {
-		pkgJSONPath := filepath.Join(workDir, "package.json")
-		if m := commandNotFoundRe.FindStringSubmatch(errorOutput); m != nil {
-			missingCmd := m[1]
-			if missingCmd == "" {
-				missingCmd = m[2]
-			}
-			if isCommandInPackageJSON(pkgJSONPath, missingCmd) {
-				if isCommandDeclaredInPackageJSON(pkgJSONPath, missingCmd) {
-					// Tool IS declared as a dep — node_modules just needs restoring.
-					return &dependencyInstallPlan{
-						cmd:      "npm",
-						args:     []string{"install"},
-						describe: "npm install (restores node_modules for missing tool: " + missingCmd + ")",
-					}
-				}
-				// Tool is used in scripts but NOT declared — install it explicitly.
-				pkgsToInstall := []string{missingCmd}
-				if known, ok := npmToolPackages[missingCmd]; ok {
-					pkgsToInstall = known
-				}
-				args := append([]string{"install", "--save-dev"}, pkgsToInstall...)
-				return &dependencyInstallPlan{
-					cmd:      "npm",
-					args:     args,
-					describe: "npm install --save-dev " + strings.Join(pkgsToInstall, " ") + " (missing tool not declared in package.json)",
-				}
-			}
-		}
-
-		seen := map[string]bool{}
-		var pkgs []string
-
-		// node: built-ins and globals (__dirname, __filename) all resolved by @types/node.
-		nodeBuiltinRe := regexp.MustCompile(`Cannot find module 'node:[^']*'`)
-		if nodeBuiltinRe.MatchString(errorOutput) ||
-			strings.Contains(errorOutput, "Cannot find name '__dirname'") ||
-			strings.Contains(errorOutput, "Cannot find name '__filename'") {
-			if !seen["@types/node"] {
-				pkgs = append(pkgs, "@types/node")
-				seen["@types/node"] = true
-			}
-		}
-
-		// Other missing modules: "Cannot find module 'X'" → try @types/X.
-		// Skip relative paths (start with '.') — those are source-code bugs.
-		otherRe := regexp.MustCompile(`Cannot find module '([^'.][^']*)'`)
-		for _, m := range otherRe.FindAllStringSubmatch(errorOutput, -1) {
-			name := m[1]
-			if strings.HasPrefix(name, "node:") {
-				continue // already covered above
-			}
-			typePkg := "@types/" + strings.TrimPrefix(name, "@")
-			if !seen[typePkg] {
-				pkgs = append(pkgs, typePkg)
-				seen[typePkg] = true
-			}
-		}
-
-		if len(pkgs) > 0 {
-			args := append([]string{"install", "--save-dev"}, pkgs...)
-			return &dependencyInstallPlan{
-				cmd:      "npm",
-				args:     args,
-				describe: "npm install --save-dev " + strings.Join(pkgs, " "),
-			}
+	for _, h := range depRepairHandlers {
+		if plan := h(workDir, hasFile, errorOutput); plan != nil {
+			return plan
 		}
 	}
-
-	// ── pip (Python) ─────────────────────────────────────────────────────────
-	if hasFile("requirements.txt") || hasFile("pyproject.toml") || hasFile("setup.py") || hasFile("setup.cfg") {
-		moduleRe := regexp.MustCompile(`(?:ModuleNotFoundError|ImportError): No module named '([^']+)'`)
-		seen := map[string]bool{}
-		var pkgs []string
-		for _, m := range moduleRe.FindAllStringSubmatch(errorOutput, -1) {
-			name := strings.SplitN(m[1], ".", 2)[0] // top-level package only
-			if !seen[name] {
-				pkgs = append(pkgs, name)
-				seen[name] = true
-			}
-		}
-		if len(pkgs) > 0 {
-			args := append([]string{"install"}, pkgs...)
-			return &dependencyInstallPlan{
-				cmd:      "pip",
-				args:     args,
-				describe: "pip install " + strings.Join(pkgs, " "),
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -4837,7 +5040,7 @@ func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 
 	// Prevent path traversal: the resolved path must stay inside the directory.
 	rel, err := filepath.Rel(cleanDir, absPath)
-	if err != nil || len(rel) >= 2 && rel[:2] == ".." {
+	if err != nil || strings.HasPrefix(rel, "..") {
 		http.Error(w, "Access denied", http.StatusForbidden)
 		return
 	}
@@ -4880,7 +5083,7 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 
 	// Prevent path traversal.
 	rel, err := filepath.Rel(cleanDir, absPath)
-	if err != nil || len(rel) >= 2 && rel[:2] == ".." {
+	if err != nil || strings.HasPrefix(rel, "..") {
 		http.Error(w, "Access denied: path outside working directory", http.StatusForbidden)
 		return
 	}
@@ -4904,7 +5107,7 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 		Content:   fmt.Sprintf("✅ Applied changes to **%s**", req.Path),
 		Timestamp: time.Now(),
 	}
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -4915,29 +5118,63 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSettings returns or updates runtime-configurable settings.
-// GET  /api/settings  → {"auto_apply": bool}
-// POST /api/settings  ← {"auto_apply": bool}
+//
+// GET  /api/settings
+//
+//	→ {"auto_apply":bool,"model":string,"temperature":float64,"concurrent_files":int}
+//
+// POST /api/settings
+//
+//	← {"auto_apply":bool,"model":string,"temperature":float64,"concurrent_files":int}
+//	   All fields are optional; omitted fields are left unchanged.
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
 	case http.MethodGet:
 		s.mu.RLock()
-		autoApply := s.cfg.Agent.AutoApply
+		out := map[string]interface{}{
+			"auto_apply":       s.cfg.Agent.AutoApply,
+			"model":            s.model,
+			"temperature":      s.cfg.LLM.Temperature,
+			"concurrent_files": s.cfg.Agent.ConcurrentFiles,
+		}
 		s.mu.RUnlock()
-		json.NewEncoder(w).Encode(map[string]interface{}{"auto_apply": autoApply})
+		json.NewEncoder(w).Encode(out)
 
 	case http.MethodPost:
 		var req struct {
-			AutoApply bool `json:"auto_apply"`
+			AutoApply       *bool    `json:"auto_apply"`
+			Model           *string  `json:"model"`
+			Temperature     *float64 `json:"temperature"`
+			ConcurrentFiles *int     `json:"concurrent_files"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			sendError(w, "Invalid request body")
 			return
 		}
 		s.mu.Lock()
-		s.cfg.Agent.AutoApply = req.AutoApply
+		if req.AutoApply != nil {
+			s.cfg.Agent.AutoApply = *req.AutoApply
+		}
+		if req.Model != nil && strings.TrimSpace(*req.Model) != "" {
+			s.model = strings.TrimSpace(*req.Model)
+			s.cfg.LLM.Model = s.model
+			s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, s.model, s.cfg.LLM.Timeout)
+		}
+		if req.Temperature != nil {
+			s.cfg.LLM.Temperature = *req.Temperature
+		}
+		if req.ConcurrentFiles != nil && *req.ConcurrentFiles > 0 {
+			s.cfg.Agent.ConcurrentFiles = *req.ConcurrentFiles
+		}
+		out := map[string]interface{}{
+			"auto_apply":       s.cfg.Agent.AutoApply,
+			"model":            s.model,
+			"temperature":      s.cfg.LLM.Temperature,
+			"concurrent_files": s.cfg.Agent.ConcurrentFiles,
+		}
 		s.mu.Unlock()
-		json.NewEncoder(w).Encode(map[string]interface{}{"auto_apply": req.AutoApply})
+		json.NewEncoder(w).Encode(out)
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -4986,7 +5223,7 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 		userLabel = "🔧 Run & Fix: " + task
 	}
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: userLabel, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: userLabel, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	var sseMu sync.Mutex
@@ -5036,7 +5273,7 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(fixStart).Milliseconds()}
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
@@ -5119,7 +5356,7 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 			if repaired {
 				s.markWrittenFile(manifestFile)
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: manifestFile, Task: "(auto-fix deterministic)"})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: manifestFile, Task: "(auto-fix deterministic)"})
 				s.mu.Unlock()
 				if scanned, scanErr := s.performRescan(); scanErr == nil {
 					s.mu.Lock()
@@ -5141,7 +5378,7 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 				for _, rel := range touchedFiles {
 					s.markWrittenFile(rel)
 					s.mu.Lock()
-					s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: rel, Task: "(auto-fix deterministic)"})
+					s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: rel, Task: "(auto-fix deterministic)"})
 					s.mu.Unlock()
 				}
 				if scanned, scanErr := s.performRescan(); scanErr == nil {
@@ -5208,7 +5445,7 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 			appliedNames = append(appliedNames, p.name)
 			s.markWrittenFile(p.name)
 			s.mu.Lock()
-			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: p.name, Task: "(auto-fix)"})
+			s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: p.name, Task: "(auto-fix)"})
 			s.mu.Unlock()
 		}
 		if len(appliedNames) == 0 {

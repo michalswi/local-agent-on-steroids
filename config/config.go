@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/michalswi/local-agent-on-steroids/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -96,55 +97,32 @@ func DefaultConfig() *Config {
 				"build/**",
 				"vendor/**",
 			},
-			AllowPatterns: []string{
-				"*.go",
-				"*.mod",
-				"*.sum",
-				"*.js",
-				"*.ts",
-				"*.py",
-				"*.java",
-				"*.c",
-				"*.cpp",
-				"*.h",
-				"*.md",
-				"*.yaml",
-				"*.yml",
-				"*.json",
-				"*.toml",
-				"*.txt",
-				"*.tf",
-				"*.tfvars",
-				"*.rs",
-				"*.rb",
-				"*.php",
-				"*.sh",
-				"*.swift",
-				"*.kt",
-				"*.scala",
-				"*.log",
-				"*.pdf",
-				"*.pcap",
-				"*.env",
-				"*.env.*",
-				"*.key",
-				"*.pem",
-				"*.crt",
-				"Dockerfile",
-				"Makefile",
-				"*.dockerfile",
-				"*.conf",
-				"*.service",
+			// Build AllowPatterns from the central language registry (code/config
+			// extensions) plus non-language patterns that are always included.
+			AllowPatterns: func() []string {
+				var out []string
+				for _, e := range types.LangRegistry {
+					if e.AllowGlob != "" {
+						out = append(out, e.AllowGlob)
+					}
+				}
+				// Go module files
+				out = append(out, "*.mod", "*.sum")
+				// Infrastructure
+				out = append(out, "*.tf", "*.tfvars")
+				// Data / analysis targets
+				out = append(out, "*.log", "*.pdf", "*.pcap")
+				// Secrets / credentials (included for scanning; detection handled separately)
+				out = append(out, "*.env.*", "*.key", "*.pem", "*.crt")
+				// Container / build system
+				out = append(out, "Dockerfile", "Makefile", "*.dockerfile", "*.conf", "*.service")
 				// Common dotfiles (no extension — need explicit names)
-				".gitignore",
-				".dockerignore",
-				".editorconfig",
-				".eslintrc",
-				".prettierrc",
-				".babelrc",
-				".nvmrc",
-				".node-version",
-			},
+				out = append(out,
+					".gitignore", ".dockerignore", ".editorconfig",
+					".eslintrc", ".prettierrc", ".babelrc", ".nvmrc", ".node-version",
+				)
+				return out
+			}(),
 		},
 		Security: SecurityConfig{
 			DetectSecrets:  false, // Disabled by default
