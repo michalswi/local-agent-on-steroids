@@ -2292,6 +2292,14 @@ func agentDocValidationIssues(content string) []string {
 	var issues []string
 	lower := strings.ToLower(content)
 
+	// Catch obviously garbage/minimal output before checking structure.
+	if len(trimmed) < 80 {
+		issues = append(issues, "content is too short to be complete documentation")
+	}
+	if !strings.Contains(content, "#") {
+		issues = append(issues, "missing markdown headings")
+	}
+
 	if strings.Count(content, "```")%2 != 0 {
 		issues = append(issues, "contains an unclosed code fence")
 	}
@@ -2335,56 +2343,107 @@ func agentDocValidationIssues(content string) []string {
 	return issues
 }
 
+// agentIsGarbageDocContent returns true when the doc content is so minimal or
+// malformed that it should be discarded entirely rather than proposed to the user.
+// Both conditions must be true simultaneously — a short-but-structured README
+// (e.g. a stub with headings) is allowed through with warnings, but a tiny
+// unstructured blob like "cd dupa" is rejected.
+func agentIsGarbageDocContent(issues []string) bool {
+	for _, iss := range issues {
+		if iss == "empty documentation output" {
+			return true
+		}
+	}
+	hasShort := false
+	hasMissingHeadings := false
+	for _, iss := range issues {
+		if iss == "content is too short to be complete documentation" {
+			hasShort = true
+		}
+		if iss == "missing markdown headings" {
+			hasMissingHeadings = true
+		}
+	}
+	return hasShort && hasMissingHeadings
+}
+
 func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, oldContent, draft string) (final string, issues []string, err error) {
 	issues = agentDocValidationIssues(draft)
 	if len(issues) == 0 {
 		return draft, nil, nil
 	}
 
-	var issueList strings.Builder
-	for _, it := range issues {
-		fmt.Fprintf(&issueList, "- %s\n", it)
-	}
-
 	systemPrompt := "You are a technical documentation writer. " +
 		"Return ONLY the complete, corrected content of the target documentation file. " +
 		"Do not include markdown fences or commentary."
 
-	userPrompt := fmt.Sprintf(
-		"Task: %s\n\nTarget file: %s\n\nCurrent file content (may be empty):\n%s\n\nDraft that needs correction:\n%s\n\nProblems to fix:\n%s\nUse the documentation requirements below and return a full replacement file.\n\n%s",
-		task,
-		filePath,
-		oldContent,
-		draft,
-		issueList.String(),
-		agentDocumentationInstructions()+"\n\n"+s.agentProjectMetaBlock(),
-	)
+	doRefinementPass := func(prevDraft string, prevIssues []string, passNum int) (string, []string, error) {
+		var issueList strings.Builder
+		for _, it := range prevIssues {
+			fmt.Fprintf(&issueList, "- %s\n", it)
+		}
 
-	chatReq := &llm.ChatRequest{
-		Model: s.cfg.LLM.Model,
-		Messages: []llm.Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		Temperature: agentTemperature(s.cfg.LLM.Temperature),
+		// If the draft is clearly garbage (too short or no headings), tell the model
+		// to ignore it and write from scratch rather than trying to patch it.
+		draftNote := fmt.Sprintf("Draft that needs correction (pass %d):\n%s", passNum, prevDraft)
+		for _, iss := range prevIssues {
+			if iss == "content is too short to be complete documentation" || iss == "missing markdown headings" {
+				draftNote = fmt.Sprintf("The previous attempt produced unusable output (pass %d). Discard it and write the file from scratch.", passNum)
+				break
+			}
+		}
+
+		userPrompt := fmt.Sprintf(
+			"Task: %s\n\nTarget file: %s\n\nCurrent file content (may be empty):\n%s\n\n%s\n\nProblems to fix:\n%s\nUse the documentation requirements below and return a full replacement file.\n\n%s",
+			task,
+			filePath,
+			oldContent,
+			draftNote,
+			issueList.String(),
+			agentDocumentationInstructions()+"\n\n"+s.agentProjectMetaBlock(),
+		)
+
+		chatReq := &llm.ChatRequest{
+			Model: s.cfg.LLM.Model,
+			Messages: []llm.Message{
+				{Role: "system", Content: systemPrompt},
+				{Role: "user", Content: userPrompt},
+			},
+			Temperature: agentTemperature(s.cfg.LLM.Temperature),
+		}
+
+		resp, callErr := s.llmClient.Chat(ctx, chatReq)
+		if callErr != nil {
+			return prevDraft, prevIssues, callErr
+		}
+
+		candidate := agentStripFences(strings.TrimSpace(resp.Message.Content))
+		if strings.TrimSpace(candidate) == "" {
+			return prevDraft, prevIssues, nil
+		}
+		return candidate, agentDocValidationIssues(candidate), nil
 	}
 
-	resp, callErr := s.llmClient.Chat(ctx, chatReq)
+	// Pass 1
+	candidate, remaining, callErr := doRefinementPass(draft, issues, 1)
 	if callErr != nil {
 		return draft, issues, callErr
 	}
-
-	candidate := agentStripFences(strings.TrimSpace(resp.Message.Content))
-	if strings.TrimSpace(candidate) == "" {
-		return draft, issues, nil
-	}
-
-	remaining := agentDocValidationIssues(candidate)
 	if len(remaining) == 0 {
 		return candidate, nil, nil
 	}
 
-	return candidate, remaining, nil
+	// Pass 2 — only if pass 1 still has issues.
+	candidate2, remaining2, callErr2 := doRefinementPass(candidate, remaining, 2)
+	if callErr2 != nil {
+		// Use pass-1 result on failure.
+		return candidate, remaining, nil
+	}
+	if len(remaining2) == 0 {
+		return candidate2, nil, nil
+	}
+
+	return candidate2, remaining2, nil
 }
 
 // filterPlannedFilesForDocsIntent keeps only documentation-like planned files,
@@ -2962,7 +3021,9 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", f.RelPath, refineErr))
 				} else {
 					newContent = refined
-					if len(issues) > 0 {
+					if agentIsGarbageDocContent(issues) {
+						progress(fmt.Sprintf("⚠️ %s — documentation may be incomplete; try a larger/better model", f.RelPath))
+					} else if len(issues) > 0 {
 						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", f.RelPath, strings.Join(issues, "; ")))
 					}
 				}
@@ -3572,7 +3633,9 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
 				} else {
 					fileContent = refined
-					if len(issues) > 0 {
+					if agentIsGarbageDocContent(issues) {
+						progress(fmt.Sprintf("⚠️ %s — documentation may be incomplete; try a larger/better model", relSlash))
+					} else if len(issues) > 0 {
 						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", relSlash, strings.Join(issues, "; ")))
 					}
 				}
