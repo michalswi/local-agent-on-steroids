@@ -23,13 +23,13 @@ If you are looking for Ollama based **AI chat** check this app [scoutai](https:/
 make build
 
 # Verify files (if any) in the directory
-./local-agent-on-steroids --interactive --dir ./myproject --dry-run
+./local-agent-on-steroids --dir ./myproject --dry-run
 
 # Web UI at http://localhost:5050
-./local-agent-on-steroids --interactive --dir ./myproject
+./local-agent-on-steroids --dir ./myproject
 
 # Remote Ollama
-./local-agent-on-steroids --interactive --dir ./myproject --host 192.168.1.100:11434
+./local-agent-on-steroids --dir ./myproject --host 192.168.1.100:11434
 
 # Custom session-log directory (default: ~/Downloads/local-agent-on-steroids)
 ./local-agent-on-steroids --dir ./myproject --homedir /tmp/local-agent-on-steroids
@@ -37,6 +37,9 @@ make build
 # Utility
 ./local-agent-on-steroids --health
 ./local-agent-on-steroids --list-models
+
+# Disable per-project memory for this session
+./local-agent-on-steroids --dir ./myproject --no-memory
 ```
 
 ## \# Ollama Setup
@@ -50,7 +53,7 @@ AGENT_TOKEN_LIMIT=8000 AGENT_CONCURRENT_FILES=5 ./local-agent-on-steroids --dir 
 
 # Defaults (context=4096, parallel=1)
 ollama serve
-./local-agent-on-steroids --dir . --interactive
+./local-agent-on-steroids --dir .
 ```
 
 > **`AGENT_CONCURRENT_FILES`** controls parallel LLM calls when **editing/analyzing existing files** (agent task mode) and when **reviewing/analyzing files via Send** (Smart Send mode — active when `AGENT_CONCURRENT_FILES > 1` and more than one file is in scope).
@@ -73,6 +76,28 @@ ls ~/Downloads/local-agent-on-steroids/
 ls /tmp/local-agent-on-steroids/
 ```
 
+## \# Memory
+
+Each project gets a persistent `memory.md` file stored alongside session logs (use `--homedir` or keep default):
+
+```
+~/Downloads/local-agent-on-steroids/myproject-a1b2c3/memory.md
+```
+
+Memory is automatically prepended to the system prompt on every request (Send, Agent, Run & Fix), giving the LLM context from previous sessions without you having to re-explain the project.
+
+After every successful **⚡ Agent** run, memory is updated automatically with:
+- A structured entry: date, task description, and list of modified/created/deleted files
+- A one-line LLM-generated summary of what was done (appended in the background)
+
+| Chat command | Action |
+|---|---|
+| `mem show` | Print current project memory |
+| `mem clear` | Delete project memory |
+| `mem save <text>` | Append a note to project memory |
+
+Use `--no-memory` to disable memory for a session (auto-save is also disabled). Memory is scoped per `--dir` path — different projects never share memory.
+
 ## \# UI Buttons
 
 | Button | Action |
@@ -93,6 +118,9 @@ ls /tmp/local-agent-on-steroids/
 | `model <name>` | Switch model |
 | `rescan` | Pick up new/changed files |
 | `clear` | Clear chat history |
+| `mem show` | Show project memory |
+| `mem clear` | Clear project memory |
+| `mem save <text>` | Append a note to project memory |
 | `help` | Show all commands |
 
 ## \# System Prompts
@@ -106,7 +134,7 @@ There are three distinct system prompts used internally, each targeting a differ
 | `webui/prompts/agent_create.md` | Agent sub-step when a new file needs to be created from scratch |
 | `webui/prompts/agent_fix.md` | **🔧 Run & Fix** button — language-agnostic fix prompt used in each repair iteration |
 
-All three prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, and session changelog) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
+All four prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, session changelog, and **project memory**) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
 
 ## \# External API
 

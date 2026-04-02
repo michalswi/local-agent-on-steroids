@@ -128,6 +128,7 @@ const htmlTemplate = `<!DOCTYPE html>
         .msg { display: flex; flex-direction: column; max-width: 92%; }
         .msg.user { align-self: flex-end; align-items: flex-end; }
         .msg.assistant { align-self: flex-start; align-items: flex-start; }
+        .msg.info { align-self: flex-start; align-items: flex-start; }
         .msg-meta { font-size: 0.72rem; color: var(--text2); margin-bottom: 0.25rem; }
         .bubble {
             padding: 0.75rem 1rem; border-radius: 10px; line-height: 1.65;
@@ -135,6 +136,7 @@ const htmlTemplate = `<!DOCTYPE html>
         }
         .msg.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
         .msg.assistant .bubble { background: var(--bg2); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
+        .msg.info .bubble { background: var(--bg2); border: 1px solid var(--border); border-bottom-left-radius: 3px; opacity: 0.85; }
         /* Markdown inside bubbles */
         .bubble h1 { font-size: 1.1rem; color: var(--accent); margin: 0.6rem 0 0.3rem; }
         .bubble h2 { font-size: 0.97rem; color: var(--accent); margin: 0.5rem 0 0.25rem; }
@@ -488,6 +490,9 @@ const htmlTemplate = `<!DOCTYPE html>
                 <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">rescan</code></td><td>Rescan the directory for changes</td></tr>
                 <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">stats</code></td><td>Show current statistics</td></tr>
                 <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">files</code></td><td>List all files in scope</td></tr>
+                <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">mem show</code></td><td>Show project memory</td></tr>
+                <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">mem clear</code></td><td>Clear project memory</td></tr>
+                <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">mem save &lt;text&gt;</code></td><td>Append text to project memory</td></tr>
             </table>
             <hr style="border:none;border-top:1px solid var(--border);margin:0.8rem 0">
             <p style="font-size:0.85rem;color:var(--muted);margin:0">💡 <strong>Enter</strong> = ⚡ Agent &nbsp;•&nbsp; <strong>Shift+Enter</strong> = new line &nbsp;•&nbsp; <strong>Send</strong> = chat only</p>
@@ -925,7 +930,7 @@ function makeMsgEl(role, content, ts, durationMs, promptEvalCount) {
     wrap.className = 'msg ' + role;
     var meta   = document.createElement('div');
     meta.className = 'msg-meta';
-    var metaText = (role === 'user' ? 'You' : '🤖 Assistant') + ' · ' + (ts ? new Date(ts).toLocaleTimeString() : '');
+    var metaText = (role === 'user' ? 'You' : role === 'info' ? '[info]' : '🤖 Assistant') + ' · ' + (ts ? new Date(ts).toLocaleTimeString() : '');
     if (role === 'assistant' && durationMs && durationMs > 0) {
         var totalSecs = durationMs / 1000;
         var durStr;
@@ -949,7 +954,24 @@ function makeMsgEl(role, content, ts, durationMs, promptEvalCount) {
     meta.textContent = metaText;
     var bubble = document.createElement('div');
     bubble.className = 'bubble';
-    if (role === 'assistant') {
+    if (role === 'info') {
+        var rows = content.split('\n');
+        var html = '<table style="border-collapse:collapse;font-size:0.9em">';
+        rows.forEach(function(row) {
+            row = row.trim();
+            if (!row) return;
+            var sep = row.indexOf(': ');
+            if (sep !== -1) {
+                var k = row.slice(0, sep);
+                var v = row.slice(sep + 2);
+                html += '<tr><td style="padding:0.1rem 1.2rem 0.1rem 0;color:var(--text2);white-space:nowrap">' + k + '</td><td>' + v + '</td></tr>';
+            } else {
+                html += '<tr><td colspan="2" style="padding:0.4rem 0 0.1rem;color:var(--text2);font-style:italic">' + row + '</td></tr>';
+            }
+        });
+        html += '</table>';
+        bubble.innerHTML = html;
+    } else if (role === 'assistant') {
         bubble.innerHTML = renderMarkdown(content);
     } else {
         bubble.textContent = content;

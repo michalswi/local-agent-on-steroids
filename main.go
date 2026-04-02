@@ -31,6 +31,7 @@ func main() {
 		homedir         = flag.String("homedir", homeDirDefault, "Directory for session logs and saved data")
 		dryRun          = flag.Bool("dry-run", false, "Scan and list files without starting the web UI")
 		noDetectSecrets = flag.Bool("no-detect-secrets", false, "Disable secret/sensitive content detection")
+		noMemory        = flag.Bool("no-memory", false, "Disable per-project persistent memory")
 
 		showVersion = flag.Bool("version", false, "Show version")
 		checkHealth = flag.Bool("health", false, "Check LLM connectivity")
@@ -123,7 +124,7 @@ func main() {
 	}
 
 	// Default: start interactive web UI.
-	startInteractiveMode(absDir, cfg, llmClient)
+	startInteractiveMode(absDir, cfg, llmClient, sessionlog.Dir(), *noMemory)
 }
 
 func scanDirectory(rootPath string, cfg *config.Config) (*types.ScanResult, error) {
@@ -310,7 +311,7 @@ func listAvailableModels(client *llm.OllamaClient) {
 	}
 }
 
-func startInteractiveMode(directory string, cfg *config.Config, llmClient *llm.OllamaClient) {
+func startInteractiveMode(directory string, cfg *config.Config, llmClient *llm.OllamaClient, homeDir string, noMemory bool) {
 	// Pre-check: verify Ollama is reachable before doing any work.
 	fmt.Printf("🔍 Checking Ollama at %s...\n", cfg.LLM.Endpoint)
 	if !llmClient.IsAvailable() {
@@ -342,7 +343,7 @@ func startInteractiveMode(directory string, cfg *config.Config, llmClient *llm.O
 	openBrowser(url)
 
 	// Start web server — this blocks until Ctrl+C or error
-	webServer := webui.NewServer(directory, cfg.LLM.Model, cfg.LLM.Endpoint, scanResult, cfg, llmClient, "")
+	webServer := webui.NewServer(directory, cfg.LLM.Model, cfg.LLM.Endpoint, scanResult, cfg, llmClient, "", homeDir, noMemory)
 	if err := webServer.Start(port); err != nil {
 		fmt.Fprintf(os.Stderr, "Web server error: %v\n", err)
 		os.Exit(1)

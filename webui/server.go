@@ -24,6 +24,7 @@ import (
 	"github.com/michalswi/local-agent-on-steroids/config"
 	"github.com/michalswi/local-agent-on-steroids/filter"
 	"github.com/michalswi/local-agent-on-steroids/llm"
+	"github.com/michalswi/local-agent-on-steroids/memory"
 	"github.com/michalswi/local-agent-on-steroids/sessionlog"
 	"github.com/michalswi/local-agent-on-steroids/types"
 )
@@ -81,6 +82,8 @@ type Server struct {
 	planProgressText string              // sticky plan line (kept while a task runs)
 	scanFilter       *filter.Filter      // filter snapshot from startup; reused by rescan so agent-created files (e.g. .gitignore) don't hide themselves
 	writtenFiles     map[string]struct{} // rel paths written via /api/file/write; always shown on rescan
+	memoryPath       string              // absolute path to this project's memory.md (empty when memory disabled)
+	homeDir          string              // homedir for session logs and memory
 	mu               sync.RWMutex
 }
 
@@ -121,7 +124,7 @@ type StatusResponse struct {
 }
 
 // NewServer creates a new web UI server
-func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, cfg *config.Config, llmClient *llm.OllamaClient, focusedPath string) *Server {
+func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, cfg *config.Config, llmClient *llm.OllamaClient, focusedPath, homeDir string, noMemory bool) *Server {
 	s := &Server{
 		directory:    directory,
 		model:        model,
@@ -133,6 +136,11 @@ func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, 
 		llmClient:    llmClient,
 		messages:     make([]Message, 0),
 		writtenFiles: make(map[string]struct{}),
+		homeDir:      homeDir,
+	}
+
+	if !noMemory && homeDir != "" {
+		s.memoryPath = memory.Path(homeDir, directory)
 	}
 
 	// Capture the filter state at startup. Re-using this on every rescan
@@ -142,10 +150,24 @@ func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, 
 		s.scanFilter = f
 	}
 
+	memStatus := "disabled"
+	if s.memoryPath != "" {
+		rel := s.memoryPath
+		if s.homeDir != "" {
+			if r, err := filepath.Rel(s.homeDir, s.memoryPath); err == nil {
+				rel = r
+			}
+		}
+		if _, err := os.Stat(s.memoryPath); err == nil {
+			memStatus = "loaded (" + rel + ")"
+		} else {
+			memStatus = "ready (" + rel + ")"
+		}
+	}
 	s.appendMessageLocked(Message{
-		Role: "assistant",
-		Content: fmt.Sprintf("🤖 Interactive mode started!\n\nScanned: %s\nFiles found: %d\nModel: %s\n\nConcurrent Files: %d\nTemperature: %.2f\n\nType your questions or commands.",
-			directory, scanResult.TotalFiles, model, cfg.Agent.ConcurrentFiles, cfg.LLM.Temperature),
+		Role: "info",
+		Content: fmt.Sprintf("Scanned: %s\nFiles: %d\nModel: %s\nConcurrent Files: %d\nTemperature: %.2f\nMemory: %s\n\nType your questions or commands.",
+			directory, scanResult.TotalFiles, model, cfg.Agent.ConcurrentFiles, cfg.LLM.Temperature, memStatus),
 		Timestamp: time.Now(),
 	})
 
@@ -178,6 +200,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/agent/fixstream", s.handleFixStream)
 	mux.HandleFunc("/api/ext/send", s.handleExtSend)
 	mux.HandleFunc("/api/ext/stream", s.handleExtStream)
+	mux.HandleFunc("/api/memory", s.handleMemory)
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("🌐 Web UI available at http://localhost%s\n", addr)
@@ -233,6 +256,129 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
+// memoryContext returns the project memory content to be prepended to system
+// prompts.  Returns an empty string when memory is disabled or the file is
+// empty / unreadable.
+func (s *Server) memoryContext() string {
+	if s.memoryPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(s.memoryPath)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	return "Project memory (facts from previous sessions — use this as background context):\n\n" + strings.TrimSpace(string(data))
+}
+
+// autoSaveMemory appends a structured summary (Option A) plus an LLM-generated
+// one-liner (Option B) to the project memory file after a successful agent run.
+// It is a no-op when memory is disabled (memoryPath == "").
+// The LLM call runs in a background goroutine so it never blocks the response.
+func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
+	if s.memoryPath == "" {
+		return
+	}
+	var changed, created, deleted []string
+	for _, r := range results {
+		if r.Error != "" {
+			continue
+		}
+		if r.Deleted {
+			deleted = append(deleted, r.File)
+		} else if r.Created {
+			created = append(created, r.File)
+		} else if r.Changed {
+			changed = append(changed, r.File)
+		}
+	}
+	if len(changed)+len(created)+len(deleted) == 0 {
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## %s\n", time.Now().Format("2006-01-02")))
+	sb.WriteString(fmt.Sprintf("Task: %s\n", task))
+	if len(changed) > 0 {
+		sb.WriteString(fmt.Sprintf("Modified: %s\n", strings.Join(changed, ", ")))
+	}
+	if len(created) > 0 {
+		sb.WriteString(fmt.Sprintf("Created: %s\n", strings.Join(created, ", ")))
+	}
+	if len(deleted) > 0 {
+		sb.WriteString(fmt.Sprintf("Deleted: %s\n", strings.Join(deleted, ", ")))
+	}
+	structuredEntry := sb.String()
+	allFiles := append(append(append([]string{}, changed...), created...), deleted...)
+	s.mu.RLock()
+	client := s.llmClient
+	homeDir := s.homeDir
+	directory := s.directory
+	s.mu.RUnlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		prompt := fmt.Sprintf(
+			"In 1-2 sentences, describe what was done. Task: %q. Files: %v.",
+			task, allFiles,
+		)
+		resp, err := client.Chat(ctx, &llm.ChatRequest{
+			Messages:  []llm.Message{{Role: "user", Content: prompt}},
+			MaxTokens: 120,
+		})
+		entry := structuredEntry
+		if err == nil && resp != nil {
+			entry += fmt.Sprintf("Summary: %s\n", strings.TrimSpace(resp.Message.Content))
+		}
+		_ = memory.Append(homeDir, directory, entry)
+	}()
+}
+
+// handleMemory handles GET/POST/DELETE /api/memory
+//
+//	GET    → returns {"content":"..."} (empty string when no memory file)
+//	POST   → body {"content":"..."} replaces the memory file
+//	DELETE → clears the memory file
+func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.memoryPath == "" {
+		http.Error(w, `{"error":"memory disabled (--no-memory flag was set)"}`, http.StatusForbidden)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		data, err := os.ReadFile(s.memoryPath)
+		if os.IsNotExist(err) {
+			json.NewEncoder(w).Encode(map[string]string{"content": ""})
+			return
+		}
+		if err != nil {
+			http.Error(w, `{"error":"failed to read memory"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"content": string(data)})
+	case http.MethodPost:
+		var body struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+			return
+		}
+		if err := memory.Save(s.homeDir, s.directory, body.Content); err != nil {
+			http.Error(w, `{"error":"failed to save memory"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	case http.MethodDelete:
+		if err := memory.Clear(s.homeDir, s.directory); err != nil {
+			http.Error(w, `{"error":"failed to clear memory"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -267,9 +413,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(ChatResponse{Success: true, Cleared: true})
 			return
 		}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
 		s.mu.Lock()
 		msg := Message{
-			Role:      "assistant",
+			Role:      role,
 			Content:   response,
 			Timestamp: time.Now(),
 		}
@@ -430,17 +581,24 @@ func (s *Server) handleCommand(input string) string {
 • model <name> - Switch to a different LLM model
 • rescan - Rescan the directory for changes
 • stats - Show current statistics
-• files - List all files in scope`
+• files - List all files in scope
+• mem show - Show current project memory
+• mem clear - Clear project memory
+• mem save <text> - Append text to project memory`
 
 	case lower == "stats":
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		activeFiles := s.getActiveFilesLocked()
-		return fmt.Sprintf(`📊 Statistics:
-• Directory: %s
-• Total files scanned: %d
-• Active files: %d
-• Model: %s`, s.directory, s.scanResult.TotalFiles, len(activeFiles), s.model)
+		memStat := "disabled"
+		if s.memoryPath != "" {
+			if _, err := os.Stat(s.memoryPath); err == nil {
+				memStat = "loaded"
+			} else {
+				memStat = "ready"
+			}
+		}
+		return fmt.Sprintf("__INFO__:Directory: %s\nTotal files scanned: %d\nActive files: %d\nModel: %s\nConcurrent Files: %d\nTemperature: %.2f\nMemory: %s", s.directory, s.scanResult.TotalFiles, len(activeFiles), s.model, s.cfg.Agent.ConcurrentFiles, s.cfg.LLM.Temperature, memStat)
 
 	case lower == "files":
 		s.mu.RLock()
@@ -483,6 +641,41 @@ func (s *Server) handleCommand(input string) string {
 		s.mu.Unlock()
 		return fmt.Sprintf("✅ Rescan complete!\n\nFiles found: %d\nFiltered: %d\nTotal size: %s",
 			scanResult.TotalFiles, scanResult.FilteredFiles, formatBytes(scanResult.TotalSize))
+
+	case lower == "mem show":
+		if s.memoryPath == "" {
+			return "⚠️  Memory is disabled (started with --no-memory)."
+		}
+		data, err := os.ReadFile(s.memoryPath)
+		if os.IsNotExist(err) || len(data) == 0 {
+			return "📭 No project memory yet.\n\nUse `mem save <text>` to add notes."
+		}
+		if err != nil {
+			return fmt.Sprintf("❌ Failed to read memory: %v", err)
+		}
+		return fmt.Sprintf("🧠 Project memory (%s):\n\n%s", s.memoryPath, string(data))
+
+	case lower == "mem clear":
+		if s.memoryPath == "" {
+			return "⚠️  Memory is disabled (started with --no-memory)."
+		}
+		if err := memory.Clear(s.homeDir, s.directory); err != nil {
+			return fmt.Sprintf("❌ Failed to clear memory: %v", err)
+		}
+		return "🗑️  Project memory cleared."
+
+	case strings.HasPrefix(lower, "mem save "):
+		if s.memoryPath == "" {
+			return "⚠️  Memory is disabled (started with --no-memory)."
+		}
+		text := strings.TrimSpace(input[len("mem save "):])
+		if text == "" {
+			return "⚠️  Please provide text to save."
+		}
+		if err := memory.Append(s.homeDir, s.directory, text); err != nil {
+			return fmt.Sprintf("❌ Failed to save memory: %v", err)
+		}
+		return "✅ Saved to project memory."
 
 	}
 
@@ -743,10 +936,14 @@ func (s *Server) processQuestion(ctx context.Context, question string, files []*
 	}
 
 	var systemPrompt string
+	memCtx := s.memoryContext()
 	if len(filePaths) == 0 {
 		systemPrompt = promptChat + "\nAvailable files: none — the working directory has not been scanned or contains no readable files. Do NOT invent, guess, or fabricate any file contents or code. If the user asks about a specific file, tell them no files are available."
 	} else {
 		systemPrompt = promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	}
+	if memCtx != "" {
+		systemPrompt += "\n\n" + memCtx
 	}
 
 	chatReq := &llm.ChatRequest{
@@ -804,6 +1001,9 @@ func (s *Server) processQuestionParallel(ctx context.Context, question string, f
 		}
 	}
 	systemPrompt := promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	if memCtxP := s.memoryContext(); memCtxP != "" {
+		systemPrompt += "\n\n" + memCtxP
+	}
 
 	type result struct {
 		idx    int
@@ -1122,8 +1322,13 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(AgentRunResponse{Success: true, Cleared: true})
 			return
 		}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
 		s.mu.Lock()
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
 		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -1170,6 +1375,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(AgentRunResponse{Success: false, Error: err.Error()})
 		return
 	}
+	s.autoSaveMemory(task, results)
 
 	if !dryRun {
 		for _, res := range results {
@@ -1251,8 +1457,13 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 			sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "cleared": true})
 			return
 		}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
 		s.mu.Lock()
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
 		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		sseWrite(w, flusher, map[string]any{
@@ -1323,6 +1534,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
 		return
 	}
+	s.autoSaveMemory(task, results)
 
 	if !dryRun {
 		for _, res := range results {
@@ -1574,7 +1786,12 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "cleared": true})
 			return
 		}
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
 		s.mu.Lock()
 		s.appendMessageLocked(msg)
 		s.mu.Unlock()
@@ -1623,6 +1840,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
 			return
 		}
+		s.autoSaveMemory(text, results)
 
 		// Always rescan after writing — dryRun is always false for the external API.
 		for _, res := range results {
@@ -1776,7 +1994,12 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 			sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "cleared": true})
 			return
 		}
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
 		s.mu.Lock()
 		s.appendMessageLocked(msg)
 		s.mu.Unlock()
@@ -1839,6 +2062,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 			sseMu.Unlock()
 			return
 		}
+		s.autoSaveMemory(text, results)
 
 		// Always rescan after writing — dryRun is always false for the external API.
 		for _, res := range results {
@@ -2537,6 +2761,9 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	systemPrompt := promptAgentEdit
 	if changelog != "" {
 		systemPrompt += "\n\n" + changelog
+	}
+	if memCtxAgent := s.memoryContext(); memCtxAgent != "" {
+		systemPrompt += "\n\n" + memCtxAgent
 	}
 
 	// crossFileContextLimit caps the total bytes of cross-file context injected
@@ -3391,6 +3618,9 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		createSystemPrompt := promptAgentCreate
 		if changelog != "" {
 			createSystemPrompt += "\n\n" + changelog
+		}
+		if memCtxCreate := s.memoryContext(); memCtxCreate != "" {
+			createSystemPrompt += "\n\n" + memCtxCreate
 		}
 
 		chatReq := &llm.ChatRequest{
@@ -5545,10 +5775,15 @@ func (s *Server) runFixLLM(ctx context.Context, task string, errorOutput string,
 
 	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\nFix the error(s) above. Return only the files that need to change.", errorOutput)
 
+	fixSystemPrompt := promptAgentFix
+	if memCtxFix := s.memoryContext(); memCtxFix != "" {
+		fixSystemPrompt += "\n\n" + memCtxFix
+	}
+
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
 		Messages: []llm.Message{
-			{Role: "system", Content: promptAgentFix},
+			{Role: "system", Content: fixSystemPrompt},
 			{Role: "user", Content: prompt.String()},
 		},
 		Temperature: fixTemperature(s.cfg.LLM.Temperature, attempt, sameError),
