@@ -2951,7 +2951,34 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			}
 
 			var userPrompt string
-			if ctxBuf.Len() > 0 {
+			fileSysPrompt := systemPrompt
+			if agentIsDocLikeFile(f.RelPath) {
+				// For doc files use a lean documentation-focused system prompt
+				// instead of the large code-editing one. Also replace source-code
+				// cross-file snippets with just a filename list so the model is not
+				// flooded with code it doesn't need to reproduce.
+				fileSysPrompt = "You are a technical documentation writer and coding agent. " +
+					"Return ONLY the complete content of the documentation file specified. " +
+					"Do not include markdown fences around the whole output or any commentary."
+				if changelog != "" {
+					fileSysPrompt += "\n\n" + changelog
+				}
+				// Build a filename-only list from all scoped files for context.
+				var fileList strings.Builder
+				for _, other := range targetFiles {
+					if other != nil && other.RelPath != f.RelPath {
+						fmt.Fprintf(&fileList, "  %s\n", other.RelPath)
+					}
+				}
+				userPrompt = fmt.Sprintf("Task: %s\n\nTarget file: %s\n\nCurrent content (may be empty):\n%s",
+					task, f.RelPath, oldContent)
+				if fileList.Len() > 0 {
+					userPrompt = fmt.Sprintf("Task: %s\n\nProject files (for reference, do NOT reproduce them):\n%s\nTarget file: %s\n\nCurrent content (may be empty):\n%s",
+						task, fileList.String(), f.RelPath, oldContent)
+				}
+				userPrompt += "\n\n" + agentDocumentationInstructions()
+				userPrompt += "\n\n" + s.agentProjectMetaBlock()
+			} else if ctxBuf.Len() > 0 {
 				userPrompt = fmt.Sprintf(
 					"Related files for context (do NOT output these — only output the file you are asked to edit):\n\n%s\nFile to edit: %s\n\n%s\n\nTask: %s",
 					ctxBuf.String(), f.RelPath, oldContent, task,
@@ -2959,14 +2986,10 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			} else {
 				userPrompt = fmt.Sprintf("File: %s\n\n%s\n\nTask: %s", f.RelPath, oldContent, task)
 			}
-			if agentIsDocLikeFile(f.RelPath) {
-				userPrompt += "\n\n" + agentDocumentationInstructions()
-				userPrompt += "\n\n" + s.agentProjectMetaBlock()
-			}
 			chatReq := &llm.ChatRequest{
 				Model: s.cfg.LLM.Model,
 				Messages: []llm.Message{
-					{Role: "system", Content: systemPrompt},
+					{Role: "system", Content: fileSysPrompt},
 					{Role: "user", Content: userPrompt},
 				},
 				Temperature: agentTemperature(s.cfg.LLM.Temperature),
@@ -3522,11 +3545,15 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 	}
 
 	// ── Step 2: build context block ─────────────────────────────────────────
-	var ctxBuf strings.Builder
+	// For doc files, only a filename list is needed — dumping full source code
+	// overwhelms small local models when all they need to write is prose.
+	var ctxBuf strings.Builder       // full file content (non-doc files)
+	var ctxFileList strings.Builder  // filename-only list (used for doc files)
 	for _, cf := range contextFiles {
 		if cf == nil || !cf.IsReadable {
 			continue
 		}
+		fmt.Fprintf(&ctxFileList, "  %s\n", cf.RelPath)
 		absPath := filepath.Clean(filepath.Join(s.directory, cf.RelPath))
 		data, err := os.ReadFile(absPath)
 		if err != nil {
@@ -3551,7 +3578,12 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			// Build a focused prompt for this single file.
 			var userMsg strings.Builder
 			fmt.Fprintf(&userMsg, "Task: %s\n\nGenerate ONLY the file: %s\n", task, fileName)
-			if ctxBuf.Len() > 0 {
+			if isDocFile {
+				// Filename list only — no source code contents.
+				if ctxFileList.Len() > 0 {
+					fmt.Fprintf(&userMsg, "\nProject files (for reference only, do NOT reproduce them):\n%s", ctxFileList.String())
+				}
+			} else if ctxBuf.Len() > 0 {
 				fmt.Fprintf(&userMsg, "\nExisting project files for context:\n%s", ctxBuf.String())
 			}
 			// Inject already-generated files so the model can stay consistent
@@ -3672,8 +3704,12 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 	if len(results) == 0 {
 		progress("⚙️  Calling LLM to create file(s)…")
 
+		isDocsLegacy := agentIsDocsIntent(task)
 		userContent := task
-		if ctxBuf.Len() > 0 {
+		if isDocsLegacy && ctxFileList.Len() > 0 {
+			progress("Reading context files…")
+			userContent = fmt.Sprintf("Project files (for reference only, do NOT reproduce them):\n%s\nTask: %s", ctxFileList.String(), task)
+		} else if !isDocsLegacy && ctxBuf.Len() > 0 {
 			progress("Reading context files…")
 			userContent = fmt.Sprintf("Existing files for context:\n\n%s\nTask: %s", ctxBuf.String(), task)
 		}

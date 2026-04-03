@@ -45,11 +45,10 @@ make build
 ## \# Ollama Setup
 
 ```bash
-# match OLLAMA_NUM_PARALLEL with AGENT_CONCURRENT_FILES,
-# match OLLAMA_CONTEXT_LENGTH with AGENT_TOKEN_LIMIT
-OLLAMA_CONTEXT_LENGTH=8192 OLLAMA_NUM_PARALLEL=5 ollama serve
+# match OLLAMA_NUM_PARALLEL with AGENT_CONCURRENT_FILES
+OLLAMA_NUM_PARALLEL=5 ollama serve
 
-AGENT_TOKEN_LIMIT=8000 AGENT_CONCURRENT_FILES=5 ./local-agent-on-steroids --dir . --interactive
+AGENT_CONCURRENT_FILES=5 ./local-agent-on-steroids --dir .
 
 # Defaults (context=4096, parallel=1)
 ollama serve
@@ -58,8 +57,6 @@ ollama serve
 
 > **`AGENT_CONCURRENT_FILES`** controls parallel LLM calls when **editing/analyzing existing files** (agent task mode) and when **reviewing/analyzing files via Send** (Smart Send mode — active when `AGENT_CONCURRENT_FILES > 1` and more than one file is in scope).
 > It does **not** apply when **generating new files** from scratch — those are produced sequentially.
-
-> **`AGENT_TOKEN_LIMIT`** sets the maximum file size (in tokens) that the scanner will read. Files exceeding this limit are marked unreadable and excluded from all prompts. Match it to `OLLAMA_CONTEXT_LENGTH` to avoid sending more content than the model's context window can handle.
 
 ## \# Session Logs
 
@@ -237,7 +234,6 @@ Create `.agent/config.yaml` (see [examples/config.yaml](examples/config.yaml)):
 
 ```yaml
 agent:
-  token_limit: 8000       # match OLLAMA_CONTEXT_LENGTH (default: 4000)
   concurrent_files: 5     # match OLLAMA_NUM_PARALLEL (default: 1)
 
 llm:

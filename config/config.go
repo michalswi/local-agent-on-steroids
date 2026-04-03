@@ -81,8 +81,9 @@ func DefaultConfig() *Config {
 		LLM: LLMConfig{
 			Provider: "ollama",
 			Endpoint: "http://localhost:11434",
-			Model:    "wizardlm2:7b", // https://ollama.com/library/wizardlm2
-			// Model:       "gemma3:4b", // https://ollama.com/library/gemma3
+			Model: "wizardlm2:7b", // https://ollama.com/library/wizardlm2
+			// Model: "gemma3:4b", // https://ollama.com/library/gemma3
+			// Model: "gemma4:e4b", // https://ollama.com/library/gemma4
 			Temperature: 0.3, // 0.1 might be too conservative..
 			Timeout:     300, // 5 minutes for large batches
 		},

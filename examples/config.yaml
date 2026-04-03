@@ -2,7 +2,6 @@
 
 agent:
   max_file_size_bytes: 1048576  # 1MB - maximum file size to analyze
-  token_limit: 8000              # maximum tokens to send to LLM per request
   concurrent_files: 10           # number of files to analyze concurrently
 
 llm:
