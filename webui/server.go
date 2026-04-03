@@ -47,11 +47,19 @@ const maxMessages = 200
 const maxAgentLogEntries = 50
 
 var (
-	promptChat        = mustPrompt("prompts/chat.md")
-	promptAgentEdit   = mustPrompt("prompts/agent_edit.md")
-	promptAgentCreate = mustPrompt("prompts/agent_create.md")
-	promptAgentFix    = mustPrompt("prompts/agent_fix.md")
+	promptChat              = mustPrompt("prompts/chat.md")
+	promptAgentEdit         = mustPrompt("prompts/agent_edit.md")
+	promptAgentCreate       = mustPrompt("prompts/agent_create.md")
+	promptAgentCreateSingle = mustPrompt("prompts/agent_create_single.md")
+	promptAgentFix          = mustPrompt("prompts/agent_fix.md")
 )
+
+// agentDocWriterSystemPrompt is the shared system prompt for all documentation
+// file generation calls (create step 3a, edit loop, and refinement passes).
+const agentDocWriterSystemPrompt = "You are a technical documentation writer and coding agent. " +
+	"Return ONLY the complete content of the documentation file specified. " +
+	"Start with the first line of content — no preamble, no commentary. " +
+	"Do not wrap the output in markdown code fences."
 
 // AgentLogEntry records a single file operation performed by the agent.
 // The log is injected into subsequent agent prompts so the LLM knows what
@@ -2219,6 +2227,27 @@ func agentIsDocsIntent(task string) bool {
 	return strings.Contains(lower, "readme") || strings.Contains(lower, "documentation") || strings.Contains(lower, "docs")
 }
 
+// agentIsMixedCodeAndDocsTask returns true when the task asks for both new
+// code/files AND documentation. In that case the docs guard must not strip the
+// code files from the plan.
+func agentIsMixedCodeAndDocsTask(task string) bool {
+	if !agentIsDocsIntent(task) {
+		return false
+	}
+	lower := strings.ToLower(task)
+	codeWords := []string{
+		"generate", "create", "write", "build", "implement", "scaffold",
+		"add ", "make ", "develop", "app", "application", "server",
+		"service", "function", "class", "module", "script",
+	}
+	for _, w := range codeWords {
+		if strings.Contains(lower, w) {
+			return true
+		}
+	}
+	return false
+}
+
 func agentIsDocLikeFile(name string) bool {
 	base := strings.ToLower(filepath.Base(filepath.ToSlash(filepath.Clean(name))))
 	ext := strings.ToLower(filepath.Ext(base))
@@ -2373,9 +2402,7 @@ func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, o
 		return draft, nil, nil
 	}
 
-	systemPrompt := "You are a technical documentation writer. " +
-		"Return ONLY the complete, corrected content of the target documentation file. " +
-		"Do not include markdown fences or commentary."
+	systemPrompt := agentDocWriterSystemPrompt
 
 	doRefinementPass := func(prevDraft string, prevIssues []string, passNum int) (string, []string, error) {
 		var issueList strings.Builder
@@ -2957,9 +2984,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				// instead of the large code-editing one. Also replace source-code
 				// cross-file snippets with just a filename list so the model is not
 				// flooded with code it doesn't need to reproduce.
-				fileSysPrompt = "You are a technical documentation writer and coding agent. " +
-					"Return ONLY the complete content of the documentation file specified. " +
-					"Do not include markdown fences around the whole output or any commentary."
+				fileSysPrompt = agentDocWriterSystemPrompt
 				if changelog != "" {
 					fileSysPrompt += "\n\n" + changelog
 				}
@@ -3404,6 +3429,12 @@ func agentExplicitFilenameFromTask(task string) string {
 	lower := strings.ToLower(task)
 	isDocsTask := strings.Contains(lower, "readme") || strings.Contains(lower, "documentation") || strings.Contains(lower, "docs")
 
+	// Mixed tasks (e.g. "generate golang app ... add documentation in README.md")
+	// must go through full planning so code files are not dropped.
+	if isDocsTask && agentIsMixedCodeAndDocsTask(task) {
+		return ""
+	}
+
 	// Keep conservative behaviour for long generic prompts (project scaffolding),
 	// but still allow explicit doc targets like README.md.
 	if len(task) > 200 && !isDocsTask {
@@ -3519,7 +3550,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			progress("⚠️  Planning returned no files — falling back to single-file mode…")
 			plannedFiles = nil
 		} else {
-			if agentIsDocsIntent(task) {
+			if agentIsDocsIntent(task) && !agentIsMixedCodeAndDocsTask(task) {
 				filtered, blocked := filterPlannedFilesForDocsIntent(task, plannedFiles)
 				if len(blocked) > 0 {
 					progress(fmt.Sprintf("🛡️  Docs guard blocked non-doc planned files: %s", strings.Join(blocked, ", ")))
@@ -3602,13 +3633,9 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				userMsg.WriteString("\n")
 			}
 
-			sysPrompt := "You are a coding agent. " +
-				"Generate ONLY the complete content of the single file specified. " +
-				"Output raw file content — no markdown fences, no commentary, no filename header."
+			sysPrompt := promptAgentCreateSingle
 			if isDocFile {
-				sysPrompt = "You are a technical documentation writer and coding agent. " +
-					"Generate ONLY the complete content of the single documentation file specified. " +
-					"Output raw file content — no markdown fences, no commentary, no filename header."
+				sysPrompt = agentDocWriterSystemPrompt
 			}
 			if changelog != "" {
 				sysPrompt += "\n\n" + changelog
@@ -3628,6 +3655,9 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				continue
 			}
 			fileContent := agentStripFences(strings.TrimSpace(resp.Message.Content))
+			if !isDocFile {
+				fileContent = agentStripLeadingProse(fileContent, fileName)
+			}
 			if fileContent == "" {
 				progress(fmt.Sprintf("⚠️  %s — empty response, skipping", fileName))
 				continue
@@ -4328,6 +4358,130 @@ func attemptDeterministicManifestRepair(workDir, manifestFile string) (bool, str
 	default:
 		return false, fmt.Sprintf("Auto-repair skipped: deterministic strategy for %s is not implemented", manifestFile)
 	}
+}
+
+// buildMissingSymbolGuidance detects "undefined / missing symbol" errors across
+// multiple languages and attempts to look up what the package actually exports,
+// so the LLM stops guessing non-existent names.
+//
+// Supported patterns:
+//   Go:     undefined: pkg.Symbol
+//   Python: cannot import name 'Symbol' from 'pkg'
+//           module 'pkg' has no attribute 'Symbol'
+//   JS/TS:  Module '"pkg"' has no exported member 'Symbol'
+//           Property 'Symbol' does not exist on type ...
+func buildMissingSymbolGuidance(workDir, errorOutput string) string {
+	type hint struct {
+		pkg string
+		sym string
+	}
+	seen := map[string]bool{}
+	var hints []hint
+
+	add := func(pkg, sym string) {
+		k := pkg + "." + sym
+		if !seen[k] {
+			seen[k] = true
+			hints = append(hints, hint{pkg, sym})
+		}
+	}
+
+	// Go: undefined: pkg.Symbol
+	goRx := regexp.MustCompile(`undefined: ([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)`)
+	for _, m := range goRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[1], m[2])
+	}
+
+	// Python: cannot import name 'Symbol' from 'pkg'
+	pyImportRx := regexp.MustCompile(`cannot import name '([^']+)' from '([^']+)'`)
+	for _, m := range pyImportRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[2], m[1])
+	}
+
+	// Python: module 'pkg' has no attribute 'Symbol'
+	pyAttrRx := regexp.MustCompile(`module '([^']+)' has no attribute '([^']+)'`)
+	for _, m := range pyAttrRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[1], m[2])
+	}
+
+	// JS/TS: Module '"pkg"' has no exported member 'Symbol'
+	tsRx := regexp.MustCompile(`Module '["']([^'"]+)["']' has no exported member '([^']+)'`)
+	for _, m := range tsRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[1], m[2])
+	}
+
+	if len(hints) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for _, h := range hints {
+		exports := lookupPackageExports(workDir, h.pkg, errorOutput)
+		if len(exports) > 0 {
+			fmt.Fprintf(&b, "NOTE: `%s.%s` does not exist. Actual exports of `%s`:\n%s\nUse one of the above — do not invent names.\n\n",
+				h.pkg, h.sym, h.pkg, strings.Join(exports, "\n"))
+		} else {
+			fmt.Fprintf(&b, "NOTE: `%s.%s` does not exist in `%s`. Check the package documentation for the correct name.\n", h.pkg, h.sym, h.pkg)
+		}
+	}
+	return b.String()
+}
+
+// lookupPackageExports tries to enumerate exported names for a package using
+// the language-specific toolchain available in workDir.
+func lookupPackageExports(workDir, pkg, errorOutput string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// ── Go ──────────────────────────────────────────────────────────────────
+	// Presence of a go.mod or a .go file in error output is a strong signal.
+	if strings.Contains(errorOutput, ".go:") || hasFileExtInDir(workDir, ".go") {
+		stdout, _, exitCode := execCommand(ctx, workDir, "go", "doc", pkg)
+		if exitCode == 0 && strings.TrimSpace(stdout) != "" {
+			var out []string
+			for _, line := range strings.Split(stdout, "\n") {
+				t := strings.TrimSpace(line)
+				if strings.HasPrefix(t, "func ") || strings.HasPrefix(t, "type ") ||
+					strings.HasPrefix(t, "const ") || strings.HasPrefix(t, "var ") {
+					out = append(out, "  "+t)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+
+	// ── Python ──────────────────────────────────────────────────────────────
+	if strings.Contains(errorOutput, ".py:") || hasFileExtInDir(workDir, ".py") {
+		script := fmt.Sprintf("import %s; print('\\n'.join(x for x in dir(%s) if not x.startswith('_')))", pkg, pkg)
+		stdout, _, exitCode := execCommand(ctx, workDir, "python3", "-c", script)
+		if exitCode == 0 && strings.TrimSpace(stdout) != "" {
+			var out []string
+			for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+				if t := strings.TrimSpace(line); t != "" {
+					out = append(out, "  "+t)
+				}
+			}
+			return out
+		}
+	}
+
+	return nil
+}
+
+// hasFileExtInDir returns true when workDir contains at least one file with ext.
+func hasFileExtInDir(workDir, ext string) bool {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildManifestErrorGuidance(errorOutput string, relatedFiles []string) string {
@@ -5297,6 +5451,96 @@ func agentInferExtension(name, content string) string {
 //
 // agentTrimSeparator removes a trailing === separator that models sometimes
 // append at the end of the last file block (leaking the multi-file format).
+// agentStripLeadingProse removes natural-language commentary that small LLMs
+// often prepend to code output (e.g. "Here is the main.go file:\n").
+// It finds the first line that looks like actual code for the given filename
+// extension and returns everything from that line onward. If no code-like line
+// is found the original content is returned unchanged.
+func agentStripLeadingProse(content, filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	// Also handle bare names like "go.mod" and "Makefile".
+	base := strings.ToLower(filepath.Base(filename))
+
+	var isCodeLine func(line string) bool
+	switch ext {
+	case ".go":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "package ") || strings.HasPrefix(l, "//") || strings.HasPrefix(l, "/*")
+		}
+	case ".mod":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "module ") || strings.HasPrefix(l, "go ")
+		}
+	case ".py":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "#!/") || strings.HasPrefix(l, "import ") ||
+				strings.HasPrefix(l, "from ") || strings.HasPrefix(l, "class ") ||
+				strings.HasPrefix(l, "def ") || strings.HasPrefix(l, "#") ||
+				strings.HasPrefix(l, "@")
+		}
+	case ".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "import ") || strings.HasPrefix(l, "export ") ||
+				strings.HasPrefix(l, "const ") || strings.HasPrefix(l, "let ") ||
+				strings.HasPrefix(l, "var ") || strings.HasPrefix(l, "function ") ||
+				strings.HasPrefix(l, "class ") || strings.HasPrefix(l, "//") ||
+				strings.HasPrefix(l, "/*") || strings.HasPrefix(l, "require(") ||
+				strings.HasPrefix(l, "\"use strict\"") || strings.HasPrefix(l, "'use strict'")
+		}
+	case ".tf", ".tfvars":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "terraform") || strings.HasPrefix(l, "resource ") ||
+				strings.HasPrefix(l, "provider ") || strings.HasPrefix(l, "data ") ||
+				strings.HasPrefix(l, "module ") || strings.HasPrefix(l, "variable ") ||
+				strings.HasPrefix(l, "output ") || strings.HasPrefix(l, "locals ") ||
+				strings.HasPrefix(l, "#") || strings.HasPrefix(l, "//")
+		}
+	case ".json":
+		isCodeLine = func(l string) bool { return strings.HasPrefix(l, "{") || strings.HasPrefix(l, "[") }
+	case ".yaml", ".yml":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "---") || strings.HasSuffix(l, ":") || strings.Contains(l, ": ")
+		}
+	case ".sh", ".bash":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "#!/") || strings.HasPrefix(l, "#") || strings.HasPrefix(l, "set ")
+		}
+	case ".rs":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "use ") || strings.HasPrefix(l, "fn ") ||
+				strings.HasPrefix(l, "mod ") || strings.HasPrefix(l, "pub ") ||
+				strings.HasPrefix(l, "struct ") || strings.HasPrefix(l, "enum ") ||
+				strings.HasPrefix(l, "//") || strings.HasPrefix(l, "/*") ||
+				strings.HasPrefix(l, "#[")
+		}
+	default:
+		// Handle special base names without recognised extensions.
+		switch base {
+		case "makefile", "dockerfile":
+			isCodeLine = func(l string) bool {
+				return strings.HasPrefix(l, "#") || strings.Contains(l, ":") || strings.HasPrefix(l, "\t")
+			}
+		default:
+			return content // unknown type — don't mutate
+		}
+	}
+
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if isCodeLine(trimmed) {
+			if i == 0 {
+				return content // already starts with code
+			}
+			return strings.Join(lines[i:], "\n")
+		}
+	}
+	return content // no code-like line found — return as-is
+}
+
 func agentTrimSeparator(s string) string {
 	t := strings.TrimRight(s, " \t\r\n")
 	if strings.HasSuffix(t, "===") {
@@ -5862,6 +6106,11 @@ func (s *Server) runFixLLM(ctx context.Context, task string, errorOutput string,
 	}
 
 	if guidance := buildManifestErrorGuidance(errorOutput, relatedFiles); guidance != "" {
+		prompt.WriteString(guidance)
+		prompt.WriteString("\n")
+	}
+
+	if guidance := buildMissingSymbolGuidance(s.directory, errorOutput); guidance != "" {
 		prompt.WriteString(guidance)
 		prompt.WriteString("\n")
 	}

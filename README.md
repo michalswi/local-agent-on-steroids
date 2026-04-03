@@ -128,10 +128,13 @@ There are three distinct system prompts used internally, each targeting a differ
 |---|---|
 | `webui/prompts/chat.md` | **Send** button — plain conversation, no file writes |
 | `webui/prompts/agent_edit.md` | **⚡ Agent** button — applied per-file in a parallel loop |
-| `webui/prompts/agent_create.md` | Agent sub-step when a new file needs to be created from scratch |
+| `webui/prompts/agent_create.md` | Agent legacy path — multi-file scaffold in a single LLM call |
+| `webui/prompts/agent_create_single.md` | Agent per-file path — one focused LLM call per planned file (code files only) |
 | `webui/prompts/agent_fix.md` | **🔧 Run & Fix** button — language-agnostic fix prompt used in each repair iteration |
 
-All four prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, session changelog, and **project memory**) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
+All prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, session changelog, and **project memory**) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
+
+Documentation files (`README.md`, `*.md`, `docs/`) always use a shared internal doc-writer system prompt instead of the code-generation prompts, regardless of which operation triggered the call.
 
 ## \# External API
 
