@@ -107,6 +107,14 @@ Use `--no-memory` to disable memory for a session (auto-save is also disabled). 
 | **⏹ Stop** | Aborts the current Agent or Send operation mid-stream. Only visible while a request is in progress. |
 | **🔒 Auto Off** | Toggles auto-apply mode. When **OFF** (default), each file change requires an explicit **⚡ Apply** confirmation. When **ON**, changes are applied immediately. Does **not** affect the Agent's planning phase — planning always runs regardless. |
 
+## \# Pinned Files
+
+Check the checkbox next to any file in the Explorer sidebar to **pin** it. A `📌 N pinned` badge appears at the bottom of the sidebar.
+
+When files are pinned, **⚡ Agent** skips its normal keyword-scoping and operates **only on those files**. This is useful when you want to refactor or update a specific file without the agent touching anything else.
+
+Pinning only affects the **Agent** button — Send and Run & Fix are not influenced.
+
 
 ## \# Chat Commands
 

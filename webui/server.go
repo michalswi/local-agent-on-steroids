@@ -52,14 +52,8 @@ var (
 	promptAgentCreate       = mustPrompt("prompts/agent_create.md")
 	promptAgentCreateSingle = mustPrompt("prompts/agent_create_single.md")
 	promptAgentFix          = mustPrompt("prompts/agent_fix.md")
+	promptAgentDoc          = mustPrompt("prompts/agent_doc.md")
 )
-
-// agentDocWriterSystemPrompt is the shared system prompt for all documentation
-// file generation calls (create step 3a, edit loop, and refinement passes).
-const agentDocWriterSystemPrompt = "You are a technical documentation writer and coding agent. " +
-	"Return ONLY the complete content of the documentation file specified. " +
-	"Start with the first line of content — no preamble, no commentary. " +
-	"Do not wrap the output in markdown code fences."
 
 // AgentLogEntry records a single file operation performed by the agent.
 // The log is injected into subsequent agent prompts so the LLM knows what
@@ -1233,7 +1227,8 @@ func sendError(w http.ResponseWriter, message string) {
 
 // AgentRunRequest is the JSON body for POST /api/agent/run.
 type AgentRunRequest struct {
-	Task string `json:"task"`
+	Task        string   `json:"task"`
+	PinnedFiles []string `json:"pinnedFiles,omitempty"` // when non-empty, restrict agent to exactly these files
 }
 
 // ExtSendRequest is the JSON body for POST /api/ext/send and POST /api/ext/stream.
@@ -1376,7 +1371,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	agentStart := time.Now()
-	summary, results, err := s.runAgentTask(taskCtx, task, func(string) {}, dryRun)
+	summary, results, err := s.runAgentTask(taskCtx, task, nil, func(string) {}, dryRun)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1534,7 +1529,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	streamAgentStart := time.Now()
-	summary, results, err := s.runAgentTask(taskCtx, task, progress, dryRun)
+	summary, results, err := s.runAgentTask(taskCtx, task, req.PinnedFiles, progress, dryRun)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return // stopped — keep the user message, no reply to store
@@ -1838,7 +1833,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 	case "agent":
 		// External API always writes files immediately — no pending/commit workflow.
 		extAgentStart := time.Now()
-		summary, results, err := s.runAgentTask(taskCtx, text, func(string) {}, false)
+		summary, results, err := s.runAgentTask(taskCtx, text, nil, func(string) {}, false)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
@@ -2060,7 +2055,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 		agentStart := time.Now()
-		summary, results, err := s.runAgentTask(taskCtx, text, progress, false)
+		summary, results, err := s.runAgentTask(taskCtx, text, nil, progress, false)
 		if err != nil {
 			if errors.Is(err, taskCtx.Err()) {
 				return // stopped
@@ -2297,7 +2292,7 @@ func agentDocumentationInstructions() string {
 		"- Start with a short plain-language overview describing what the app is for and who it helps.\n" +
 		"- Include a step-by-step Getting Started section with copy-pasteable shell examples in fenced bash blocks.\n" +
 		"- Include build and run instructions plus required config/environment variables using concrete values from provided files.\n" +
-		"- Include a brief Possible Improvements section with practical future enhancements.\n" +
+		"- Use ONLY commands and values visible in the source snippets — do not invent flags, commands, or features.\n" +
 		"- Keep wording user-friendly and concise; avoid placeholders."
 }
 
@@ -2337,9 +2332,6 @@ func agentDocValidationIssues(content string) []string {
 	}
 	if !strings.Contains(lower, "```bash") {
 		issues = append(issues, "missing step-by-step shell examples in fenced bash blocks")
-	}
-	if !strings.Contains(lower, "possible improvements") {
-		issues = append(issues, "missing a Possible Improvements section")
 	}
 
 	placeholderHints := []string{
@@ -2396,13 +2388,13 @@ func agentIsGarbageDocContent(issues []string) bool {
 	return hasShort && hasMissingHeadings
 }
 
-func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, oldContent, draft string) (final string, issues []string, err error) {
+func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, oldContent, draft, sourceCtx string) (final string, issues []string, err error) {
 	issues = agentDocValidationIssues(draft)
 	if len(issues) == 0 {
 		return draft, nil, nil
 	}
 
-	systemPrompt := agentDocWriterSystemPrompt
+	systemPrompt := promptAgentDoc
 
 	doRefinementPass := func(prevDraft string, prevIssues []string, passNum int) (string, []string, error) {
 		var issueList strings.Builder
@@ -2420,14 +2412,24 @@ func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, o
 			}
 		}
 
+		srcSection := ""
+		if sourceCtx != "" {
+			srcSection = fmt.Sprintf("Source snippets (read-only context, do NOT reproduce):\n%s\n\n", sourceCtx)
+		}
+		// Don't feed garbage existing content into the refinement prompt — it anchors the model.
+		existingForRefinement := oldContent
+		if agentIsGarbageDocContent(agentDocValidationIssues(oldContent)) {
+			existingForRefinement = "(none — write from scratch)"
+		}
 		userPrompt := fmt.Sprintf(
-			"Task: %s\n\nTarget file: %s\n\nCurrent file content (may be empty):\n%s\n\n%s\n\nProblems to fix:\n%s\nUse the documentation requirements below and return a full replacement file.\n\n%s",
-			task,
-			filePath,
-			oldContent,
-			draftNote,
-			issueList.String(),
-			agentDocumentationInstructions()+"\n\n"+s.agentProjectMetaBlock(),
+"Task: %s\n\nTarget file: %s\n\nExisting content:\n%s\n\n%s%s\n\nProblems to fix:\n%sReturn a complete replacement file.\n\n%s",
+		task,
+		filePath,
+		existingForRefinement,
+		srcSection,
+		draftNote,
+		issueList.String(),
+		s.agentProjectMetaBlock(),
 		)
 
 		chatReq := &llm.ChatRequest{
@@ -2446,6 +2448,12 @@ func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, o
 
 		candidate := agentStripFences(strings.TrimSpace(resp.Message.Content))
 		if strings.TrimSpace(candidate) == "" {
+			return prevDraft, prevIssues, nil
+		}
+		// Don't downgrade: if the refinement produced something shorter/worse
+		// than the previous draft, keep the previous draft.
+		if agentIsGarbageDocContent(agentDocValidationIssues(candidate)) &&
+			!agentIsGarbageDocContent(prevIssues) {
 			return prevDraft, prevIssues, nil
 		}
 		return candidate, agentDocValidationIssues(candidate), nil
@@ -2693,10 +2701,27 @@ func truncatePromptContent(s string, maxBytes int) string {
 	return s[:maxBytes] + "\n\n...[truncated for context]"
 }
 
-func (s *Server) runAgentTask(ctx context.Context, task string, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
+func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []string, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
 	// Scope to files mentioned in the task; fall back to all files.
 	allFiles := s.getActiveFilesSnapshot()
-	targetFiles := s.scopeFilesToQuestion(task, allFiles)
+
+	// If the user pinned specific files in the UI, honour that selection
+	// exactly — skip keyword scoping entirely.
+	var targetFiles []*types.FileInfo
+	if len(pinnedFiles) > 0 {
+		pinnedSet := make(map[string]bool, len(pinnedFiles))
+		for _, p := range pinnedFiles {
+			pinnedSet[filepath.ToSlash(p)] = true
+		}
+		for _, f := range allFiles {
+			if f != nil && pinnedSet[filepath.ToSlash(f.RelPath)] {
+				targetFiles = append(targetFiles, f)
+			}
+		}
+		progress(fmt.Sprintf("📌 Pinned %d file(s): %s", len(targetFiles), strings.Join(pinnedFiles, ", ")))
+	} else {
+		targetFiles = s.scopeFilesToQuestion(task, allFiles)
+	}
 
 	// nil means a technology mismatch was detected: the task requests a
 	// language/framework absent from the workspace — route directly to create.
@@ -2860,10 +2885,12 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	taskLower := strings.ToLower(task)
 	taskTokenSet := promptTokenSet(task)
 
-	// Pre-read all target files once so that each goroutine can build its
+	// Pre-read ALL project files once so that each goroutine can build its
 	// cross-file context from memory rather than issuing O(n²) disk reads.
-	fileCache := make(map[string]string, len(targetFiles))
-	for _, f := range targetFiles {
+	// Using allFiles (not targetFiles) ensures pinned single-file edits still
+	// have full project context available.
+	fileCache := make(map[string]string, len(allFiles))
+	for _, f := range allFiles {
 		if f == nil || !f.IsReadable {
 			continue
 		}
@@ -2914,10 +2941,10 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			currentRelLower := strings.ToLower(f.RelPath)
 			currentDir := strings.ToLower(filepath.Dir(currentRelLower))
 			currentExt := strings.ToLower(filepath.Ext(currentRelLower))
-			candidates := make([]related, 0, len(targetFiles))
+			candidates := make([]related, 0, len(allFiles))
 
 			var ctxBuf strings.Builder
-			for _, other := range targetFiles {
+			for _, other := range allFiles {
 				if other == nil || other.RelPath == f.RelPath || !other.IsReadable {
 					continue
 				}
@@ -2980,29 +3007,43 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			var userPrompt string
 			fileSysPrompt := systemPrompt
 			if agentIsDocLikeFile(f.RelPath) {
-				// For doc files use a lean documentation-focused system prompt
-				// instead of the large code-editing one. Also replace source-code
-				// cross-file snippets with just a filename list so the model is not
-				// flooded with code it doesn't need to reproduce.
-				fileSysPrompt = agentDocWriterSystemPrompt
-				if changelog != "" {
-					fileSysPrompt += "\n\n" + changelog
+				// For doc files: call processQuestion exactly as Send does, then
+				// write the response to disk. This gives identical output quality.
+				progress(fmt.Sprintf("⚙️  Calling LLM for %s…", f.RelPath))
+				_, docContent, _, docErr := s.processQuestion(ctx, task, allFiles)
+				if docErr != nil {
+					progress(fmt.Sprintf("❌ %s — error", f.RelPath))
+					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: docErr.Error()}}
+					return
 				}
-				// Build a filename-only list from all scoped files for context.
-				var fileList strings.Builder
-				for _, other := range targetFiles {
-					if other != nil && other.RelPath != f.RelPath {
-						fmt.Fprintf(&fileList, "  %s\n", other.RelPath)
+				newContent := strings.TrimSpace(docContent)
+				if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
+					progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
+					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+					return
+				}
+				if !dryRun {
+					if err := os.WriteFile(absPath, []byte(newContent), 0o644); err != nil {
+						progress(fmt.Sprintf("❌ %s — write error", f.RelPath))
+						resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: err.Error()}}
+						return
 					}
+					s.markWrittenFile(f.RelPath)
+					progress(fmt.Sprintf("✅ %s — modified", f.RelPath))
+					s.mu.Lock()
+					s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: f.RelPath, Task: task})
+					s.mu.Unlock()
+				} else {
+					progress(fmt.Sprintf("📋 %s — proposed (awaiting confirmation)", f.RelPath))
 				}
-				userPrompt = fmt.Sprintf("Task: %s\n\nTarget file: %s\n\nCurrent content (may be empty):\n%s",
-					task, f.RelPath, oldContent)
-				if fileList.Len() > 0 {
-					userPrompt = fmt.Sprintf("Task: %s\n\nProject files (for reference, do NOT reproduce them):\n%s\nTarget file: %s\n\nCurrent content (may be empty):\n%s",
-						task, fileList.String(), f.RelPath, oldContent)
-				}
-				userPrompt += "\n\n" + agentDocumentationInstructions()
-				userPrompt += "\n\n" + s.agentProjectMetaBlock()
+				resultsCh <- indexedResult{idx, AgentFileResult{
+					File:       f.RelPath,
+					Changed:    true,
+					Pending:    dryRun,
+					OldContent: oldContent,
+					NewContent: newContent,
+				}}
+				return
 			} else if ctxBuf.Len() > 0 {
 				userPrompt = fmt.Sprintf(
 					"Related files for context (do NOT output these — only output the file you are asked to edit):\n\n%s\nFile to edit: %s\n\n%s\n\nTask: %s",
@@ -3061,20 +3102,6 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					PromptEvalCount: resp.PromptEvalCount,
 				}}
 				return
-			}
-
-			if agentIsDocLikeFile(f.RelPath) {
-				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, f.RelPath, oldContent, newContent)
-				if refineErr != nil {
-					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", f.RelPath, refineErr))
-				} else {
-					newContent = refined
-					if agentIsGarbageDocContent(issues) {
-						progress(fmt.Sprintf("⚠️ %s — documentation may be incomplete; try a larger/better model", f.RelPath))
-					} else if len(issues) > 0 {
-						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", f.RelPath, strings.Join(issues, "; ")))
-					}
-				}
 			}
 
 			if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
@@ -3566,6 +3593,16 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				}
 			}
 
+			// Sort: code files first, doc files last so README/docs are always
+			// generated after the code they describe is in alreadyGenerated.
+			sort.SliceStable(plannedFiles, func(i, j int) bool {
+				di, dj := agentIsDocLikeFile(plannedFiles[i]), agentIsDocLikeFile(plannedFiles[j])
+				if di == dj {
+					return false
+				}
+				return !di // code files (di=false) sort before doc files (di=true)
+			})
+
 			var planBuf strings.Builder
 			fmt.Fprintf(&planBuf, "📋 Plan: %d file(s) to create\n", len(plannedFiles))
 			for _, f := range plannedFiles {
@@ -3598,7 +3635,6 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 	var results []AgentFileResult
 	var summaryLines []string
 
-	// ── Step 3a: per-file generation (planning succeeded) ───────────────────
 	if len(plannedFiles) > 0 {
 		alreadyGenerated := map[string]string{} // relPath → content, for cross-file context
 
@@ -3627,15 +3663,13 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			}
 			if isDocFile {
 				userMsg.WriteString("\n")
-				userMsg.WriteString(agentDocumentationInstructions())
-				userMsg.WriteString("\n\n")
 				userMsg.WriteString(s.agentProjectMetaBlock())
 				userMsg.WriteString("\n")
 			}
 
 			sysPrompt := promptAgentCreateSingle
 			if isDocFile {
-				sysPrompt = agentDocWriterSystemPrompt
+				sysPrompt = promptAgentDoc
 			}
 			if changelog != "" {
 				sysPrompt += "\n\n" + changelog
@@ -3690,7 +3724,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				if data, readErr := os.ReadFile(absPath); readErr == nil {
 					existingDoc = string(data)
 				}
-				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent)
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent, "")
 				if refineErr != nil {
 					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
 				} else {
@@ -3730,7 +3764,6 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		}
 	}
 
-	// ── Step 3b: legacy single-call path (planning returned nothing) ─────────
 	if len(results) == 0 {
 		progress("⚙️  Calling LLM to create file(s)…")
 
@@ -3798,7 +3831,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				if data, readErr := os.ReadFile(absPath); readErr == nil {
 					existingDoc = string(data)
 				}
-				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent)
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent, "")
 				if refineErr != nil {
 					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
 				} else {
@@ -5863,6 +5896,199 @@ type prevFixAttempt struct {
 
 // runFixLoop detects the project's run/build command, executes it, and if it
 // fails sends the error to the LLM for a fix. Iterates up to maxFixAttempts.
+// unifiedDiff produces a minimal unified diff between before and after,
+// showing context lines of unchanged context around each changed block.
+// Returns an empty string when the two inputs are identical.
+func unifiedDiff(filename, before, after string, context int) string {
+	aLines := strings.Split(before, "\n")
+	bLines := strings.Split(after, "\n")
+
+	type hunk struct {
+		aStart, aLen int
+		bStart, bLen int
+		lines        []string
+	}
+
+	// Find changed line ranges using a simple LCS-free diff approach:
+	// build a map of (b line → indices in b) then walk a to find matching runs.
+	// For large files this is O(n²) worst case but adequate for typical source files.
+	type change struct{ aIdx, bIdx int }
+	var changes []change
+
+	ia, ib := 0, 0
+	for ia < len(aLines) && ib < len(bLines) {
+		if aLines[ia] == bLines[ib] {
+			ia++
+			ib++
+			continue
+		}
+		// Scan ahead to find the next matching pair (simple greedy, not LCS).
+		found := false
+		for lookahead := 1; lookahead <= 20; lookahead++ {
+			if ia+lookahead < len(aLines) && aLines[ia+lookahead] == bLines[ib] {
+				for k := 0; k < lookahead; k++ {
+					changes = append(changes, change{ia + k, -1})
+				}
+				ia += lookahead
+				found = true
+				break
+			}
+			if ib+lookahead < len(bLines) && aLines[ia] == bLines[ib+lookahead] {
+				for k := 0; k < lookahead; k++ {
+					changes = append(changes, change{-1, ib + k})
+				}
+				ib += lookahead
+				found = true
+				break
+			}
+		}
+		if !found {
+			changes = append(changes, change{ia, -1}, change{-1, ib})
+			ia++
+			ib++
+		}
+	}
+	for ; ia < len(aLines); ia++ {
+		changes = append(changes, change{ia, -1})
+	}
+	for ; ib < len(bLines); ib++ {
+		changes = append(changes, change{-1, ib})
+	}
+
+	if len(changes) == 0 {
+		return ""
+	}
+
+	// Build output lines in unified diff format.
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "--- %s\n+++ %s\n", filename, filename)
+
+	// Collect changed a/b indices.
+	changedA := map[int]bool{}
+	changedB := map[int]bool{}
+	for _, c := range changes {
+		if c.aIdx >= 0 {
+			changedA[c.aIdx] = true
+		}
+		if c.bIdx >= 0 {
+			changedB[c.bIdx] = true
+		}
+	}
+
+	// Emit hunks: for each changed line in a/b, print ±context lines.
+	type span struct{ start, end int } // inclusive line indices in a
+	var spans []span
+	for idx := range changedA {
+		s := idx - context
+		if s < 0 {
+			s = 0
+		}
+		e := idx + context
+		if e >= len(aLines) {
+			e = len(aLines) - 1
+		}
+		spans = append(spans, span{s, e})
+	}
+	for idx := range changedB {
+		s := idx - context
+		if s < 0 {
+			s = 0
+		}
+		e := idx + context
+		if e >= len(bLines) {
+			e = len(bLines) - 1
+		}
+		spans = append(spans, span{s, e})
+	}
+
+	if len(spans) == 0 {
+		return ""
+	}
+
+	// Merge overlapping spans (operating in a-space for simplicity).
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	merged := []span{spans[0]}
+	for _, sp := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if sp.start <= last.end+1 {
+			if sp.end > last.end {
+				last.end = sp.end
+			}
+		} else {
+			merged = append(merged, sp)
+		}
+	}
+
+	// Walk a and b together, emitting hunk headers + lines.
+	bCursor := 0
+	for _, sp := range merged {
+		// Count lines in this hunk.
+		aHunkLen := sp.end - sp.start + 1
+
+		// Walk b to find the b-start equivalent.
+		bStart := bCursor
+		// Advance bStart to align with sp.start in a (skipping deleted+added).
+		// Simple heuristic: walk together until a-index reaches sp.start.
+		aWalk, bWalk := 0, bCursor
+		for aWalk < sp.start && bWalk < len(bLines) {
+			if !changedA[aWalk] && !changedB[bWalk] {
+				aWalk++
+				bWalk++
+			} else if changedA[aWalk] {
+				aWalk++
+			} else {
+				bWalk++
+			}
+		}
+		bStart = bWalk
+
+		// Now emit from sp.start / bStart.
+		var hunkLines []string
+		ai, bi := sp.start, bStart
+		for ai <= sp.end || (bi < len(bLines) && changedB[bi]) {
+			if ai <= sp.end && bi < len(bLines) {
+				if !changedA[ai] && !changedB[bi] {
+					hunkLines = append(hunkLines, " "+aLines[ai])
+					ai++
+					bi++
+				} else {
+					if changedA[ai] {
+						hunkLines = append(hunkLines, "-"+aLines[ai])
+						ai++
+					}
+					if bi < len(bLines) && changedB[bi] {
+						hunkLines = append(hunkLines, "+"+bLines[bi])
+						bi++
+					}
+				}
+			} else if ai <= sp.end {
+				hunkLines = append(hunkLines, "-"+aLines[ai])
+				ai++
+			} else if bi < len(bLines) && changedB[bi] {
+				hunkLines = append(hunkLines, "+"+bLines[bi])
+				bi++
+			} else {
+				break
+			}
+		}
+		bCursor = bi
+
+		bHunkLen := 0
+		for _, l := range hunkLines {
+			if !strings.HasPrefix(l, "-") {
+				bHunkLen++
+			}
+		}
+
+		fmt.Fprintf(&sb, "@@ -%d,%d +%d,%d @@\n", sp.start+1, aHunkLen, bStart+1, bHunkLen)
+		for _, l := range hunkLines {
+			sb.WriteString(l + "\n")
+		}
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
+}
+
 func (s *Server) runFixLoop(ctx context.Context, task string, progress func(string)) (string, error) {
 	files := s.getActiveFilesSnapshot()
 
@@ -5999,6 +6225,18 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 		}
 		progress(fmt.Sprintf("📝 Proposed fix: %s", strings.Join(patchedNames, ", ")))
 
+		// Snapshot file contents before patching so we can show a diff after.
+		preSnapshots := map[string]string{}
+		for _, p := range patches {
+			if p.name == "" {
+				continue
+			}
+			absSnap := filepath.Clean(filepath.Join(s.directory, p.name))
+			if data, readErr := os.ReadFile(absSnap); readErr == nil {
+				preSnapshots[p.name] = string(data)
+			}
+		}
+
 		var appliedPatches []fixPatch
 		var appliedNames []string
 
@@ -6025,6 +6263,23 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 			progress("⚠️  No proposed changes were applied (all patches were rejected or invalid).")
 		} else {
 			progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(appliedNames, ", ")))
+			// Show a unified diff for each patched file.
+			for _, name := range appliedNames {
+				absPatched := filepath.Clean(filepath.Join(s.directory, name))
+				afterBytes, readErr := os.ReadFile(absPatched)
+				if readErr != nil {
+					continue
+				}
+				before := preSnapshots[name]
+				after := string(afterBytes)
+				if before == after {
+					continue
+				}
+				diff := unifiedDiff(name, before, after, 3)
+				if diff != "" {
+					progress(fmt.Sprintf("📄 Diff for %s:\n```diff\n%s\n```", name, diff))
+				}
+			}
 		}
 
 		recordedPatches := appliedPatches

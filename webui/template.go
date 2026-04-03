@@ -404,6 +404,7 @@ const htmlTemplate = `<!DOCTYPE html>
             </div>
             <input type="search" class="file-search" id="fileSearch" placeholder="Search files…">
             <div class="file-tree" id="fileTree"><span class="muted">Loading…</span></div>
+            <div id="pinBadge" style="display:none;font-size:0.75rem;padding:4px 8px;color:var(--accent);cursor:pointer" title="Click to clear pinned files" onclick="clearPins()"></div>
         </aside>
 
         <!-- Main content -->
@@ -528,6 +529,7 @@ const htmlTemplate = `<!DOCTYPE html>
 var allFiles       = [];      // FileEntry[] from /api/files
 var codeStore      = {};      // blockId -> {lang, file, code}
 var currentFile    = null;    // relPath of open file
+var pinnedFiles    = new Set(); // relPaths selected for targeted agent edits
 // autoApply: when false (default) chat code blocks are never
 // written automatically — the user must click ⚡ Apply explicitly.
 var autoApply      = false;
@@ -1133,10 +1135,12 @@ function sendAgentTask() {
     }
 
     // Use streaming fetch so we can update the status bubble live.
+    var agentBody = { task: txt };
+    if (pinnedFiles.size > 0) { agentBody.pinnedFiles = Array.from(pinnedFiles); }
     fetch('/api/agent/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task: txt }),
+        body: JSON.stringify(agentBody),
         signal: controller.signal
     }).then(function(resp) {
         if (!resp.ok || !resp.body) {
@@ -1858,8 +1862,31 @@ function renderTree(files) {
 function treeFileHTML(relPath) {
     var name  = relPath.split('/').pop();
     var safe  = relPath.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    return '<div class="tree-file" onclick="openFile(\'' + safe + '\')" data-path="' + esc(relPath) + '">' +
-           '<span>' + fileIcon(relPath) + '</span><span class="fname">' + esc(name) + '</span></div>';
+    var checked = pinnedFiles.has(relPath) ? ' checked' : '';
+    return '<div class="tree-file" data-path="' + esc(relPath) + '">' +
+           '<input type="checkbox" class="pin-cb" title="Pin for targeted edit"' + checked +
+           ' onclick="event.stopPropagation();togglePin(\'' + safe + '\',this)">' +
+           '<span onclick="openFile(\'' + safe + '\')">' + fileIcon(relPath) + '</span>' +
+           '<span class="fname" onclick="openFile(\'' + safe + '\')">' + esc(name) + '</span></div>';
+}
+
+function togglePin(relPath, cb) {
+    if (cb.checked) { pinnedFiles.add(relPath); } else { pinnedFiles.delete(relPath); }
+    updatePinBadge();
+}
+
+function updatePinBadge() {
+    var badge = document.getElementById('pinBadge');
+    if (!badge) return;
+    var n = pinnedFiles.size;
+    badge.textContent = n > 0 ? '\uD83D\uDCCC ' + n + ' pinned' : '';
+    badge.style.display = n > 0 ? 'inline' : 'none';
+}
+
+function clearPins() {
+    pinnedFiles.clear();
+    document.querySelectorAll('.pin-cb').forEach(function(cb){ cb.checked = false; });
+    updatePinBadge();
 }
 
 function highlightTreeFile(relPath) {
