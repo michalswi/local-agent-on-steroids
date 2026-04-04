@@ -53,6 +53,7 @@ var (
 	promptAgentCreateSingle = mustPrompt("prompts/agent_create_single.md")
 	promptAgentFix          = mustPrompt("prompts/agent_fix.md")
 	promptAgentDoc          = mustPrompt("prompts/agent_doc.md")
+	promptAgentPlan         = mustPrompt("prompts/agent_plan.md")
 )
 
 // AgentLogEntry records a single file operation performed by the agent.
@@ -296,9 +297,16 @@ func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
 	if len(changed)+len(created)+len(deleted) == 0 {
 		return
 	}
+	s.mu.RLock()
+	planText := s.planProgressText
+	s.mu.RUnlock()
+
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("## %s\n", time.Now().Format("2006-01-02")))
+	sb.WriteString(fmt.Sprintf("## %s\n", time.Now().Format("2006-01-02 15:04")))
 	sb.WriteString(fmt.Sprintf("Task: %s\n", task))
+	if strings.TrimSpace(planText) != "" {
+		sb.WriteString(fmt.Sprintf("Plan: %s\n", strings.TrimSpace(planText)))
+	}
 	if len(changed) > 0 {
 		sb.WriteString(fmt.Sprintf("Modified: %s\n", strings.Join(changed, ", ")))
 	}
@@ -629,7 +637,7 @@ func (s *Server) handleCommand(input string) string {
 		oldModel := s.model
 		s.model = newModel
 		s.cfg.LLM.Model = newModel
-		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, newModel, s.cfg.LLM.Timeout)
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, newModel, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
 		s.mu.Unlock()
 		return fmt.Sprintf("✅ Model switched: %s → %s\n\nYou can now continue asking questions.", oldModel, newModel)
 
@@ -1775,7 +1783,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		prevClient := s.llmClient
 		s.model = reqModel
 		s.cfg.LLM.Model = reqModel
-		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
 		s.mu.Unlock()
 		defer func() {
 			s.mu.Lock()
@@ -1985,7 +1993,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 		prevClient := s.llmClient
 		s.model = reqModel
 		s.cfg.LLM.Model = reqModel
-		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
 		s.mu.Unlock()
 		defer func() {
 			s.mu.Lock()
@@ -2241,8 +2249,7 @@ func agentIsMixedCodeAndDocsTask(task string) bool {
 	lower := strings.ToLower(task)
 	codeWords := []string{
 		"generate", "create", "write", "build", "implement", "scaffold",
-		"add ", "make ", "develop", "app", "application", "server",
-		"service", "function", "class", "module", "script",
+		"develop", "server", "service", "function", "class", "module", "script",
 	}
 	for _, w := range codeWords {
 		if strings.Contains(lower, w) {
@@ -2371,6 +2378,18 @@ func agentDocValidationIssues(content string) []string {
 	}
 
 	return issues
+}
+
+// agentIsSignificantlyShortened returns true when newContent is less than one
+// third of oldContent's length, indicating the model likely truncated or ignored
+// the existing file. Only fires when oldContent is substantial (>200 chars).
+func agentIsSignificantlyShortened(newContent, oldContent string) bool {
+	oldLen := len(strings.TrimSpace(oldContent))
+	newLen := len(strings.TrimSpace(newContent))
+	if oldLen < 200 {
+		return false
+	}
+	return newLen > 0 && newLen < oldLen/3
 }
 
 // agentIsGarbageDocContent returns true when the doc content is so minimal or
@@ -2887,9 +2906,9 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 	}
 
 	// crossFileContextLimit caps the total bytes of cross-file context injected
-	// into each per-file prompt. Additional caps keep fanout bounded.
-	const crossFileContextLimit = 24 * 1024
-	const crossFileMaxFiles = 3
+	// into each per-file prompt. With num_ctx=32768 there is room for ~64KB of
+	// context text alongside system prompt and output tokens.
+	const crossFileContextLimit = 64 * 1024
 	const crossFileSnippetBytes = 6 * 1024
 	taskLower := strings.ToLower(task)
 	taskTokenSet := promptTokenSet(task)
@@ -2999,9 +3018,6 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 
 			included := 0
 			for _, cand := range candidates {
-				if included >= crossFileMaxFiles {
-					break
-				}
 				if cand.score <= 0 {
 					continue
 				}
@@ -3016,20 +3032,121 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 			var userPrompt string
 			fileSysPrompt := systemPrompt
 			if agentIsDocLikeFile(f.RelPath) {
-				// For doc files: call processQuestion exactly as Send does, then
-				// write the response to disk. This gives identical output quality.
+				// For doc files: use promptAgentDoc so the doc-writer system prompt
+				// is always applied. Files are scored so entry-points and manifests
+				// appear first in the context window.
 				progress(fmt.Sprintf("⚙️  Calling LLM for %s…", f.RelPath))
-				_, docContent, _, docErr := s.processQuestion(ctx, task, allFiles)
+				type docCandidate struct {
+					info    *types.FileInfo
+					content string
+					score   int
+				}
+				docCands := make([]docCandidate, 0, len(allFiles))
+				for _, other := range allFiles {
+					if other == nil || other.RelPath == f.RelPath || !other.IsReadable {
+						continue
+					}
+					base := strings.ToLower(filepath.Base(other.RelPath))
+					sc := 0
+					for _, ep := range []string{"main.", "index.", "app.", "server.", "cmd."} {
+						if strings.HasPrefix(base, ep) {
+							sc += 10
+							break
+						}
+					}
+					for _, m := range []string{"go.mod", "package.json", "makefile", "dockerfile", "pyproject.toml", "requirements.txt", "cargo.toml"} {
+						if base == m {
+							sc += 8
+							break
+						}
+					}
+					if strings.HasPrefix(base, "config.") {
+						sc += 8
+					}
+					docCands = append(docCands, docCandidate{
+						info:    other,
+						content: fileCache[other.RelPath],
+						score:   sc,
+					})
+				}
+				sort.Slice(docCands, func(i, j int) bool {
+					if docCands[i].score == docCands[j].score {
+						return docCands[i].info.RelPath < docCands[j].info.RelPath
+					}
+					return docCands[i].score > docCands[j].score
+				})
+				var docCtxBuf strings.Builder
+				for _, dc := range docCands {
+					if dc.content != "" {
+						snippet := truncatePromptContent(dc.content, crossFileSnippetBytes)
+						fmt.Fprintf(&docCtxBuf, "=== %s ===\n%s\n\n", dc.info.RelPath, snippet)
+					} else {
+						fmt.Fprintf(&docCtxBuf, "=== %s ===\n(no content)\n\n", dc.info.RelPath)
+					}
+				}
+				var docUserMsg strings.Builder
+				fmt.Fprintf(&docUserMsg, "Task: %s\n\nGenerate ONLY the file: %s\n", task, f.RelPath)
+				if strings.TrimSpace(oldContent) != "" {
+					fmt.Fprintf(&docUserMsg, "\nExisting content of %s (preserve correct concrete content, improve and extend it):\n%s\n", f.RelPath, oldContent)
+				}
+				if docCtxBuf.Len() > 0 {
+					fmt.Fprintf(&docUserMsg, "\nProject source files — extract concrete details (commands, flags, config keys, env vars, ports, binary names, function names) from these to write accurate, detailed documentation:\n%s", docCtxBuf.String())
+				}
+				docUserMsg.WriteString("\n")
+				docUserMsg.WriteString(s.agentProjectMetaBlock())
+				docDocSysPrompt := promptAgentDoc
+				if changelog != "" {
+					docDocSysPrompt += "\n\n" + changelog
+				}
+				docChatReq := &llm.ChatRequest{
+					Model: s.cfg.LLM.Model,
+					Messages: []llm.Message{
+						{Role: "system", Content: docDocSysPrompt},
+						{Role: "user", Content: docUserMsg.String()},
+					},
+					Temperature: s.cfg.LLM.Temperature,
+				}
+				docResp, docErr := s.llmClient.Chat(ctx, docChatReq)
 				if docErr != nil {
 					progress(fmt.Sprintf("❌ %s — error", f.RelPath))
 					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: docErr.Error()}}
 					return
 				}
-				newContent := strings.TrimSpace(docContent)
+				newContent := strings.TrimSpace(agentStripFences(docResp.Message.Content))
 				if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
 					progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
 					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
 					return
+				}
+				// For simple doc updates (file already exists, not mixed code+docs), the
+				// first LLM call already saw the existing content — skip costly refinement
+				// passes which add latency without improving quality for small models.
+				isSimpleDocUpdate := strings.TrimSpace(oldContent) != "" && !agentIsMixedCodeAndDocsTask(task)
+				var refineIssues []string
+				if !isSimpleDocUpdate {
+					refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, f.RelPath, oldContent, newContent, "")
+					if refineErr != nil {
+						progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", f.RelPath, refineErr))
+					} else {
+						newContent = refined
+						refineIssues = issues
+					}
+				} else {
+					refineIssues = agentDocValidationIssues(newContent)
+				}
+				// Garbage guard: when output is too short/malformed OR significantly
+				// shorter than existing content, don't overwrite — keep existing content.
+				isGarbage := agentIsGarbageDocContent(refineIssues) ||
+					agentIsSignificantlyShortened(newContent, oldContent)
+				if isGarbage {
+					if strings.TrimSpace(oldContent) != "" {
+						progress(fmt.Sprintf("— %s — model output too short/malformed; keeping existing content (try a larger model)", f.RelPath))
+						resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+						return
+					}
+					progress(fmt.Sprintf("⚠️ %s — documentation may be incomplete; try a larger/better model", f.RelPath))
+				} else if len(refineIssues) > 0 {
+					progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", f.RelPath, strings.Join(refineIssues, "; ")))
 				}
 				if !dryRun {
 					if err := os.WriteFile(absPath, []byte(newContent), 0o644); err != nil {
@@ -3178,7 +3295,14 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 				break
 			}
 		}
-		if noErrors {
+		allDocTargets := true
+		for _, f := range targetFiles {
+			if f != nil && !agentIsDocLikeFile(f.RelPath) {
+				allDocTargets = false
+				break
+			}
+		}
+		if noErrors && !allDocTargets {
 			progress("🔄 No existing files need changes — routing to file creation…")
 			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
 		}
@@ -3514,28 +3638,10 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 		userMsg += "\n\nExisting files in the project:\n" + strings.Join(ctxNames, "\n")
 	}
 
-	planPrompt := "You are a project planning agent. " +
-		"Given a task, list EVERY file that must be created to fully complete it. " +
-		"Output one file per line using this exact format:\n" +
-		"  filename | description of what this file owns and is responsible for | comma-separated dependencies (or empty)\n\n" +
-		"Rules:\n" +
-		"- Each filename must include the correct extension (e.g. main.go, variables.tf, server.py).\n" +
-		"- The description must state what symbols, types, functions, or logic this file OWNS. " +
-		"Other files must NOT redefine those.\n" +
-		"- Dependencies are other files in this plan that this file imports or references.\n" +
-		"- Include all boilerplate files needed to make the project runnable " +
-		"(e.g. go.mod, package.json, requirements.txt, Makefile).\n" +
-		"- No markdown, no numbering, no extra text — only lines in the format above.\n\n" +
-		"Examples:\n" +
-		"  main.go | entry point; owns main(); wires HTTP server | vars.go,handlers.go\n" +
-		"  vars.go | owns all shared variables and configuration constants (AppConfig, Version) |\n" +
-		"  handlers.go | HTTP request handlers only; owns HandleFoo, HandleBar | vars.go\n" +
-		"  README.md | project documentation | main.go,handlers.go,vars.go"
-
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
 		Messages: []llm.Message{
-			{Role: "system", Content: planPrompt},
+			{Role: "system", Content: promptAgentPlan},
 			{Role: "user", Content: userMsg},
 		},
 		Temperature: 0.2, // low temp: we want a deterministic, factual list
@@ -3656,6 +3762,18 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		// The user explicitly named a file, so avoid broad multi-file planning.
 		plan = []PlannedFile{{File: explicit}}
 		progress(fmt.Sprintf("📋 Plan: explicit target %s (planning skipped)", explicit))
+	} else if agentIsDocsIntent(task) && !agentIsMixedCodeAndDocsTask(task) {
+		// Pure doc-only task — skip the planning LLM call and target the doc
+		// file directly to save one round-trip.
+		target := "README.md"
+		for _, m := range agentFileMentionsFromTask(task) {
+			if agentIsDocLikeFile(m) {
+				target = m
+				break
+			}
+		}
+		plan = []PlannedFile{{File: target}}
+		progress(fmt.Sprintf("📋 Plan: pure docs task, targeting %s (planning skipped)", target))
 	} else {
 		// Ask the model which files are needed. This small focused call is far more
 		// reliable than asking a small LLM to plan AND generate in one shot.
@@ -5934,7 +6052,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if req.Model != nil && strings.TrimSpace(*req.Model) != "" {
 			s.model = strings.TrimSpace(*req.Model)
 			s.cfg.LLM.Model = s.model
-			s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, s.model, s.cfg.LLM.Timeout)
+			s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, s.model, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
 		}
 		if req.Temperature != nil {
 			s.cfg.LLM.Temperature = *req.Temperature
@@ -6692,15 +6810,138 @@ func agentFetchGitRemoteURL(dir string) string {
 	return strings.TrimSpace(stdout)
 }
 
-// agentProjectMetaBlock returns a small context block with repository-specific
-// facts (directory name, remote URL) that the LLM should use when writing
-// README / documentation files, so it never falls back to generic placeholders.
+// agentDetectProjectName reads common manifest files to find the canonical
+// project/module name. Falls back to the directory name if nothing is found.
+func agentDetectProjectName(dir string) string {
+	// go.mod — take last path segment of the module declaration
+	if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "module ") {
+				mod := strings.TrimSpace(strings.TrimPrefix(line, "module "))
+				if parts := strings.Split(mod, "/"); len(parts) > 0 {
+					return parts[len(parts)-1]
+				}
+			}
+		}
+	}
+	// package.json — "name" field
+	if data, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
+		var pkg struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(data, &pkg) == nil && pkg.Name != "" {
+			return pkg.Name
+		}
+	}
+	// Cargo.toml — name = "..."
+	if data, err := os.ReadFile(filepath.Join(dir, "Cargo.toml")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "name") && strings.Contains(line, "=") {
+				parts := strings.SplitN(line, "=", 2)
+				if len(parts) == 2 {
+					name := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+					if name != "" {
+						return name
+					}
+				}
+			}
+		}
+	}
+	return filepath.Base(filepath.Clean(dir))
+}
+
+// agentDetectBuildCommands scans common manifest and build files to produce
+// concrete build/run commands for the project's Getting Started section.
+func agentDetectBuildCommands(dir string) string {
+	var cmds []string
+	// go.mod → go build / go run / go test
+	if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+		modName := ""
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "module ") {
+				modName = strings.TrimSpace(strings.TrimPrefix(line, "module "))
+			}
+		}
+		if modName != "" {
+			parts := strings.Split(modName, "/")
+			binName := parts[len(parts)-1]
+			cmds = append(cmds,
+				"go build -o "+binName+" .",
+				"go run .",
+				"go test ./...",
+			)
+		}
+	}
+	// package.json → npm scripts (build, start, dev)
+	if data, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
+		var pkg struct {
+			Scripts map[string]string `json:"scripts"`
+		}
+		if json.Unmarshal(data, &pkg) == nil {
+			for _, key := range []string{"build", "start", "dev"} {
+				if v, ok := pkg.Scripts[key]; ok {
+					cmds = append(cmds, fmt.Sprintf("npm run %s  # %s", key, v))
+				}
+			}
+		}
+	}
+	// Makefile → first few non-trivial targets
+	if data, err := os.ReadFile(filepath.Join(dir, "Makefile")); err == nil {
+		count := 0
+		for _, line := range strings.Split(string(data), "\n") {
+			if count >= 5 {
+				break
+			}
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "\t") {
+				continue
+			}
+			if idx := strings.Index(trimmed, ":"); idx > 0 {
+				target := strings.TrimSpace(trimmed[:idx])
+				if target != "" && !strings.Contains(target, " ") {
+					cmds = append(cmds, "make "+target)
+					count++
+				}
+			}
+		}
+	}
+	// Dockerfile → ENTRYPOINT / CMD lines
+	if data, err := os.ReadFile(filepath.Join(dir, "Dockerfile")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			upper := strings.ToUpper(strings.TrimSpace(line))
+			if strings.HasPrefix(upper, "ENTRYPOINT") || strings.HasPrefix(upper, "CMD") {
+				cmds = append(cmds, "Docker: "+strings.TrimSpace(line))
+			}
+		}
+	}
+	// Python
+	if _, err := os.Stat(filepath.Join(dir, "requirements.txt")); err == nil {
+		cmds = append(cmds, "pip install -r requirements.txt")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pyproject.toml")); err == nil {
+		cmds = append(cmds, "pip install -e .")
+	}
+	if len(cmds) == 0 {
+		return ""
+	}
+	return strings.Join(cmds, "\n")
+}
+
+// agentProjectMetaBlock returns a context block with repository-specific facts
+// (project name, directory, remote URL, detected build commands) that the LLM
+// should use when writing README / documentation files.
 func (s *Server) agentProjectMetaBlock() string {
 	dirName := filepath.Base(filepath.Clean(s.directory))
+	projectName := agentDetectProjectName(s.directory)
 	remoteURL := agentFetchGitRemoteURL(s.directory)
+	buildCmds := agentDetectBuildCommands(s.directory)
 
 	var b strings.Builder
 	b.WriteString("Project metadata for documentation (use these exact values):\n")
+	fmt.Fprintf(&b, "- Project name: %s\n", projectName)
 	fmt.Fprintf(&b, "- Local directory name: %s\n", dirName)
 	if remoteURL != "" {
 		fmt.Fprintf(&b, "- Repository URL: %s\n", remoteURL)
@@ -6708,6 +6949,12 @@ func (s *Server) agentProjectMetaBlock() string {
 		fmt.Fprintf(&b, "  Then: cd %s\n", dirName)
 	} else {
 		b.WriteString("- No remote repository found. Do NOT include a \"git clone\" step; the user already has the source code.\n")
+	}
+	if buildCmds != "" {
+		b.WriteString("- Detected build/run commands (use these verbatim in Getting Started):\n")
+		for _, line := range strings.Split(buildCmds, "\n") {
+			fmt.Fprintf(&b, "  %s\n", line)
+		}
 	}
 	return b.String()
 }

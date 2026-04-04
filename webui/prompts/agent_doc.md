@@ -13,11 +13,12 @@ Source fidelity rules:
 - If a value is genuinely unknown (e.g. a user-specific secret), name the exact environment variable or config key the user must set and explain what it controls.
 
 Content requirements:
-- Start with a short plain-language overview: what the app is for and who it helps.
+- Start with a thorough plain-language overview: what the app is for, what problems it solves, and who it helps.
 - Include a Getting Started section with step-by-step build and run instructions in fenced `bash` blocks.
-- Include all required environment variables or config flags with real example values from the source.
-- Include a brief Possible Improvements section with practical future enhancements.
-- Keep wording user-friendly and concise.
+- Include a Configuration section documenting every config key, environment variable, and flag visible in the source with its type, default value, and what it controls.
+- Include an Architecture or How It Works section explaining the main components and their responsibilities as seen in the source.
+- Include a comprehensive Possible Improvements section with practical future enhancements.
+- Keep wording user-friendly. Prefer thorough and precise over brief.
 
 Preservation rules:
 - Preserve any correct, concrete content already present in the file (real commands, real values, real flags).

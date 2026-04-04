@@ -38,6 +38,7 @@ type LLMConfig struct {
 	APIKey      string  `yaml:"api_key,omitempty" json:"api_key,omitempty"`
 	Temperature float64 `yaml:"temperature" json:"temperature"`
 	Timeout     int     `yaml:"timeout" json:"timeout"` // seconds
+	NumCtx      int     `yaml:"num_ctx" json:"num_ctx"` // Ollama context window tokens (0 = use Ollama default)
 }
 
 // FilterConfig contains file filtering rules
@@ -81,11 +82,12 @@ func DefaultConfig() *Config {
 		LLM: LLMConfig{
 			Provider: "ollama",
 			Endpoint: "http://localhost:11434",
-			Model: "wizardlm2:7b", // https://ollama.com/library/wizardlm2
+			Model:    "wizardlm2:7b", // https://ollama.com/library/wizardlm2
 			// Model: "gemma3:4b", // https://ollama.com/library/gemma3
 			// Model: "gemma4:e4b", // https://ollama.com/library/gemma4
-			Temperature: 0.3, // 0.1 might be too conservative..
-			Timeout:     300, // 5 minutes for large batches
+			Temperature: 0.3,   // 0.1 might be too conservative..
+			Timeout:     300,   // 5 minutes for large batches
+			NumCtx:      32768, // 32K context; set to 0 to use Ollama default (4096)
 		},
 		Filters: FilterConfig{
 			RespectGitignore: true,

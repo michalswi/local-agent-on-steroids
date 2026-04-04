@@ -136,13 +136,18 @@ There are three distinct system prompts used internally, each targeting a differ
 |---|---|
 | `webui/prompts/chat.md` | **Send** button — plain conversation, no file writes |
 | `webui/prompts/agent_edit.md` | **⚡ Agent** button — applied per-file in a parallel loop |
+| `webui/prompts/agent_doc.md` | **⚡ Agent** on `.md` / doc files — documentation writer prompt |
 | `webui/prompts/agent_create.md` | Agent legacy path — multi-file scaffold in a single LLM call |
 | `webui/prompts/agent_create_single.md` | Agent per-file path — one focused LLM call per planned file (code files only) |
 | `webui/prompts/agent_fix.md` | **🔧 Run & Fix** button — language-agnostic fix prompt used in each repair iteration |
 
 All prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, session changelog, and **project memory**) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
 
-Documentation files (`README.md`, `*.md`, `docs/`) always use a shared internal doc-writer system prompt instead of the code-generation prompts, regardless of which operation triggered the call.
+Documentation files (`README.md`, `*.md`, `docs/`) always use `agent_doc.md` instead of the code-generation prompts. The doc path additionally receives:
+- **Existing file content** — so the model can preserve and extend what is already correct rather than rewriting from scratch
+- **Prioritised source snippets** — entry-point files (`main.*`, `index.*`, `server.*`) and manifests (`go.mod`, `package.json`, `Makefile`, `Dockerfile`) appear first in the context window
+- **Detected build/run commands** — extracted from `go.mod`, `package.json` scripts, `Makefile` targets, and `Dockerfile` `ENTRYPOINT`/`CMD` lines so Getting Started instructions use the real commands
+- **Canonical project name** — parsed from the module declaration (`go.mod`, `package.json`, `Cargo.toml`) instead of the local directory name
 
 ## \# External API
 

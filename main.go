@@ -86,7 +86,7 @@ func main() {
 	}
 
 	// Initialize LLM client
-	llmClient := llm.NewOllamaClient(cfg.LLM.Endpoint, cfg.LLM.Model, cfg.LLM.Timeout)
+	llmClient := llm.NewOllamaClient(cfg.LLM.Endpoint, cfg.LLM.Model, cfg.LLM.Timeout, cfg.LLM.NumCtx)
 
 	// Handle health check
 	if *checkHealth {
