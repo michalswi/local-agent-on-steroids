@@ -1249,6 +1249,15 @@ type ExtSendRequest struct {
 	Model   string `json:"model"` // optional per-request model override
 }
 
+// PlannedFile is one entry in the project file plan produced by runAgentPlan.
+// It carries the file path, a description of what the file owns/does, and
+// which other planned files it depends on (used for generation ordering).
+type PlannedFile struct {
+	File        string   // relative path, e.g. "handlers/user.go"
+	Description string   // what this file owns and is responsible for
+	DependsOn   []string // other planned files this file imports or references
+}
+
 // AgentFileResult describes what the agent did with one file.
 type AgentFileResult struct {
 	File    string `json:"file"`
@@ -2422,14 +2431,14 @@ func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, o
 			existingForRefinement = "(none — write from scratch)"
 		}
 		userPrompt := fmt.Sprintf(
-"Task: %s\n\nTarget file: %s\n\nExisting content:\n%s\n\n%s%s\n\nProblems to fix:\n%sReturn a complete replacement file.\n\n%s",
-		task,
-		filePath,
-		existingForRefinement,
-		srcSection,
-		draftNote,
-		issueList.String(),
-		s.agentProjectMetaBlock(),
+			"Task: %s\n\nTarget file: %s\n\nExisting content:\n%s\n\n%s%s\n\nProblems to fix:\n%sReturn a complete replacement file.\n\n%s",
+			task,
+			filePath,
+			existingForRefinement,
+			srcSection,
+			draftNote,
+			issueList.String(),
+			s.agentProjectMetaBlock(),
 		)
 
 		chatReq := &llm.ChatRequest{
@@ -3489,9 +3498,10 @@ func agentExplicitFilenameFromTask(task string) string {
 }
 
 // runAgentPlan asks the LLM which files need to be created for the task.
-// It returns a deduplicated, sanitized list of filenames. This is a cheap
-// "thinking" call — the model only returns names, not content.
-func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*types.FileInfo) ([]string, error) {
+// It returns a deduplicated list of PlannedFile entries each with a description
+// of what the file owns and its declared dependencies. This is a cheap
+// "thinking" call — the model only plans, it does not generate content.
+func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*types.FileInfo) ([]PlannedFile, error) {
 	// Build a brief context summary (just filenames, not content — keep tokens low).
 	var ctxNames []string
 	for _, cf := range contextFiles {
@@ -3506,11 +3516,21 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 
 	planPrompt := "You are a project planning agent. " +
 		"Given a task, list EVERY file that must be created to fully complete it. " +
-		"Output ONLY the filenames, one per line — no explanations, no numbers, no markdown, no extra text. " +
-		"Include all files needed (e.g. for a standalone Go app: main.go and go.mod; " +
-		"for Terraform: main.tf, variables.tf, providers.tf; " +
-		"for a Python service: main.py, requirements.txt). " +
-		"Always include config/dependency files required to make the project runnable."
+		"Output one file per line using this exact format:\n" +
+		"  filename | description of what this file owns and is responsible for | comma-separated dependencies (or empty)\n\n" +
+		"Rules:\n" +
+		"- Each filename must include the correct extension (e.g. main.go, variables.tf, server.py).\n" +
+		"- The description must state what symbols, types, functions, or logic this file OWNS. " +
+		"Other files must NOT redefine those.\n" +
+		"- Dependencies are other files in this plan that this file imports or references.\n" +
+		"- Include all boilerplate files needed to make the project runnable " +
+		"(e.g. go.mod, package.json, requirements.txt, Makefile).\n" +
+		"- No markdown, no numbering, no extra text — only lines in the format above.\n\n" +
+		"Examples:\n" +
+		"  main.go | entry point; owns main(); wires HTTP server | vars.go,handlers.go\n" +
+		"  vars.go | owns all shared variables and configuration constants (AppConfig, Version) |\n" +
+		"  handlers.go | HTTP request handlers only; owns HandleFoo, HandleBar | vars.go\n" +
+		"  README.md | project documentation | main.go,handlers.go,vars.go"
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
@@ -3526,12 +3546,14 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 		return nil, err
 	}
 
-	// Parse the response: one filename per line.
+	// Parse the response: one entry per line in "filename | description | deps" format.
 	seen := map[string]bool{}
-	var files []string
+	var files []PlannedFile
 	for _, line := range strings.Split(resp.Message.Content, "\n") {
-		name := agentSanitizeFilename(strings.TrimSpace(line))
-		// Skip empty lines, lines that look like prose (contain spaces after sanitizing)
+		line = strings.TrimSpace(line)
+		parts := strings.SplitN(line, "|", 3)
+		name := agentSanitizeFilename(strings.TrimSpace(parts[0]))
+		// Skip empty lines, lines that look like prose (contain spaces in the filename).
 		if name == "" || strings.Contains(name, " ") {
 			continue
 		}
@@ -3544,12 +3566,84 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 		if knownNonFilenames[strings.ToLower(name)] {
 			continue
 		}
-		if !seen[name] {
-			seen[name] = true
-			files = append(files, name)
+		if seen[name] {
+			continue
 		}
+		seen[name] = true
+		desc := ""
+		if len(parts) >= 2 {
+			desc = strings.TrimSpace(parts[1])
+		}
+		var deps []string
+		if len(parts) >= 3 {
+			for _, d := range strings.Split(parts[2], ",") {
+				if dep := agentSanitizeFilename(strings.TrimSpace(d)); dep != "" {
+					deps = append(deps, dep)
+				}
+			}
+		}
+		files = append(files, PlannedFile{File: name, Description: desc, DependsOn: deps})
 	}
 	return files, nil
+}
+
+// topoSortPlannedFiles orders files so each dependency comes before the files
+// that depend on it (Kahn's algorithm). Doc-like files are always placed last
+// regardless of declared dependencies. Falls back to original order on cycle.
+func topoSortPlannedFiles(files []PlannedFile) []PlannedFile {
+	if len(files) <= 1 {
+		return files
+	}
+	idx := make(map[string]int, len(files))
+	for i, f := range files {
+		idx[f.File] = i
+	}
+	// adj[j] = list of file indices that depend on file[j] (j must come first).
+	adj := make([][]int, len(files))
+	inDegree := make([]int, len(files))
+	for i, f := range files {
+		for _, dep := range f.DependsOn {
+			j, ok := idx[dep]
+			if !ok {
+				continue // dep not in plan, ignore
+			}
+			adj[j] = append(adj[j], i)
+			inDegree[i]++
+		}
+	}
+	queue := make([]int, 0, len(files))
+	for i := range files {
+		if inDegree[i] == 0 {
+			queue = append(queue, i)
+		}
+	}
+	result := make([]PlannedFile, 0, len(files))
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		result = append(result, files[cur])
+		for _, next := range adj[cur] {
+			inDegree[next]--
+			if inDegree[next] == 0 {
+				queue = append(queue, next)
+			}
+		}
+	}
+	if len(result) != len(files) {
+		// Cycle detected — fall back to original order.
+		result = files
+	}
+	// Always place doc-like files last regardless of dependency order.
+	code := make([]PlannedFile, 0, len(result))
+	docs := make([]PlannedFile, 0, 2)
+	for _, f := range result {
+		if agentIsDocLikeFile(f.File) {
+			docs = append(docs, f)
+		} else {
+			code = append(code, f)
+		}
+	}
+	return append(code, docs...)
 }
 
 // runAgentCreate handles the case where one or more new files must be created
@@ -3557,56 +3651,67 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 // generates each file with a focused, isolated LLM prompt.
 func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles []*types.FileInfo, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
 	// ── Step 1: planning call (or explicit single-file shortcut) ───────────
-	var plannedFiles []string
+	var plan []PlannedFile
 	if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
 		// The user explicitly named a file, so avoid broad multi-file planning.
-		plannedFiles = []string{explicit}
+		plan = []PlannedFile{{File: explicit}}
 		progress(fmt.Sprintf("📋 Plan: explicit target %s (planning skipped)", explicit))
 	} else {
 		// Ask the model which files are needed. This small focused call is far more
 		// reliable than asking a small LLM to plan AND generate in one shot.
 		progress("🗺️  Planning: asking LLM which files to create…")
 		var err error
-		plannedFiles, err = s.runAgentPlan(ctx, task, contextFiles)
+		plan, err = s.runAgentPlan(ctx, task, contextFiles)
 		if err != nil {
 			return "", nil, fmt.Errorf("agent plan step failed: %w", err)
 		}
-		if len(plannedFiles) == 0 {
+		if len(plan) == 0 {
 			// Planning failed silently (model returned only prose). Fall back to
 			// the legacy single-call path.
 			progress("⚠️  Planning returned no files — falling back to single-file mode…")
-			plannedFiles = nil
+			plan = nil
 		} else {
 			if agentIsDocsIntent(task) && !agentIsMixedCodeAndDocsTask(task) {
-				filtered, blocked := filterPlannedFilesForDocsIntent(task, plannedFiles)
+				plannedFileNames := make([]string, len(plan))
+				for i, pf := range plan {
+					plannedFileNames[i] = pf.File
+				}
+				filtered, blocked := filterPlannedFilesForDocsIntent(task, plannedFileNames)
 				if len(blocked) > 0 {
 					progress(fmt.Sprintf("🛡️  Docs guard blocked non-doc planned files: %s", strings.Join(blocked, ", ")))
 				}
-				plannedFiles = filtered
-				if len(plannedFiles) == 0 {
-					if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
-						plannedFiles = []string{explicit}
-					} else {
-						plannedFiles = []string{"README.md"}
+				filteredSet := make(map[string]bool, len(filtered))
+				for _, f := range filtered {
+					filteredSet[f] = true
+				}
+				filteredPlan := make([]PlannedFile, 0, len(filtered))
+				for _, pf := range plan {
+					if filteredSet[pf.File] {
+						filteredPlan = append(filteredPlan, pf)
 					}
-					progress(fmt.Sprintf("📋 Plan: docs fallback target %s", plannedFiles[0]))
+				}
+				plan = filteredPlan
+				if len(plan) == 0 {
+					if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
+						plan = []PlannedFile{{File: explicit}}
+					} else {
+						plan = []PlannedFile{{File: "README.md"}}
+					}
+					progress(fmt.Sprintf("📋 Plan: docs fallback target %s", plan[0].File))
 				}
 			}
 
-			// Sort: code files first, doc files last so README/docs are always
-			// generated after the code they describe is in alreadyGenerated.
-			sort.SliceStable(plannedFiles, func(i, j int) bool {
-				di, dj := agentIsDocLikeFile(plannedFiles[i]), agentIsDocLikeFile(plannedFiles[j])
-				if di == dj {
-					return false
-				}
-				return !di // code files (di=false) sort before doc files (di=true)
-			})
+			// Sort: deps-first topological order, doc files always last.
+			plan = topoSortPlannedFiles(plan)
 
 			var planBuf strings.Builder
-			fmt.Fprintf(&planBuf, "📋 Plan: %d file(s) to create\n", len(plannedFiles))
-			for _, f := range plannedFiles {
-				fmt.Fprintf(&planBuf, "  • %s\n", f)
+			fmt.Fprintf(&planBuf, "📋 Plan: %d file(s) to create\n", len(plan))
+			for _, pf := range plan {
+				if pf.Description != "" {
+					fmt.Fprintf(&planBuf, "  • %s — %s\n", pf.File, pf.Description)
+				} else {
+					fmt.Fprintf(&planBuf, "  • %s\n", pf.File)
+				}
 			}
 			progress(planBuf.String())
 		}
@@ -3615,8 +3720,8 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 	// ── Step 2: build context block ─────────────────────────────────────────
 	// For doc files, only a filename list is needed — dumping full source code
 	// overwhelms small local models when all they need to write is prose.
-	var ctxBuf strings.Builder       // full file content (non-doc files)
-	var ctxFileList strings.Builder  // filename-only list (used for doc files)
+	var ctxBuf strings.Builder      // full file content (non-doc files)
+	var ctxFileList strings.Builder // filename-only list (used for doc files)
 	for _, cf := range contextFiles {
 		if cf == nil || !cf.IsReadable {
 			continue
@@ -3635,16 +3740,36 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 	var results []AgentFileResult
 	var summaryLines []string
 
-	if len(plannedFiles) > 0 {
+	// Build the plan block once — injected into every per-file prompt so each
+	// file knows what its siblings own and avoids redefining those symbols.
+	var planBlockBuf strings.Builder
+	if len(plan) > 1 {
+		planBlockBuf.WriteString("\nProject file plan (responsibilities of every file being created):\n")
+		for _, pf := range plan {
+			if pf.Description != "" {
+				fmt.Fprintf(&planBlockBuf, "  %s — %s\n", pf.File, pf.Description)
+			} else {
+				fmt.Fprintf(&planBlockBuf, "  %s\n", pf.File)
+			}
+		}
+		planBlockBuf.WriteString("Do NOT define symbols or logic that are owned by other files listed above.\n")
+	}
+	planBlock := planBlockBuf.String()
+
+	if len(plan) > 0 {
 		alreadyGenerated := map[string]string{} // relPath → content, for cross-file context
 
-		for i, fileName := range plannedFiles {
-			progress(fmt.Sprintf("⚙️  Generating %s (%d/%d)…", fileName, i+1, len(plannedFiles)))
+		for i, pf := range plan {
+			fileName := pf.File
+			progress(fmt.Sprintf("⚙️  Generating %s (%d/%d)…", fileName, i+1, len(plan)))
 			isDocFile := agentIsDocLikeFile(fileName)
 
 			// Build a focused prompt for this single file.
 			var userMsg strings.Builder
 			fmt.Fprintf(&userMsg, "Task: %s\n\nGenerate ONLY the file: %s\n", task, fileName)
+			if !isDocFile && planBlock != "" {
+				userMsg.WriteString(planBlock)
+			}
 			if isDocFile {
 				// Filename list only — no source code contents.
 				if ctxFileList.Len() > 0 {
@@ -3761,6 +3886,12 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				Pending: dryRun, OldContent: "", NewContent: fileContent,
 				PromptEvalCount: resp.PromptEvalCount,
 			})
+		}
+		// Post-generation consistency check: a single cheap LLM call to surface
+		// duplicate symbols or mismatched signatures — no files are modified.
+		if !dryRun && len(alreadyGenerated) >= 2 {
+			progress("🔍 Running consistency check across generated files…")
+			s.runAgentConsistencyCheck(ctx, task, alreadyGenerated, progress)
 		}
 	}
 
@@ -3880,6 +4011,43 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			len(results), strings.Join(summaryLines, "\n"))
 	}
 	return summary, results, nil
+}
+
+// runAgentConsistencyCheck runs a cheap LLM analysis across all generated files
+// to surface duplicate symbols, mismatched signatures, or missing imports.
+// It never modifies files — findings are emitted via progress messages only.
+func (s *Server) runAgentConsistencyCheck(ctx context.Context, task string, generated map[string]string, progress func(string)) {
+	if len(generated) < 2 {
+		return
+	}
+	var fileBuf strings.Builder
+	for name, content := range generated {
+		fmt.Fprintf(&fileBuf, "=== %s ===\n%s\n\n", name, content)
+	}
+	sysPrompt := "You are a code review agent. Analyze the provided source files and list ONLY concrete problems: " +
+		"duplicate symbol definitions across files, mismatched function or type signatures between files, " +
+		"or clearly missing imports or references. " +
+		"If no problems are found, output exactly: OK. " +
+		"Do not suggest style improvements or optional enhancements. Be concise."
+	userMsg := fmt.Sprintf("Task that generated these files: %s\n\nGenerated files:\n%s", task, fileBuf.String())
+	chatReq := &llm.ChatRequest{
+		Model: s.cfg.LLM.Model,
+		Messages: []llm.Message{
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: userMsg},
+		},
+		Temperature: 0.1,
+	}
+	resp, err := s.llmClient.Chat(ctx, chatReq)
+	if err != nil || strings.TrimSpace(resp.Message.Content) == "" {
+		return
+	}
+	issues := strings.TrimSpace(resp.Message.Content)
+	if strings.EqualFold(issues, "ok") {
+		progress("✅ Consistency check: no issues found")
+		return
+	}
+	progress("⚠️ Consistency check findings:\n" + issues)
 }
 
 // agentTemperature returns a temperature suitable for agent code-editing tasks.
@@ -4398,11 +4566,12 @@ func attemptDeterministicManifestRepair(workDir, manifestFile string) (bool, str
 // so the LLM stops guessing non-existent names.
 //
 // Supported patterns:
-//   Go:     undefined: pkg.Symbol
-//   Python: cannot import name 'Symbol' from 'pkg'
-//           module 'pkg' has no attribute 'Symbol'
-//   JS/TS:  Module '"pkg"' has no exported member 'Symbol'
-//           Property 'Symbol' does not exist on type ...
+//
+//	Go:     undefined: pkg.Symbol
+//	Python: cannot import name 'Symbol' from 'pkg'
+//	        module 'pkg' has no attribute 'Symbol'
+//	JS/TS:  Module '"pkg"' has no exported member 'Symbol'
+//	        Property 'Symbol' does not exist on type ...
 func buildMissingSymbolGuidance(workDir, errorOutput string) string {
 	type hint struct {
 		pkg string
@@ -4655,22 +4824,22 @@ type dependencyInstallPlan struct {
 // provide them. Used when a tool is invoked in scripts but not declared as
 // a dependency, so we know exactly what to install.
 var npmToolPackages = map[string][]string{
-	"webpack":        {"webpack", "webpack-cli"},
-	"webpack-cli":    {"webpack-cli"},
-	"vite":           {"vite"},
-	"esbuild":        {"esbuild"},
-	"rollup":         {"rollup"},
-	"parcel":         {"parcel"},
-	"tsc":            {"typescript"},
-	"ts-node":        {"ts-node"},
-	"ts-node-esm":    {"ts-node"},
-	"eslint":         {"eslint"},
-	"prettier":       {"prettier"},
-	"jest":           {"jest"},
-	"vitest":         {"vitest"},
-	"mocha":          {"mocha"},
-	"nodemon":        {"nodemon"},
-	"concurrently":   {"concurrently"},
+	"webpack":      {"webpack", "webpack-cli"},
+	"webpack-cli":  {"webpack-cli"},
+	"vite":         {"vite"},
+	"esbuild":      {"esbuild"},
+	"rollup":       {"rollup"},
+	"parcel":       {"parcel"},
+	"tsc":          {"typescript"},
+	"ts-node":      {"ts-node"},
+	"ts-node-esm":  {"ts-node"},
+	"eslint":       {"eslint"},
+	"prettier":     {"prettier"},
+	"jest":         {"jest"},
+	"vitest":       {"vitest"},
+	"mocha":        {"mocha"},
+	"nodemon":      {"nodemon"},
+	"concurrently": {"concurrently"},
 }
 
 // isCommandDeclaredInPackageJSON returns true when the command is explicitly
