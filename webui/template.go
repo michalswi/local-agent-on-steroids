@@ -533,7 +533,8 @@ var pinnedFiles    = new Set(); // relPaths selected for targeted agent edits
 // autoApply: when false (default) chat code blocks are never
 // written automatically — the user must click ⚡ Apply explicitly.
 var autoApply      = false;
-var agentPendingStore = {};   // cardId -> {file, oldContent, newContent, deleted}
+var agentPendingStore = {};   // cardId -> {file, oldContent, newContent, deleted, task}
+var _lastAgentTask    = '';   // task text from the most recent agent submission
 var agentBulkGroups   = {};   // barId  -> [cardId, ...]
 var agentRevertStore  = {};   // revertId -> {file, oldContent}
 var origContent    = null;    // content when file was loaded
@@ -787,7 +788,7 @@ function pollMessages() {
                 c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms, m.prompt_eval_count));
                 if (m.agentResults && m.agentResults.length) {
                     var hasPending = m.agentResults.some(function(r){ return r.pending; });
-                    if (hasPending) { renderAgentPendingResults(m.agentResults, c); }
+                    if (hasPending) { renderAgentPendingResults(m.agentResults, c, _lastAgentTask); }
                     else            { renderAgentResults(m.agentResults, c); }
                 }
             });
@@ -916,7 +917,7 @@ function loadMessages() {
             if (m.agentResults && m.agentResults.length) {
                 var hasPending = m.agentResults.some(function(r){ return r.pending; });
                 if (hasPending) {
-                    renderAgentPendingResults(m.agentResults, c);
+                    renderAgentPendingResults(m.agentResults, c, _lastAgentTask);
                 } else {
                     renderAgentResults(m.agentResults, c);
                 }
@@ -1067,6 +1068,7 @@ function sendAgentTask() {
     var inp = document.getElementById('msgInput');
     var txt = inp.value.trim();
     if (!txt) return;
+    _lastAgentTask = txt;
 
     var c = document.getElementById('messages');
     c.appendChild(makeMsgEl('user', txt, new Date().toISOString()));
@@ -1114,9 +1116,9 @@ function sendAgentTask() {
             c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms, d.message.prompt_eval_count));
             c.scrollTop = c.scrollHeight;
             if (d.agentResults && d.agentResults.length) {
-                var hasPending = d.agentResults.some(function(r){ return r.pending; });
+                    var hasPending = d.agentResults.some(function(r){ return r.pending; });
                 if (hasPending) {
-                    renderAgentPendingResults(d.agentResults, c);
+                    renderAgentPendingResults(d.agentResults, c, _lastAgentTask);
                 } else {
                     renderAgentResults(d.agentResults, c);
                 }
@@ -1360,7 +1362,7 @@ function renderAgentResults(results, container) {
 
 // renderAgentPendingResults shows each proposed file change with
 // individual Apply / Deny buttons plus an Apply-All / Deny-All bar.
-function renderAgentPendingResults(results, container) {
+function renderAgentPendingResults(results, container, task) {
     var pendingCardIds = [];
     var barId = 'agentBar_' + Date.now();
 
@@ -1380,7 +1382,7 @@ function renderAgentPendingResults(results, container) {
                 '<span style="color:var(--text2)">\u2014 <code>' + esc(r.file) + '</code> \u2014 no change needed</span>' +
                 '</div>';
         } else if (r.deleted) {
-            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: '', deleted: true };
+            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: '', deleted: true, task: task||'' };
             pendingCardIds.push(cardId);
             var diffHtml = buildDiffHtml(r.oldContent||'', '');
             var uid2 = 'idiff_p_' + Date.now() + '_' + i;
@@ -1406,7 +1408,7 @@ function renderAgentPendingResults(results, container) {
                 '</div>' +
                 '</div>';
         } else {
-            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: r.newContent||'' };
+            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: r.newContent||'', task: task||'' };
             pendingCardIds.push(cardId);
             var icon  = r.created ? '\u2728 New file' : '\ud83d\udcdd Proposed';
             var color = r.created ? 'var(--accent2)' : 'var(--yellow)';
@@ -1475,8 +1477,8 @@ function agentApplyFile(cardId) {
     if (denyBtn)  { denyBtn.disabled  = true; }
 
     var commitBody = pending.deleted
-        ? JSON.stringify({ files: [{ path: pending.file, delete: true }] })
-        : JSON.stringify({ files: [{ path: pending.file, content: pending.newContent }] });
+        ? JSON.stringify({ files: [{ path: pending.file, delete: true }], task: pending.task||'' })
+        : JSON.stringify({ files: [{ path: pending.file, content: pending.newContent }], task: pending.task||'' });
     fetch('/api/agent/commit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

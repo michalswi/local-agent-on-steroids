@@ -1285,6 +1285,7 @@ type AgentFileResult struct {
 // AgentCommitRequest is the JSON body for POST /api/agent/commit.
 type AgentCommitRequest struct {
 	Files []AgentCommitFile `json:"files"`
+	Task  string            `json:"task,omitempty"` // original agent task; used to save to memory.md on commit
 }
 
 // AgentCommitFile is one approved file entry inside an AgentCommitRequest.
@@ -1395,9 +1396,8 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(AgentRunResponse{Success: false, Error: err.Error()})
 		return
 	}
-	s.autoSaveMemory(task, results)
-
 	if !dryRun {
+		s.autoSaveMemory(task, results)
 		for _, res := range results {
 			if res.Changed {
 				if scanned, scanErr := s.performRescan(); scanErr == nil {
@@ -1554,9 +1554,8 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
 		return
 	}
-	s.autoSaveMemory(task, results)
-
 	if !dryRun {
+		s.autoSaveMemory(task, results)
 		for _, res := range results {
 			if res.Changed {
 				if scanned, scanErr := s.performRescan(); scanErr == nil {
@@ -1624,6 +1623,7 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 
 	cleanDir := filepath.Clean(s.directory)
 	var results []commitResult
+	var agentResults []AgentFileResult
 	anyWritten := false
 
 	for _, f := range req.Files {
@@ -1672,6 +1672,11 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 		s.markWrittenFile(f.Path)
 		anyWritten = true
 		results = append(results, commitResult{File: f.Path, Success: true})
+		agentResults = append(agentResults, AgentFileResult{
+			File:    f.Path,
+			Changed: true,
+			Created: !existedBefore,
+		})
 		// Record in agent changelog so future agent runs know about this file.
 		// The commit endpoint doesn't have access to the original task string,
 		// so we mark it generically; the file and operation are what matter.
@@ -1710,6 +1715,12 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.mu.Unlock()
+	}
+
+	// Save applied files to memory. Only fires when the task is known (i.e. sent
+	// by the frontend commit call) — reverts don't send a task and are skipped.
+	if req.Task != "" && len(agentResults) > 0 {
+		s.autoSaveMemory(req.Task, agentResults)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
