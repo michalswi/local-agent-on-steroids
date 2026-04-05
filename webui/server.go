@@ -47,6 +47,11 @@ const maxMessages = 200
 // agent prompt. Older entries are dropped first to bound prompt token usage.
 const maxAgentLogEntries = 50
 
+// maxTaskPlanCacheEntries bounds in-memory cached initial plans used when
+// memory autosave runs after the request lifecycle has already cleared
+// transient progress fields (e.g. pending -> commit flow).
+const maxTaskPlanCacheEntries = 128
+
 // docCompletionSentinel must be the final line emitted by doc-generation
 // prompts so we can detect truncated/incomplete outputs reliably.
 const docCompletionSentinel = "<END_OF_DOC>"
@@ -96,6 +101,7 @@ type Server struct {
 	taskKind         string              // "chat" | "agent"
 	lastProgressText string              // last progress message from the running agent task
 	planProgressText string              // sticky plan line (kept while a task runs)
+	taskPlanCache    map[string]string   // task hash -> initial plan text for memory autosave fallback
 	scanFilter       *filter.Filter      // filter snapshot from startup; reused by rescan so agent-created files (e.g. .gitignore) don't hide themselves
 	writtenFiles     map[string]struct{} // rel paths written via /api/file/write; always shown on rescan
 	memoryPath       string              // absolute path to this project's memory.md (empty when memory disabled)
@@ -143,17 +149,18 @@ type StatusResponse struct {
 // NewServer creates a new web UI server
 func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, cfg *config.Config, llmClient *llm.OllamaClient, focusedPath, homeDir string, noMemory bool) *Server {
 	s := &Server{
-		directory:    directory,
-		model:        model,
-		endpoint:     endpoint,
-		indexTmpl:    template.Must(template.New("index").Parse(htmlTemplate)),
-		scanResult:   scanResult,
-		focusedPath:  focusedPath,
-		cfg:          cfg,
-		llmClient:    llmClient,
-		messages:     make([]Message, 0),
-		writtenFiles: make(map[string]struct{}),
-		homeDir:      homeDir,
+		directory:     directory,
+		model:         model,
+		endpoint:      endpoint,
+		indexTmpl:     template.Must(template.New("index").Parse(htmlTemplate)),
+		scanResult:    scanResult,
+		focusedPath:   focusedPath,
+		cfg:           cfg,
+		llmClient:     llmClient,
+		messages:      make([]Message, 0),
+		taskPlanCache: make(map[string]string),
+		writtenFiles:  make(map[string]struct{}),
+		homeDir:       homeDir,
 	}
 
 	if !noMemory && homeDir != "" {
@@ -295,6 +302,7 @@ func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
 	if s.memoryPath == "" {
 		return
 	}
+	taskKey := hashTaskForMemory(task)
 	var changed, created, deleted []string
 	for _, r := range results {
 		if r.Error != "" {
@@ -315,15 +323,21 @@ func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
 		return
 	}
 	s.mu.RLock()
-	planText := s.planProgressText
+	planText := strings.TrimSpace(s.planProgressText)
+	if planText == "" {
+		planText = strings.TrimSpace(s.taskPlanCache[taskKey])
+	}
 	s.mu.RUnlock()
+	if planText == "" {
+		planText = buildFallbackPlanForMemory(changed, created, deleted)
+	}
 
 	taskSummary := compactTaskForMemory(task)
 	event := memoryTaskEvent{
 		Timestamp: time.Now(),
-		TaskKey:   hashTaskForMemory(task),
+		TaskKey:   taskKey,
 		Task:      taskSummary,
-		Plan:      strings.TrimSpace(planText),
+		Plan:      normalizePlanForMemory(planText),
 		Modified:  changed,
 		Created:   created,
 		Deleted:   deleted,
@@ -405,6 +419,69 @@ func hashTaskForMemory(task string) string {
 	return fmt.Sprintf("%x", sum[:6])
 }
 
+func normalizePlanForMemory(plan string) string {
+	plan = strings.ReplaceAll(plan, "\r\n", "\n")
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return ""
+	}
+	lines := strings.Split(plan, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func buildFallbackPlanForMemory(changed, created, deleted []string) string {
+	var lines []string
+	for _, f := range sortedCopy(created) {
+		lines = append(lines, "• "+f+" — create file")
+	}
+	for _, f := range sortedCopy(changed) {
+		lines = append(lines, "• "+f+" — modify file")
+	}
+	for _, f := range sortedCopy(deleted) {
+		lines = append(lines, "• "+f+" — delete file")
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "📋 Plan (executed changes):\n" + strings.Join(lines, "\n")
+}
+
+func (s *Server) rememberTaskPlanForMemory(task, plan string) {
+	plan = normalizePlanForMemory(plan)
+	if task == "" || plan == "" {
+		return
+	}
+	key := hashTaskForMemory(task)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.taskPlanCache == nil {
+		s.taskPlanCache = make(map[string]string)
+	}
+	s.taskPlanCache[key] = plan
+	if len(s.taskPlanCache) > maxTaskPlanCacheEntries {
+		for k := range s.taskPlanCache {
+			if k != key {
+				delete(s.taskPlanCache, k)
+				break
+			}
+		}
+	}
+}
+
 func uniqueStringList(in []string) []string {
 	if len(in) == 0 {
 		return nil
@@ -446,9 +523,15 @@ func renderMemoryTaskEvent(e memoryTaskEvent) string {
 		sb.WriteString("\n")
 	}
 	if strings.TrimSpace(e.Plan) != "" {
-		sb.WriteString("Plan: ")
-		sb.WriteString(strings.TrimSpace(e.Plan))
-		sb.WriteString("\n")
+		sb.WriteString("Plan:\n")
+		for _, line := range strings.Split(normalizePlanForMemory(e.Plan), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			sb.WriteString("  ")
+			sb.WriteString(strings.TrimSpace(line))
+			sb.WriteString("\n")
+		}
 	}
 	if files := uniqueStringList(e.Modified); len(files) > 0 {
 		sb.WriteString("Modified: ")
@@ -493,14 +576,32 @@ func parseMemoryTaskEvent(block string) memoryTaskEvent {
 			e.Timestamp = ts
 		}
 	}
-	for _, line := range lines[1:] {
+	for i := 1; i < len(lines); i++ {
+		line := lines[i]
 		switch {
 		case strings.HasPrefix(line, "TaskKey: "):
 			e.TaskKey = strings.TrimSpace(strings.TrimPrefix(line, "TaskKey: "))
 		case strings.HasPrefix(line, "Task: "):
 			e.Task = strings.TrimSpace(strings.TrimPrefix(line, "Task: "))
-		case strings.HasPrefix(line, "Plan: "):
-			e.Plan = strings.TrimSpace(strings.TrimPrefix(line, "Plan: "))
+		case strings.HasPrefix(line, "Plan:"):
+			planInline := strings.TrimSpace(strings.TrimPrefix(line, "Plan:"))
+			planLines := make([]string, 0, 8)
+			if planInline != "" {
+				planLines = append(planLines, planInline)
+			}
+			for j := i + 1; j < len(lines); j++ {
+				next := lines[j]
+				if strings.TrimSpace(next) == "" {
+					continue
+				}
+				if isMemoryTopLevelField(next) {
+					i = j - 1
+					break
+				}
+				planLines = append(planLines, strings.TrimSpace(next))
+				i = j
+			}
+			e.Plan = normalizePlanForMemory(strings.Join(planLines, "\n"))
 		case strings.HasPrefix(line, "Modified: "):
 			e.Modified = parseCommaList(strings.TrimPrefix(line, "Modified: "))
 		case strings.HasPrefix(line, "Created: "):
@@ -512,6 +613,19 @@ func parseMemoryTaskEvent(block string) memoryTaskEvent {
 		}
 	}
 	return e
+}
+
+func isMemoryTopLevelField(line string) bool {
+	if strings.TrimLeft(line, " \t") != line {
+		return false
+	}
+	return strings.HasPrefix(line, "TaskKey: ") ||
+		strings.HasPrefix(line, "Task: ") ||
+		strings.HasPrefix(line, "Plan:") ||
+		strings.HasPrefix(line, "Modified: ") ||
+		strings.HasPrefix(line, "Created: ") ||
+		strings.HasPrefix(line, "Deleted: ") ||
+		strings.HasPrefix(line, "Summary: ")
 }
 
 func parseCommaList(v string) []string {
@@ -539,7 +653,7 @@ func mergeMemoryTaskEvents(prev memoryTaskEvent, incoming memoryTaskEvent) memor
 	if out.Task == "" {
 		out.Task = incoming.Task
 	}
-	if out.Plan == "" {
+	if out.Plan == "" || (incoming.Plan != "" && len(incoming.Plan) > len(out.Plan)) {
 		out.Plan = incoming.Plan
 	}
 	out.Modified = uniqueStringList(append(out.Modified, incoming.Modified...))
@@ -3969,6 +4083,23 @@ func agentExplicitFilenameFromTask(task string) string {
 	return ""
 }
 
+func formatPlanForMemory(plan []PlannedFile) string {
+	if len(plan) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "📋 Plan: %d file(s) to create\n", len(plan))
+	for _, pf := range plan {
+		desc := strings.TrimSpace(pf.Description)
+		if desc != "" {
+			fmt.Fprintf(&sb, "• %s — %s\n", pf.File, desc)
+		} else {
+			fmt.Fprintf(&sb, "• %s\n", pf.File)
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
 // runAgentPlan asks the LLM which files need to be created for the task.
 // It returns a deduplicated list of PlannedFile entries each with a description
 // of what the file owns and its declared dependencies. This is a cheap
@@ -4108,8 +4239,10 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 	var plan []PlannedFile
 	if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
 		// The user explicitly named a file, so avoid broad multi-file planning.
-		plan = []PlannedFile{{File: explicit}}
-		progress(fmt.Sprintf("📋 Plan: explicit target %s (planning skipped)", explicit))
+		plan = []PlannedFile{{File: explicit, Description: "explicit target (planning skipped)"}}
+		planText := formatPlanForMemory(plan)
+		s.rememberTaskPlanForMemory(task, planText)
+		progress(planText)
 	} else {
 		// Ask the model which files are needed. This small focused call is far more
 		// reliable than asking a small LLM to plan AND generate in one shot.
@@ -4182,7 +4315,9 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 					fmt.Fprintf(&planBuf, "  • %s\n", pf.File)
 				}
 			}
-			progress(planBuf.String())
+			planText := planBuf.String()
+			s.rememberTaskPlanForMemory(task, planText)
+			progress(planText)
 		}
 	}
 
