@@ -3,6 +3,7 @@ package webui
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -98,6 +99,7 @@ type Server struct {
 	scanFilter       *filter.Filter      // filter snapshot from startup; reused by rescan so agent-created files (e.g. .gitignore) don't hide themselves
 	writtenFiles     map[string]struct{} // rel paths written via /api/file/write; always shown on rescan
 	memoryPath       string              // absolute path to this project's memory.md (empty when memory disabled)
+	memoryWriteMu    sync.Mutex          // serializes memory.md load+merge+save updates
 	homeDir          string              // homedir for session logs and memory
 	mu               sync.RWMutex
 }
@@ -306,6 +308,9 @@ func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
 			changed = append(changed, r.File)
 		}
 	}
+	changed = uniqueStringList(changed)
+	created = uniqueStringList(created)
+	deleted = uniqueStringList(deleted)
 	if len(changed)+len(created)+len(deleted) == 0 {
 		return
 	}
@@ -313,22 +318,16 @@ func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
 	planText := s.planProgressText
 	s.mu.RUnlock()
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("## %s\n", time.Now().Format("2006-01-02 15:04")))
-	sb.WriteString(fmt.Sprintf("Task: %s\n", task))
-	if strings.TrimSpace(planText) != "" {
-		sb.WriteString(fmt.Sprintf("Plan: %s\n", strings.TrimSpace(planText)))
+	taskSummary := compactTaskForMemory(task)
+	event := memoryTaskEvent{
+		Timestamp: time.Now(),
+		TaskKey:   hashTaskForMemory(task),
+		Task:      taskSummary,
+		Plan:      strings.TrimSpace(planText),
+		Modified:  changed,
+		Created:   created,
+		Deleted:   deleted,
 	}
-	if len(changed) > 0 {
-		sb.WriteString(fmt.Sprintf("Modified: %s\n", strings.Join(changed, ", ")))
-	}
-	if len(created) > 0 {
-		sb.WriteString(fmt.Sprintf("Created: %s\n", strings.Join(created, ", ")))
-	}
-	if len(deleted) > 0 {
-		sb.WriteString(fmt.Sprintf("Deleted: %s\n", strings.Join(deleted, ", ")))
-	}
-	structuredEntry := sb.String()
 	allFiles := append(append(append([]string{}, changed...), created...), deleted...)
 	s.mu.RLock()
 	client := s.llmClient
@@ -339,19 +338,239 @@ func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		prompt := fmt.Sprintf(
-			"In 1-2 sentences, describe what was done. Task: %q. Files: %v.",
-			task, allFiles,
+			"In 1 short sentence, describe what was done. Task: %q. Files: %v.",
+			taskSummary, allFiles,
 		)
 		resp, err := client.Chat(ctx, &llm.ChatRequest{
 			Messages:  []llm.Message{{Role: "user", Content: prompt}},
 			MaxTokens: 120,
 		})
-		entry := structuredEntry
 		if err == nil && resp != nil {
-			entry += fmt.Sprintf("Summary: %s\n", strings.TrimSpace(resp.Message.Content))
+			event.Summary = strings.TrimSpace(resp.Message.Content)
 		}
-		_ = memory.Append(homeDir, directory, entry)
+
+		s.memoryWriteMu.Lock()
+		defer s.memoryWriteMu.Unlock()
+
+		existing, loadErr := memory.Load(homeDir, directory)
+		if loadErr != nil {
+			_ = memory.Append(homeDir, directory, strings.TrimSpace(renderMemoryTaskEvent(event)))
+			return
+		}
+		updated := upsertMemoryTaskEvent(existing, event)
+		_ = memory.Save(homeDir, directory, updated)
 	}()
+}
+
+var memoryEntryHeaderRE = regexp.MustCompile(`(?m)^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n`)
+
+type memoryTaskEvent struct {
+	Timestamp time.Time
+	TaskKey   string
+	Task      string
+	Plan      string
+	Modified  []string
+	Created   []string
+	Deleted   []string
+	Summary   string
+}
+
+func compactTaskForMemory(task string) string {
+	task = strings.ReplaceAll(task, "\r\n", "\n")
+	firstLine := ""
+	for _, line := range strings.Split(task, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			firstLine = line
+			break
+		}
+	}
+	if firstLine == "" {
+		firstLine = strings.TrimSpace(task)
+	}
+	firstLine = strings.Join(strings.Fields(firstLine), " ")
+	if firstLine == "" {
+		return "(empty task)"
+	}
+	const maxTaskChars = 220
+	if len(firstLine) > maxTaskChars {
+		return strings.TrimSpace(firstLine[:maxTaskChars-3]) + "..."
+	}
+	return firstLine
+}
+
+func hashTaskForMemory(task string) string {
+	norm := strings.ToLower(strings.Join(strings.Fields(task), " "))
+	sum := sha1.Sum([]byte(norm))
+	return fmt.Sprintf("%x", sum[:6])
+}
+
+func uniqueStringList(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		v := strings.TrimSpace(item)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func renderMemoryTaskEvent(e memoryTaskEvent) string {
+	ts := e.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	var sb strings.Builder
+	sb.WriteString("## ")
+	sb.WriteString(ts.Format("2006-01-02 15:04"))
+	sb.WriteString("\n")
+	if strings.TrimSpace(e.TaskKey) != "" {
+		sb.WriteString("TaskKey: ")
+		sb.WriteString(strings.TrimSpace(e.TaskKey))
+		sb.WriteString("\n")
+	}
+	if strings.TrimSpace(e.Task) != "" {
+		sb.WriteString("Task: ")
+		sb.WriteString(strings.TrimSpace(e.Task))
+		sb.WriteString("\n")
+	}
+	if strings.TrimSpace(e.Plan) != "" {
+		sb.WriteString("Plan: ")
+		sb.WriteString(strings.TrimSpace(e.Plan))
+		sb.WriteString("\n")
+	}
+	if files := uniqueStringList(e.Modified); len(files) > 0 {
+		sb.WriteString("Modified: ")
+		sb.WriteString(strings.Join(files, ", "))
+		sb.WriteString("\n")
+	}
+	if files := uniqueStringList(e.Created); len(files) > 0 {
+		sb.WriteString("Created: ")
+		sb.WriteString(strings.Join(files, ", "))
+		sb.WriteString("\n")
+	}
+	if files := uniqueStringList(e.Deleted); len(files) > 0 {
+		sb.WriteString("Deleted: ")
+		sb.WriteString(strings.Join(files, ", "))
+		sb.WriteString("\n")
+	}
+	if strings.TrimSpace(e.Summary) != "" {
+		sb.WriteString("Summary: ")
+		sb.WriteString(strings.TrimSpace(e.Summary))
+		sb.WriteString("\n")
+	}
+	return strings.TrimRight(sb.String(), "\n") + "\n"
+}
+
+func splitLastMemoryEntry(content string) (prefix string, last string, ok bool) {
+	matches := memoryEntryHeaderRE.FindAllStringIndex(content, -1)
+	if len(matches) == 0 {
+		return content, "", false
+	}
+	start := matches[len(matches)-1][0]
+	return strings.TrimRight(content[:start], "\n"), strings.TrimSpace(content[start:]), true
+}
+
+func parseMemoryTaskEvent(block string) memoryTaskEvent {
+	e := memoryTaskEvent{}
+	lines := strings.Split(strings.TrimSpace(block), "\n")
+	if len(lines) == 0 {
+		return e
+	}
+	if strings.HasPrefix(lines[0], "## ") {
+		if ts, err := time.Parse("2006-01-02 15:04", strings.TrimSpace(strings.TrimPrefix(lines[0], "## "))); err == nil {
+			e.Timestamp = ts
+		}
+	}
+	for _, line := range lines[1:] {
+		switch {
+		case strings.HasPrefix(line, "TaskKey: "):
+			e.TaskKey = strings.TrimSpace(strings.TrimPrefix(line, "TaskKey: "))
+		case strings.HasPrefix(line, "Task: "):
+			e.Task = strings.TrimSpace(strings.TrimPrefix(line, "Task: "))
+		case strings.HasPrefix(line, "Plan: "):
+			e.Plan = strings.TrimSpace(strings.TrimPrefix(line, "Plan: "))
+		case strings.HasPrefix(line, "Modified: "):
+			e.Modified = parseCommaList(strings.TrimPrefix(line, "Modified: "))
+		case strings.HasPrefix(line, "Created: "):
+			e.Created = parseCommaList(strings.TrimPrefix(line, "Created: "))
+		case strings.HasPrefix(line, "Deleted: "):
+			e.Deleted = parseCommaList(strings.TrimPrefix(line, "Deleted: "))
+		case strings.HasPrefix(line, "Summary: "):
+			e.Summary = strings.TrimSpace(strings.TrimPrefix(line, "Summary: "))
+		}
+	}
+	return e
+}
+
+func parseCommaList(v string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return uniqueStringList(out)
+}
+
+func mergeMemoryTaskEvents(prev memoryTaskEvent, incoming memoryTaskEvent) memoryTaskEvent {
+	out := prev
+	out.Timestamp = incoming.Timestamp
+	if out.TaskKey == "" {
+		out.TaskKey = incoming.TaskKey
+	}
+	if out.Task == "" {
+		out.Task = incoming.Task
+	}
+	if out.Plan == "" {
+		out.Plan = incoming.Plan
+	}
+	out.Modified = uniqueStringList(append(out.Modified, incoming.Modified...))
+	out.Created = uniqueStringList(append(out.Created, incoming.Created...))
+	out.Deleted = uniqueStringList(append(out.Deleted, incoming.Deleted...))
+	if strings.TrimSpace(incoming.Summary) != "" {
+		out.Summary = incoming.Summary
+	}
+	return out
+}
+
+func upsertMemoryTaskEvent(existing string, incoming memoryTaskEvent) string {
+	existing = strings.TrimSpace(existing)
+	incomingBlock := strings.TrimSpace(renderMemoryTaskEvent(incoming))
+	if existing == "" {
+		return incomingBlock + "\n"
+	}
+
+	prefix, lastBlock, ok := splitLastMemoryEntry(existing)
+	if ok {
+		prev := parseMemoryTaskEvent(lastBlock)
+		if prev.TaskKey != "" && prev.TaskKey == incoming.TaskKey {
+			merged := strings.TrimSpace(renderMemoryTaskEvent(mergeMemoryTaskEvents(prev, incoming)))
+			if strings.TrimSpace(prefix) == "" {
+				return merged + "\n"
+			}
+			return strings.TrimRight(prefix, "\n") + "\n\n" + merged + "\n"
+		}
+	}
+
+	return strings.TrimRight(existing, "\n") + "\n\n" + incomingBlock + "\n"
 }
 
 // handleMemory handles GET/POST/DELETE /api/memory

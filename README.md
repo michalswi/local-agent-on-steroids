@@ -83,9 +83,14 @@ Each project gets a persistent `memory.md` file stored alongside session logs (u
 
 Memory is automatically prepended to the system prompt on every request (Send, Agent, Run & Fix), giving the LLM context from previous sessions without you having to re-explain the project.
 
-After every successful **⚡ Agent** run, memory is updated automatically with:
+After every successful **⚡ Agent** change application, memory is updated automatically with:
 - A structured entry: date, task description, and list of modified/created/deleted files
 - A one-line LLM-generated summary of what was done (appended in the background)
+
+Notes:
+- With **Auto Off** (default), Agent first proposes pending changes; memory is saved when changes are actually applied.
+- Memory is capped to 32 KB and trimmed from oldest entries first.
+- Consecutive saves for the same task are merged to avoid duplicated prompt-sized entries.
 
 | Chat command | Action |
 |---|---|
@@ -99,7 +104,7 @@ Use `--no-memory` to disable memory for a session (auto-save is also disabled). 
 
 | Button | Action |
 |---|---|
-| **⚡ Agent** | Agent mode — scans all files, plans changes, and applies them autonomously. Triggered by pressing `Enter`. |
+| **⚡ Agent** | Agent mode — scans all files, plans changes, and generates file edits. With **Auto Off** (default), changes are pending until you confirm with **⚡ Apply**. With **Auto On**, changes are written immediately. Triggered by pressing `Enter`. |
 | **🔧 Run & Fix** | Runs the project, feeds build errors to the LLM, applies fixes, and retries — up to 3 attempts. |
 | **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. When `AGENT_CONCURRENT_FILES > 1` and multiple files are in scope, automatically switches to **Smart Send**: one parallel LLM call per file, results combined into a single response. |
 | **Clear** | Clears the current chat conversation history (same behavior as typing `clear` in chat). |
@@ -130,13 +135,14 @@ Pinning only affects the **Agent** button — Send and Run & Fix are not influen
 
 ## \# System Prompts
 
-There are three distinct system prompts used internally, each targeting a different operation mode. They are stored as embedded `.md` files under `webui/prompts/` and compiled into the binary at build time.
+System prompts are stored as embedded `.md` files under `webui/prompts/` and compiled into the binary at build time.
 
 | Prompt file | Triggered by |
 |---|---|
 | `webui/prompts/chat.md` | **Send** button — plain conversation, no file writes |
 | `webui/prompts/agent_edit.md` | **⚡ Agent** button — applied per-file in a parallel loop |
 | `webui/prompts/agent_doc.md` | **⚡ Agent** on `.md` / doc files — documentation writer prompt |
+| `webui/prompts/agent_plan.md` | **⚡ Agent** planning step — asks the model which files should be generated |
 | `webui/prompts/agent_create.md` | Agent legacy path — multi-file scaffold in a single LLM call |
 | `webui/prompts/agent_create_single.md` | Agent per-file path — one focused LLM call per planned file (code files only) |
 | `webui/prompts/agent_fix.md` | **🔧 Run & Fix** button — language-agnostic fix prompt used in each repair iteration |

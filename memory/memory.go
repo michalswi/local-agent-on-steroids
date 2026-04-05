@@ -13,12 +13,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 // maxBytes is the hard cap for memory.md.  Content beyond this is silently
 // trimmed from the top (oldest entries) when writing.
 const maxBytes = 32 * 1024 // 32 KB
+
+var (
+	writeMu       sync.Mutex
+	entryHeaderRE = regexp.MustCompile(`(?m)^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n`)
+)
 
 // Path returns the absolute path to the memory file for the given project
 // directory, stored under homeDir.
@@ -48,6 +55,9 @@ func Load(homeDir, absProjectDir string) (string, error) {
 // if needed.  If the resulting file would exceed maxBytes, the oldest content is
 // trimmed from the top while preserving the last maxBytes bytes.
 func Append(homeDir, absProjectDir, content string) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
 	p := Path(homeDir, absProjectDir)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
@@ -63,15 +73,7 @@ func Append(homeDir, absProjectDir, content string) error {
 		combined += "\n"
 	}
 	combined += strings.TrimSpace(content) + "\n"
-
-	// Trim oldest content if over the cap.
-	if len(combined) > maxBytes {
-		combined = combined[len(combined)-maxBytes:]
-		// Realign to the next newline so we don't start mid-line.
-		if idx := strings.Index(combined, "\n"); idx >= 0 {
-			combined = combined[idx+1:]
-		}
-	}
+	combined = trimToMaxBytes(combined)
 
 	return os.WriteFile(p, []byte(combined), 0o644)
 }
@@ -79,17 +81,14 @@ func Append(homeDir, absProjectDir, content string) error {
 // Save replaces the entire memory file with the provided content (capped to
 // maxBytes from the end).
 func Save(homeDir, absProjectDir, content string) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
 	p := Path(homeDir, absProjectDir)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-
-	if len(content) > maxBytes {
-		content = content[len(content)-maxBytes:]
-		if idx := strings.Index(content, "\n"); idx >= 0 {
-			content = content[idx+1:]
-		}
-	}
+	content = trimToMaxBytes(content)
 
 	return os.WriteFile(p, []byte(content), 0o644)
 }
@@ -97,12 +96,39 @@ func Save(homeDir, absProjectDir, content string) error {
 // Clear deletes the memory file for the project.  It is not an error if the
 // file does not exist.
 func Clear(homeDir, absProjectDir string) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
 	p := Path(homeDir, absProjectDir)
 	err := os.Remove(p)
 	if os.IsNotExist(err) {
 		return nil
 	}
 	return err
+}
+
+// trimToMaxBytes keeps the newest content under maxBytes while trying to align
+// to whole timestamped entries that start with: "## YYYY-MM-DD HH:MM".
+func trimToMaxBytes(content string) string {
+	if len(content) <= maxBytes {
+		return content
+	}
+
+	matches := entryHeaderRE.FindAllStringIndex(content, -1)
+	if len(matches) > 0 {
+		for _, m := range matches {
+			start := m[0]
+			if len(content[start:]) <= maxBytes {
+				return strings.TrimLeft(content[start:], "\n")
+			}
+		}
+	}
+
+	trimmed := content[len(content)-maxBytes:]
+	if idx := strings.Index(trimmed, "\n"); idx >= 0 {
+		trimmed = trimmed[idx+1:]
+	}
+	return trimmed
 }
 
 // projectSlug returns a filesystem-safe directory name derived from the
