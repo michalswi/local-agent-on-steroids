@@ -2288,6 +2288,12 @@ func agentIsDocLikeFile(name string) bool {
 		return true
 	}
 	if ext == ".txt" {
+		// Any .txt file inside a docs/ or documentation/ directory is doc-like
+		// regardless of its own filename (e.g. docs/reference.txt).
+		dir := strings.ToLower(filepath.ToSlash(filepath.Dir(filepath.Clean(name))))
+		if strings.Contains(dir, "docs") || strings.Contains(dir, "documentation") {
+			return true
+		}
 		for _, hint := range []string{"readme", "docs", "documentation", "guide", "manual", "install", "getting-started"} {
 			if strings.Contains(base, hint) {
 				return true
@@ -2301,15 +2307,6 @@ func agentIsDocLikeFile(name string) bool {
 	default:
 		return false
 	}
-}
-
-func agentDocumentationInstructions() string {
-	return "Documentation requirements:\n" +
-		"- Start with a short plain-language overview describing what the app is for and who it helps.\n" +
-		"- Include a step-by-step Getting Started section with copy-pasteable shell examples in fenced bash blocks.\n" +
-		"- Include build and run instructions plus required config/environment variables using concrete values from provided files.\n" +
-		"- Use ONLY commands and values visible in the source snippets — do not invent flags, commands, or features.\n" +
-		"- Keep wording user-friendly and concise; avoid placeholders."
 }
 
 func agentLastNonEmptyLine(s string) string {
@@ -2372,7 +2369,19 @@ func agentDocValidationIssues(content string) []string {
 
 	last := agentLastNonEmptyLine(content)
 	if last != "" {
-		if strings.HasSuffix(last, ":") || strings.HasSuffix(last, ",") {
+		lastTrimmed := strings.TrimSpace(last)
+		endsClean := strings.HasSuffix(lastTrimmed, ".") ||
+			strings.HasSuffix(lastTrimmed, "!") ||
+			strings.HasSuffix(lastTrimmed, "?") ||
+			strings.HasSuffix(lastTrimmed, ")") ||
+			strings.HasSuffix(lastTrimmed, "]") ||
+			strings.HasSuffix(lastTrimmed, "\"") ||
+			strings.HasSuffix(lastTrimmed, "'") ||
+			strings.HasPrefix(lastTrimmed, "#") ||
+			strings.HasPrefix(lastTrimmed, "- ") ||
+			strings.HasPrefix(lastTrimmed, "* ") ||
+			strings.HasPrefix(lastTrimmed, "```")
+		if !endsClean && len(lastTrimmed) > 10 {
 			issues = append(issues, "appears truncated at the end")
 		}
 	}
@@ -2394,32 +2403,30 @@ func agentIsSignificantlyShortened(newContent, oldContent string) bool {
 
 // agentIsGarbageDocContent returns true when the doc content is so minimal or
 // malformed that it should be discarded entirely rather than proposed to the user.
-// Both conditions must be true simultaneously — a short-but-structured README
-// (e.g. a stub with headings) is allowed through with warnings, but a tiny
-// unstructured blob like "cd dupa" is rejected.
+// "Too short" alone is sufficient — a 2-line output like "# Navigate\ncd dupa"
+// has a heading so the old two-condition check missed it. Any content under the
+// minimum length threshold is garbage regardless of structure.
 func agentIsGarbageDocContent(issues []string) bool {
 	for _, iss := range issues {
 		if iss == "empty documentation output" {
 			return true
 		}
-	}
-	hasShort := false
-	hasMissingHeadings := false
-	for _, iss := range issues {
 		if iss == "content is too short to be complete documentation" {
-			hasShort = true
-		}
-		if iss == "missing markdown headings" {
-			hasMissingHeadings = true
+			return true
 		}
 	}
-	return hasShort && hasMissingHeadings
+	return false
 }
 
 func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, oldContent, draft, sourceCtx string) (final string, issues []string, err error) {
 	issues = agentDocValidationIssues(draft)
 	if len(issues) == 0 {
 		return draft, nil, nil
+	}
+	// If the only issue is truncation, the model hit its output token limit.
+	// Retrying the same model will produce identical truncation — skip passes.
+	if len(issues) == 1 && issues[0] == "appears truncated at the end" {
+		return draft, issues, nil
 	}
 
 	systemPrompt := promptAgentDoc
@@ -3118,21 +3125,26 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
 					return
 				}
-				// For simple doc updates (file already exists, not mixed code+docs), the
-				// first LLM call already saw the existing content — skip costly refinement
-				// passes which add latency without improving quality for small models.
-				isSimpleDocUpdate := strings.TrimSpace(oldContent) != "" && !agentIsMixedCodeAndDocsTask(task)
+				// Only skip refinement when the first-pass output is already clean.
+				// If the model returned garbage or a truncated response, we still run
+				// ensureCompleteDocContent so it gets a second chance to expand it.
+				initialIssues := agentDocValidationIssues(newContent)
+				isSimpleDocUpdate := strings.TrimSpace(oldContent) != "" &&
+					!agentIsMixedCodeAndDocsTask(task) &&
+					len(initialIssues) == 0
 				var refineIssues []string
 				if !isSimpleDocUpdate {
 					refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, f.RelPath, oldContent, newContent, "")
 					if refineErr != nil {
 						progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", f.RelPath, refineErr))
+						// fall back to initial issues so garbage guard can still fire
+						refineIssues = initialIssues
 					} else {
 						newContent = refined
 						refineIssues = issues
 					}
 				} else {
-					refineIssues = agentDocValidationIssues(newContent)
+					refineIssues = initialIssues
 				}
 				// Garbage guard: when output is too short/malformed OR significantly
 				// shorter than existing content, don't overwrite — keep existing content.
@@ -3762,18 +3774,6 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		// The user explicitly named a file, so avoid broad multi-file planning.
 		plan = []PlannedFile{{File: explicit}}
 		progress(fmt.Sprintf("📋 Plan: explicit target %s (planning skipped)", explicit))
-	} else if agentIsDocsIntent(task) && !agentIsMixedCodeAndDocsTask(task) {
-		// Pure doc-only task — skip the planning LLM call and target the doc
-		// file directly to save one round-trip.
-		target := "README.md"
-		for _, m := range agentFileMentionsFromTask(task) {
-			if agentIsDocLikeFile(m) {
-				target = m
-				break
-			}
-		}
-		plan = []PlannedFile{{File: target}}
-		progress(fmt.Sprintf("📋 Plan: pure docs task, targeting %s (planning skipped)", target))
 	} else {
 		// Ask the model which files are needed. This small focused call is far more
 		// reliable than asking a small LLM to plan AND generate in one shot.
@@ -3816,6 +3816,21 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 						plan = []PlannedFile{{File: "README.md"}}
 					}
 					progress(fmt.Sprintf("📋 Plan: docs fallback target %s", plan[0].File))
+				} else if len(plan) > 1 {
+					// Pure doc tasks should produce exactly one file. The LLM often
+					// splits "add documentation" into multiple .md files (e.g. README.md
+					// + simplewebserver_documentation.md) which produces duplicate,
+					// low-quality output. Collapse to one: prefer README.md if planned,
+					// otherwise keep the first entry.
+					chosen := plan[0]
+					for _, pf := range plan {
+						if strings.EqualFold(filepath.Base(pf.File), "readme.md") {
+							chosen = pf
+							break
+						}
+					}
+					progress(fmt.Sprintf("📋 Docs guard collapsed %d planned files to single target: %s", len(plan), chosen.File))
+					plan = []PlannedFile{chosen}
 				}
 			}
 
