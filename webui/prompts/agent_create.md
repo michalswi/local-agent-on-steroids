@@ -32,9 +32,12 @@ Rules — correctness (the app must work when run):
 
 Rules — README and documentation files:
 - When the task involves creating a README or documentation file, produce a COMPLETE, well-structured document — never a minimal stub or a handful of shell commands.
+- The document must clearly explain what the app is for in plain language (who it is for, what problem it solves).
 - Always include at minimum: project overview, prerequisites, how to build, how to run, required environment variables or config (with real example values), and example commands.
+- Include step-by-step shell examples in fenced `bash` blocks so users can copy-paste commands directly.
 - Derive ALL commands and values from the actual generated source files — filenames, binary names, ports, flags, config keys, and environment variable names must exactly match the code. Do not invent or guess values.
 - NEVER use generic placeholders such as [repository_url], [your_value], <project_name>, YOUR_PROJECT_ID, YOUR_KEY, etc. If a value is user-specific (e.g. a GCP project ID), state the exact variable or flag the user must set and describe what it controls — do not leave angle-bracket templates.
+- Include a short "Possible Improvements" section with practical future enhancements relevant to the generated project.
 - For infrastructure/IaC files (Terraform, Helm, etc.) include a step-by-step "Getting Started" section: authenticate, configure backend/state, run init, plan, apply — all with the actual commands derived from the generated files.
 - Use proper Markdown: headings (`##`), code blocks (``` ``` ```), and ordered lists for sequential steps.
 

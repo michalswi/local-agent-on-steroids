@@ -29,6 +29,11 @@ func SetDir(path string) {
 	sessionDir = path
 }
 
+// Dir returns the current session directory (may have been overridden by SetDir).
+func Dir() string {
+	return sessionDir
+}
+
 // DefaultDir returns the default or a temp fallback if
 // the home directory cannot be determined.
 func DefaultDir() string {

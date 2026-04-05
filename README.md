@@ -23,13 +23,13 @@ If you are looking for Ollama based **AI chat** check this app [scoutai](https:/
 make build
 
 # Verify files (if any) in the directory
-./local-agent-on-steroids --interactive --dir ./myproject --dry-run
+./local-agent-on-steroids --dir ./myproject --dry-run
 
 # Web UI at http://localhost:5050
-./local-agent-on-steroids --interactive --dir ./myproject
+./local-agent-on-steroids --dir ./myproject
 
 # Remote Ollama
-./local-agent-on-steroids --interactive --dir ./myproject --host 192.168.1.100:11434
+./local-agent-on-steroids --dir ./myproject --host 192.168.1.100:11434
 
 # Custom session-log directory (default: ~/Downloads/local-agent-on-steroids)
 ./local-agent-on-steroids --dir ./myproject --homedir /tmp/local-agent-on-steroids
@@ -37,23 +37,25 @@ make build
 # Utility
 ./local-agent-on-steroids --health
 ./local-agent-on-steroids --list-models
+
+# Disable per-project memory for this session
+./local-agent-on-steroids --dir ./myproject --no-memory
 ```
 
 ## \# Ollama Setup
 
 ```bash
-# Recommended: match OLLAMA_NUM_PARALLEL with AGENT_CONCURRENT_FILES,
-#              match OLLAMA_CONTEXT_LENGTH with AGENT_TOKEN_LIMIT
-OLLAMA_CONTEXT_LENGTH=8192 OLLAMA_NUM_PARALLEL=5 ollama serve
+# match OLLAMA_NUM_PARALLEL with AGENT_CONCURRENT_FILES
+OLLAMA_NUM_PARALLEL=5 ollama serve
 
-AGENT_TOKEN_LIMIT=8000 AGENT_CONCURRENT_FILES=5 ./local-agent-on-steroids --dir . --interactive
+AGENT_CONCURRENT_FILES=5 ./local-agent-on-steroids --dir .
 
 # Defaults (context=4096, parallel=1)
 ollama serve
-./local-agent-on-steroids --dir . --interactive
+./local-agent-on-steroids --dir .
 ```
 
-> **`AGENT_CONCURRENT_FILES`** controls parallel LLM calls when **editing/analyzing existing files** (agent task mode).
+> **`AGENT_CONCURRENT_FILES`** controls parallel LLM calls when **editing/analyzing existing files** (agent task mode) and when **reviewing/analyzing files via Send** (Smart Send mode — active when `AGENT_CONCURRENT_FILES > 1` and more than one file is in scope).
 > It does **not** apply when **generating new files** from scratch — those are produced sequentially.
 
 ## \# Session Logs
@@ -71,17 +73,52 @@ ls ~/Downloads/local-agent-on-steroids/
 ls /tmp/local-agent-on-steroids/
 ```
 
+## \# Memory
+
+Each project gets a persistent `memory.md` file stored alongside session logs (use `--homedir` or keep default):
+
+```
+~/Downloads/local-agent-on-steroids/myproject-a1b2c3/memory.md
+```
+
+Memory is automatically prepended to the system prompt on every request (Send, Agent, Run & Fix), giving the LLM context from previous sessions without you having to re-explain the project.
+
+After every successful **⚡ Agent** change application, memory is updated automatically with:
+- A structured entry: date, task description, and list of modified/created/deleted files
+- A one-line LLM-generated summary of what was done (appended in the background)
+
+Notes:
+- With **Auto Off** (default), Agent first proposes pending changes; memory is saved when changes are actually applied.
+- Memory is capped to 32 KB and trimmed from oldest entries first.
+- Consecutive saves for the same task are merged to avoid duplicated prompt-sized entries.
+
+| Chat command | Action |
+|---|---|
+| `mem show` | Print current project memory |
+| `mem clear` | Delete project memory |
+| `mem save <text>` | Append a note to project memory |
+
+Use `--no-memory` to disable memory for a session (auto-save is also disabled). Memory is scoped per `--dir` path — different projects never share memory.
+
 ## \# UI Buttons
 
 | Button | Action |
 |---|---|
-| **⚡ Agent** | Agent mode — scans all files, plans changes, and applies them autonomously. Triggered by pressing `Enter`. |
+| **⚡ Agent** | Agent mode — scans all files, plans changes, and generates file edits. With **Auto Off** (default), changes are pending until you confirm with **⚡ Apply**. With **Auto On**, changes are written immediately. Triggered by pressing `Enter`. |
 | **🔧 Run & Fix** | Runs the project, feeds build errors to the LLM, applies fixes, and retries — up to 3 attempts. |
-| **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. |
+| **Send** | Chat-only mode — sends your message as a plain conversation without modifying any files. When `AGENT_CONCURRENT_FILES > 1` and multiple files are in scope, automatically switches to **Smart Send**: one parallel LLM call per file, results combined into a single response. |
 | **Clear** | Clears the current chat conversation history (same behavior as typing `clear` in chat). |
 | **Help** | Opens the in-app help modal listing all available chat commands and keyboard shortcuts. |
 | **⏹ Stop** | Aborts the current Agent or Send operation mid-stream. Only visible while a request is in progress. |
 | **🔒 Auto Off** | Toggles auto-apply mode. When **OFF** (default), each file change requires an explicit **⚡ Apply** confirmation. When **ON**, changes are applied immediately. Does **not** affect the Agent's planning phase — planning always runs regardless. |
+
+## \# Pinned Files
+
+Check the checkbox next to any file in the Explorer sidebar to **pin** it. A `📌 N pinned` badge appears at the bottom of the sidebar.
+
+When files are pinned, **⚡ Agent** skips its normal keyword-scoping and operates **only on those files**. This is useful when you want to refactor or update a specific file without the agent touching anything else.
+
+Pinning only affects the **Agent** button — Send and Run & Fix are not influenced.
 
 
 ## \# Chat Commands
@@ -91,20 +128,32 @@ ls /tmp/local-agent-on-steroids/
 | `model <name>` | Switch model |
 | `rescan` | Pick up new/changed files |
 | `clear` | Clear chat history |
+| `mem show` | Show project memory |
+| `mem clear` | Clear project memory |
+| `mem save <text>` | Append a note to project memory |
 | `help` | Show all commands |
 
 ## \# System Prompts
 
-There are three distinct system prompts used internally, each targeting a different operation mode. They are stored as embedded `.md` files under `webui/prompts/` and compiled into the binary at build time.
+System prompts are stored as embedded `.md` files under `webui/prompts/` and compiled into the binary at build time.
 
 | Prompt file | Triggered by |
 |---|---|
 | `webui/prompts/chat.md` | **Send** button — plain conversation, no file writes |
 | `webui/prompts/agent_edit.md` | **⚡ Agent** button — applied per-file in a parallel loop |
-| `webui/prompts/agent_create.md` | Agent sub-step when a new file needs to be created from scratch |
+| `webui/prompts/agent_doc.md` | **⚡ Agent** on `.md` / doc files — documentation writer prompt |
+| `webui/prompts/agent_plan.md` | **⚡ Agent** planning step — asks the model which files should be generated |
+| `webui/prompts/agent_create.md` | Agent legacy path — multi-file scaffold in a single LLM call |
+| `webui/prompts/agent_create_single.md` | Agent per-file path — one focused LLM call per planned file (code files only) |
 | `webui/prompts/agent_fix.md` | **🔧 Run & Fix** button — language-agnostic fix prompt used in each repair iteration |
 
-All three prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, and session changelog) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
+All prompts are the static base. At runtime the server appends dynamic context (file tree, file contents, session changelog, and **project memory**) before sending to the LLM. Edit the `.md` files directly to tune the behaviour and rebuild — no Go string hunting required.
+
+Documentation files (`README.md`, `*.md`, `docs/`) always use `agent_doc.md` instead of the code-generation prompts. The doc path additionally receives:
+- **Existing file content** — so the model can preserve and extend what is already correct rather than rewriting from scratch
+- **Prioritised source snippets** — entry-point files (`main.*`, `index.*`, `server.*`) and manifests (`go.mod`, `package.json`, `Makefile`, `Dockerfile`) appear first in the context window
+- **Detected build/run commands** — extracted from `go.mod`, `package.json` scripts, `Makefile` targets, and `Dockerfile` `ENTRYPOINT`/`CMD` lines so Getting Started instructions use the real commands
+- **Canonical project name** — parsed from the module declaration (`go.mod`, `package.json`, `Cargo.toml`) instead of the local directory name
 
 ## \# External API
 
@@ -207,7 +256,6 @@ Create `.agent/config.yaml` (see [examples/config.yaml](examples/config.yaml)):
 
 ```yaml
 agent:
-  token_limit: 8000       # match OLLAMA_CONTEXT_LENGTH (default: 4000)
   concurrent_files: 5     # match OLLAMA_NUM_PARALLEL (default: 1)
 
 llm:

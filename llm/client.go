@@ -21,11 +21,12 @@ type Client interface {
 
 // ChatRequest represents a request to the LLM
 type ChatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Stream      bool      `json:"stream"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Model       string                 `json:"model"`
+	Messages    []Message              `json:"messages"`
+	Stream      bool                   `json:"stream"`
+	Temperature float64                `json:"temperature,omitempty"`
+	MaxTokens   int                    `json:"max_tokens,omitempty"`
+	Options     map[string]interface{} `json:"options,omitempty"`
 }
 
 // Message represents a chat message
@@ -51,15 +52,18 @@ type ChatResponse struct {
 type OllamaClient struct {
 	endpoint   string
 	model      string
+	numCtx     int
 	httpClient *http.Client
 	timeout    time.Duration
 }
 
-// NewOllamaClient creates a new Ollama client
-func NewOllamaClient(endpoint, model string, timeout int) *OllamaClient {
+// NewOllamaClient creates a new Ollama client.
+// numCtx sets the Ollama context window (num_ctx); pass 0 to use Ollama's default.
+func NewOllamaClient(endpoint, model string, timeout, numCtx int) *OllamaClient {
 	return &OllamaClient{
 		endpoint: endpoint,
 		model:    model,
+		numCtx:   numCtx,
 		httpClient: &http.Client{
 			Timeout: time.Duration(timeout) * time.Second,
 		},
@@ -76,6 +80,16 @@ func (c *OllamaClient) Chat(ctx context.Context, request *ChatRequest) (*ChatRes
 
 	// Ensure stream is false (we want complete responses)
 	request.Stream = false
+
+	// Inject num_ctx into options if configured and not already set by caller.
+	if c.numCtx > 0 {
+		if request.Options == nil {
+			request.Options = make(map[string]interface{})
+		}
+		if _, already := request.Options["num_ctx"]; !already {
+			request.Options["num_ctx"] = c.numCtx
+		}
+	}
 
 	jsonData, err := json.Marshal(request)
 	if err != nil {

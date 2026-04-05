@@ -128,6 +128,7 @@ const htmlTemplate = `<!DOCTYPE html>
         .msg { display: flex; flex-direction: column; max-width: 92%; }
         .msg.user { align-self: flex-end; align-items: flex-end; }
         .msg.assistant { align-self: flex-start; align-items: flex-start; }
+        .msg.info { align-self: flex-start; align-items: flex-start; }
         .msg-meta { font-size: 0.72rem; color: var(--text2); margin-bottom: 0.25rem; }
         .bubble {
             padding: 0.75rem 1rem; border-radius: 10px; line-height: 1.65;
@@ -135,6 +136,7 @@ const htmlTemplate = `<!DOCTYPE html>
         }
         .msg.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
         .msg.assistant .bubble { background: var(--bg2); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
+        .msg.info .bubble { background: var(--bg2); border: 1px solid var(--border); border-bottom-left-radius: 3px; opacity: 0.85; }
         /* Markdown inside bubbles */
         .bubble h1 { font-size: 1.1rem; color: var(--accent); margin: 0.6rem 0 0.3rem; }
         .bubble h2 { font-size: 0.97rem; color: var(--accent); margin: 0.5rem 0 0.25rem; }
@@ -402,6 +404,7 @@ const htmlTemplate = `<!DOCTYPE html>
             </div>
             <input type="search" class="file-search" id="fileSearch" placeholder="Search files…">
             <div class="file-tree" id="fileTree"><span class="muted">Loading…</span></div>
+            <div id="pinBadge" style="display:none;font-size:0.75rem;padding:4px 8px;color:var(--accent);cursor:pointer" title="Click to clear pinned files" onclick="clearPins()"></div>
         </aside>
 
         <!-- Main content -->
@@ -488,6 +491,9 @@ const htmlTemplate = `<!DOCTYPE html>
                 <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">rescan</code></td><td>Rescan the directory for changes</td></tr>
                 <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">stats</code></td><td>Show current statistics</td></tr>
                 <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">files</code></td><td>List all files in scope</td></tr>
+                <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">mem show</code></td><td>Show project memory</td></tr>
+                <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">mem clear</code></td><td>Clear project memory</td></tr>
+                <tr><td style="padding:0.2rem 0.6rem 0.2rem 0;white-space:nowrap"><code style="color:var(--accent)">mem save &lt;text&gt;</code></td><td>Append text to project memory</td></tr>
             </table>
             <hr style="border:none;border-top:1px solid var(--border);margin:0.8rem 0">
             <p style="font-size:0.85rem;color:var(--muted);margin:0">💡 <strong>Enter</strong> = ⚡ Agent &nbsp;•&nbsp; <strong>Shift+Enter</strong> = new line &nbsp;•&nbsp; <strong>Send</strong> = chat only</p>
@@ -523,10 +529,12 @@ const htmlTemplate = `<!DOCTYPE html>
 var allFiles       = [];      // FileEntry[] from /api/files
 var codeStore      = {};      // blockId -> {lang, file, code}
 var currentFile    = null;    // relPath of open file
+var pinnedFiles    = new Set(); // relPaths selected for targeted agent edits
 // autoApply: when false (default) chat code blocks are never
 // written automatically — the user must click ⚡ Apply explicitly.
 var autoApply      = false;
-var agentPendingStore = {};   // cardId -> {file, oldContent, newContent, deleted}
+var agentPendingStore = {};   // cardId -> {file, oldContent, newContent, deleted, task}
+var _lastAgentTask    = '';   // task text from the most recent agent submission
 var agentBulkGroups   = {};   // barId  -> [cardId, ...]
 var agentRevertStore  = {};   // revertId -> {file, oldContent}
 var origContent    = null;    // content when file was loaded
@@ -780,7 +788,7 @@ function pollMessages() {
                 c.appendChild(makeMsgEl(m.role, m.content, m.timestamp, m.duration_ms, m.prompt_eval_count));
                 if (m.agentResults && m.agentResults.length) {
                     var hasPending = m.agentResults.some(function(r){ return r.pending; });
-                    if (hasPending) { renderAgentPendingResults(m.agentResults, c); }
+                    if (hasPending) { renderAgentPendingResults(m.agentResults, c, _lastAgentTask); }
                     else            { renderAgentResults(m.agentResults, c); }
                 }
             });
@@ -909,7 +917,7 @@ function loadMessages() {
             if (m.agentResults && m.agentResults.length) {
                 var hasPending = m.agentResults.some(function(r){ return r.pending; });
                 if (hasPending) {
-                    renderAgentPendingResults(m.agentResults, c);
+                    renderAgentPendingResults(m.agentResults, c, _lastAgentTask);
                 } else {
                     renderAgentResults(m.agentResults, c);
                 }
@@ -925,7 +933,7 @@ function makeMsgEl(role, content, ts, durationMs, promptEvalCount) {
     wrap.className = 'msg ' + role;
     var meta   = document.createElement('div');
     meta.className = 'msg-meta';
-    var metaText = (role === 'user' ? 'You' : '🤖 Assistant') + ' · ' + (ts ? new Date(ts).toLocaleTimeString() : '');
+    var metaText = (role === 'user' ? 'You' : role === 'info' ? '[info]' : '🤖 Assistant') + ' · ' + (ts ? new Date(ts).toLocaleTimeString() : '');
     if (role === 'assistant' && durationMs && durationMs > 0) {
         var totalSecs = durationMs / 1000;
         var durStr;
@@ -949,7 +957,24 @@ function makeMsgEl(role, content, ts, durationMs, promptEvalCount) {
     meta.textContent = metaText;
     var bubble = document.createElement('div');
     bubble.className = 'bubble';
-    if (role === 'assistant') {
+    if (role === 'info') {
+        var rows = content.split('\n');
+        var html = '<table style="border-collapse:collapse;font-size:0.9em">';
+        rows.forEach(function(row) {
+            row = row.trim();
+            if (!row) return;
+            var sep = row.indexOf(': ');
+            if (sep !== -1) {
+                var k = row.slice(0, sep);
+                var v = row.slice(sep + 2);
+                html += '<tr><td style="padding:0.1rem 1.2rem 0.1rem 0;color:var(--text2);white-space:nowrap">' + k + '</td><td>' + v + '</td></tr>';
+            } else {
+                html += '<tr><td colspan="2" style="padding:0.4rem 0 0.1rem;color:var(--text2);font-style:italic">' + row + '</td></tr>';
+            }
+        });
+        html += '</table>';
+        bubble.innerHTML = html;
+    } else if (role === 'assistant') {
         bubble.innerHTML = renderMarkdown(content);
     } else {
         bubble.textContent = content;
@@ -1043,6 +1068,7 @@ function sendAgentTask() {
     var inp = document.getElementById('msgInput');
     var txt = inp.value.trim();
     if (!txt) return;
+    _lastAgentTask = txt;
 
     var c = document.getElementById('messages');
     c.appendChild(makeMsgEl('user', txt, new Date().toISOString()));
@@ -1090,9 +1116,9 @@ function sendAgentTask() {
             c.appendChild(makeMsgEl(d.message.role, d.message.content, d.message.timestamp, d.message.duration_ms, d.message.prompt_eval_count));
             c.scrollTop = c.scrollHeight;
             if (d.agentResults && d.agentResults.length) {
-                var hasPending = d.agentResults.some(function(r){ return r.pending; });
+                    var hasPending = d.agentResults.some(function(r){ return r.pending; });
                 if (hasPending) {
-                    renderAgentPendingResults(d.agentResults, c);
+                    renderAgentPendingResults(d.agentResults, c, _lastAgentTask);
                 } else {
                     renderAgentResults(d.agentResults, c);
                 }
@@ -1111,10 +1137,12 @@ function sendAgentTask() {
     }
 
     // Use streaming fetch so we can update the status bubble live.
+    var agentBody = { task: txt };
+    if (pinnedFiles.size > 0) { agentBody.pinnedFiles = Array.from(pinnedFiles); }
     fetch('/api/agent/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task: txt }),
+        body: JSON.stringify(agentBody),
         signal: controller.signal
     }).then(function(resp) {
         if (!resp.ok || !resp.body) {
@@ -1334,7 +1362,7 @@ function renderAgentResults(results, container) {
 
 // renderAgentPendingResults shows each proposed file change with
 // individual Apply / Deny buttons plus an Apply-All / Deny-All bar.
-function renderAgentPendingResults(results, container) {
+function renderAgentPendingResults(results, container, task) {
     var pendingCardIds = [];
     var barId = 'agentBar_' + Date.now();
 
@@ -1354,7 +1382,7 @@ function renderAgentPendingResults(results, container) {
                 '<span style="color:var(--text2)">\u2014 <code>' + esc(r.file) + '</code> \u2014 no change needed</span>' +
                 '</div>';
         } else if (r.deleted) {
-            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: '', deleted: true };
+            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: '', deleted: true, task: task||'' };
             pendingCardIds.push(cardId);
             var diffHtml = buildDiffHtml(r.oldContent||'', '');
             var uid2 = 'idiff_p_' + Date.now() + '_' + i;
@@ -1380,7 +1408,7 @@ function renderAgentPendingResults(results, container) {
                 '</div>' +
                 '</div>';
         } else {
-            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: r.newContent||'' };
+            agentPendingStore[cardId] = { file: r.file, oldContent: r.oldContent||'', newContent: r.newContent||'', task: task||'' };
             pendingCardIds.push(cardId);
             var icon  = r.created ? '\u2728 New file' : '\ud83d\udcdd Proposed';
             var color = r.created ? 'var(--accent2)' : 'var(--yellow)';
@@ -1449,8 +1477,8 @@ function agentApplyFile(cardId) {
     if (denyBtn)  { denyBtn.disabled  = true; }
 
     var commitBody = pending.deleted
-        ? JSON.stringify({ files: [{ path: pending.file, delete: true }] })
-        : JSON.stringify({ files: [{ path: pending.file, content: pending.newContent }] });
+        ? JSON.stringify({ files: [{ path: pending.file, delete: true }], task: pending.task||'' })
+        : JSON.stringify({ files: [{ path: pending.file, content: pending.newContent }], task: pending.task||'' });
     fetch('/api/agent/commit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1836,8 +1864,31 @@ function renderTree(files) {
 function treeFileHTML(relPath) {
     var name  = relPath.split('/').pop();
     var safe  = relPath.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    return '<div class="tree-file" onclick="openFile(\'' + safe + '\')" data-path="' + esc(relPath) + '">' +
-           '<span>' + fileIcon(relPath) + '</span><span class="fname">' + esc(name) + '</span></div>';
+    var checked = pinnedFiles.has(relPath) ? ' checked' : '';
+    return '<div class="tree-file" data-path="' + esc(relPath) + '">' +
+           '<input type="checkbox" class="pin-cb" title="Pin for targeted edit"' + checked +
+           ' onclick="event.stopPropagation();togglePin(\'' + safe + '\',this)">' +
+           '<span onclick="openFile(\'' + safe + '\')">' + fileIcon(relPath) + '</span>' +
+           '<span class="fname" onclick="openFile(\'' + safe + '\')">' + esc(name) + '</span></div>';
+}
+
+function togglePin(relPath, cb) {
+    if (cb.checked) { pinnedFiles.add(relPath); } else { pinnedFiles.delete(relPath); }
+    updatePinBadge();
+}
+
+function updatePinBadge() {
+    var badge = document.getElementById('pinBadge');
+    if (!badge) return;
+    var n = pinnedFiles.size;
+    badge.textContent = n > 0 ? '\uD83D\uDCCC ' + n + ' pinned' : '';
+    badge.style.display = n > 0 ? 'inline' : 'none';
+}
+
+function clearPins() {
+    pinnedFiles.clear();
+    document.querySelectorAll('.pin-cb').forEach(function(cb){ cb.checked = false; });
+    updatePinBadge();
 }
 
 function highlightTreeFile(relPath) {

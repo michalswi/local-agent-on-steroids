@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/michalswi/local-agent-on-steroids/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -37,6 +38,7 @@ type LLMConfig struct {
 	APIKey      string  `yaml:"api_key,omitempty" json:"api_key,omitempty"`
 	Temperature float64 `yaml:"temperature" json:"temperature"`
 	Timeout     int     `yaml:"timeout" json:"timeout"` // seconds
+	NumCtx      int     `yaml:"num_ctx" json:"num_ctx"` // Ollama context window tokens (0 = use Ollama default)
 }
 
 // FilterConfig contains file filtering rules
@@ -81,9 +83,11 @@ func DefaultConfig() *Config {
 			Provider: "ollama",
 			Endpoint: "http://localhost:11434",
 			Model:    "wizardlm2:7b", // https://ollama.com/library/wizardlm2
-			// Model:       "gemma3:4b", // https://ollama.com/library/gemma3
-			Temperature: 0.3, // 0.1 might be too conservative..
-			Timeout:     300, // 5 minutes for large batches
+			// Model: "gemma3:4b", // https://ollama.com/library/gemma3
+			// Model: "gemma4:e4b", // https://ollama.com/library/gemma4
+			Temperature: 0.3,   // 0.1 might be too conservative..
+			Timeout:     300,   // 5 minutes for large batches
+			NumCtx:      32768, // 32K context; set to 0 to use Ollama default (4096)
 		},
 		Filters: FilterConfig{
 			RespectGitignore: true,
@@ -96,55 +100,32 @@ func DefaultConfig() *Config {
 				"build/**",
 				"vendor/**",
 			},
-			AllowPatterns: []string{
-				"*.go",
-				"*.mod",
-				"*.sum",
-				"*.js",
-				"*.ts",
-				"*.py",
-				"*.java",
-				"*.c",
-				"*.cpp",
-				"*.h",
-				"*.md",
-				"*.yaml",
-				"*.yml",
-				"*.json",
-				"*.toml",
-				"*.txt",
-				"*.tf",
-				"*.tfvars",
-				"*.rs",
-				"*.rb",
-				"*.php",
-				"*.sh",
-				"*.swift",
-				"*.kt",
-				"*.scala",
-				"*.log",
-				"*.pdf",
-				"*.pcap",
-				"*.env",
-				"*.env.*",
-				"*.key",
-				"*.pem",
-				"*.crt",
-				"Dockerfile",
-				"Makefile",
-				"*.dockerfile",
-				"*.conf",
-				"*.service",
+			// Build AllowPatterns from the central language registry (code/config
+			// extensions) plus non-language patterns that are always included.
+			AllowPatterns: func() []string {
+				var out []string
+				for _, e := range types.LangRegistry {
+					if e.AllowGlob != "" {
+						out = append(out, e.AllowGlob)
+					}
+				}
+				// Go module files
+				out = append(out, "*.mod", "*.sum")
+				// Infrastructure
+				out = append(out, "*.tf", "*.tfvars")
+				// Data / analysis targets
+				out = append(out, "*.log", "*.pdf", "*.pcap")
+				// Secrets / credentials (included for scanning; detection handled separately)
+				out = append(out, "*.env.*", "*.key", "*.pem", "*.crt")
+				// Container / build system
+				out = append(out, "Dockerfile", "Makefile", "*.dockerfile", "*.conf", "*.service")
 				// Common dotfiles (no extension — need explicit names)
-				".gitignore",
-				".dockerignore",
-				".editorconfig",
-				".eslintrc",
-				".prettierrc",
-				".babelrc",
-				".nvmrc",
-				".node-version",
-			},
+				out = append(out,
+					".gitignore", ".dockerignore", ".editorconfig",
+					".eslintrc", ".prettierrc", ".babelrc", ".nvmrc", ".node-version",
+				)
+				return out
+			}(),
 		},
 		Security: SecurityConfig{
 			DetectSecrets:  false, // Disabled by default

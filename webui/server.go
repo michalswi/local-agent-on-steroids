@@ -3,6 +3,7 @@ package webui
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"github.com/michalswi/local-agent-on-steroids/config"
 	"github.com/michalswi/local-agent-on-steroids/filter"
 	"github.com/michalswi/local-agent-on-steroids/llm"
+	"github.com/michalswi/local-agent-on-steroids/memory"
 	"github.com/michalswi/local-agent-on-steroids/sessionlog"
 	"github.com/michalswi/local-agent-on-steroids/types"
 )
@@ -37,11 +39,39 @@ func mustPrompt(name string) string {
 	return strings.TrimSpace(string(data))
 }
 
+// maxMessages is the maximum number of messages kept in the in-memory chat
+// history. Entries beyond this limit are dropped from the front of the slice.
+const maxMessages = 200
+
+// maxAgentLogEntries caps the agent changelog that is injected into every
+// agent prompt. Older entries are dropped first to bound prompt token usage.
+const maxAgentLogEntries = 50
+
+// maxTaskPlanCacheEntries bounds in-memory cached initial plans used when
+// memory autosave runs after the request lifecycle has already cleared
+// transient progress fields (e.g. pending -> commit flow).
+const maxTaskPlanCacheEntries = 128
+
+// docCompletionSentinel must be the final line emitted by doc-generation
+// prompts so we can detect truncated/incomplete outputs reliably.
+const docCompletionSentinel = "<END_OF_DOC>"
+
+// docContextMaxBytes caps the total source context injected into doc prompts.
+// Even on local models, unbounded prompt growth leaves too little room for the
+// model's completion and increases truncation risk.
+const docContextMaxBytes = 96 * 1024
+
+// docContextSnippetBytes caps each per-file snippet included in doc context.
+const docContextSnippetBytes = 8 * 1024
+
 var (
-	promptChat        = mustPrompt("prompts/chat.md")
-	promptAgentEdit   = mustPrompt("prompts/agent_edit.md")
-	promptAgentCreate = mustPrompt("prompts/agent_create.md")
-	promptAgentFix    = mustPrompt("prompts/agent_fix.md")
+	promptChat              = mustPrompt("prompts/chat.md")
+	promptAgentEdit         = mustPrompt("prompts/agent_edit.md")
+	promptAgentCreate       = mustPrompt("prompts/agent_create.md")
+	promptAgentCreateSingle = mustPrompt("prompts/agent_create_single.md")
+	promptAgentFix          = mustPrompt("prompts/agent_fix.md")
+	promptAgentDoc          = mustPrompt("prompts/agent_doc.md")
+	promptAgentPlan         = mustPrompt("prompts/agent_plan.md")
 )
 
 // AgentLogEntry records a single file operation performed by the agent.
@@ -71,19 +101,23 @@ type Server struct {
 	taskKind         string              // "chat" | "agent"
 	lastProgressText string              // last progress message from the running agent task
 	planProgressText string              // sticky plan line (kept while a task runs)
+	taskPlanCache    map[string]string   // task hash -> initial plan text for memory autosave fallback
 	scanFilter       *filter.Filter      // filter snapshot from startup; reused by rescan so agent-created files (e.g. .gitignore) don't hide themselves
 	writtenFiles     map[string]struct{} // rel paths written via /api/file/write; always shown on rescan
+	memoryPath       string              // absolute path to this project's memory.md (empty when memory disabled)
+	memoryWriteMu    sync.Mutex          // serializes memory.md load+merge+save updates
+	homeDir          string              // homedir for session logs and memory
 	mu               sync.RWMutex
 }
 
 // Message represents a chat message
 type Message struct {
-	Role           string            `json:"role"`
-	Content        string            `json:"content"`
-	Timestamp      time.Time         `json:"timestamp"`
-	DurationMs     int64             `json:"duration_ms,omitempty"`
-	PromptEvalCount int              `json:"prompt_eval_count,omitempty"`
-	AgentResults   []AgentFileResult `json:"agentResults,omitempty"`
+	Role            string            `json:"role"`
+	Content         string            `json:"content"`
+	Timestamp       time.Time         `json:"timestamp"`
+	DurationMs      int64             `json:"duration_ms,omitempty"`
+	PromptEvalCount int               `json:"prompt_eval_count,omitempty"`
+	AgentResults    []AgentFileResult `json:"agentResults,omitempty"`
 }
 
 // ChatRequest represents an incoming chat message
@@ -113,18 +147,24 @@ type StatusResponse struct {
 }
 
 // NewServer creates a new web UI server
-func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, cfg *config.Config, llmClient *llm.OllamaClient, focusedPath string) *Server {
+func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, cfg *config.Config, llmClient *llm.OllamaClient, focusedPath, homeDir string, noMemory bool) *Server {
 	s := &Server{
-		directory:    directory,
-		model:        model,
-		endpoint:     endpoint,
-		indexTmpl:    template.Must(template.New("index").Parse(htmlTemplate)),
-		scanResult:   scanResult,
-		focusedPath:  focusedPath,
-		cfg:          cfg,
-		llmClient:    llmClient,
-		messages:     make([]Message, 0),
-		writtenFiles: make(map[string]struct{}),
+		directory:     directory,
+		model:         model,
+		endpoint:      endpoint,
+		indexTmpl:     template.Must(template.New("index").Parse(htmlTemplate)),
+		scanResult:    scanResult,
+		focusedPath:   focusedPath,
+		cfg:           cfg,
+		llmClient:     llmClient,
+		messages:      make([]Message, 0),
+		taskPlanCache: make(map[string]string),
+		writtenFiles:  make(map[string]struct{}),
+		homeDir:       homeDir,
+	}
+
+	if !noMemory && homeDir != "" {
+		s.memoryPath = memory.Path(homeDir, directory)
 	}
 
 	// Capture the filter state at startup. Re-using this on every rescan
@@ -134,10 +174,24 @@ func NewServer(directory, model, endpoint string, scanResult *types.ScanResult, 
 		s.scanFilter = f
 	}
 
-	s.messages = append(s.messages, Message{
-		Role: "assistant",
-		Content: fmt.Sprintf("🤖 Interactive mode started!\n\nScanned: %s\nFiles found: %d\nModel: %s\n\nConcurrent Files: %d\nTemperature: %.2f\n\nType your questions or commands.",
-			directory, scanResult.TotalFiles, model, cfg.Agent.ConcurrentFiles, cfg.LLM.Temperature),
+	memStatus := "disabled"
+	if s.memoryPath != "" {
+		rel := s.memoryPath
+		if s.homeDir != "" {
+			if r, err := filepath.Rel(s.homeDir, s.memoryPath); err == nil {
+				rel = r
+			}
+		}
+		if _, err := os.Stat(s.memoryPath); err == nil {
+			memStatus = "loaded (" + rel + ")"
+		} else {
+			memStatus = "ready (" + rel + ")"
+		}
+	}
+	s.appendMessageLocked(Message{
+		Role: "info",
+		Content: fmt.Sprintf("Scanned: %s\nFiles: %d\nModel: %s\nConcurrent Files: %d\nTemperature: %.2f\nMemory: %s\n\nType your questions or commands.",
+			directory, scanResult.TotalFiles, model, cfg.Agent.ConcurrentFiles, cfg.LLM.Temperature, memStatus),
 		Timestamp: time.Now(),
 	})
 
@@ -170,6 +224,7 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/agent/fixstream", s.handleFixStream)
 	mux.HandleFunc("/api/ext/send", s.handleExtSend)
 	mux.HandleFunc("/api/ext/stream", s.handleExtStream)
+	mux.HandleFunc("/api/memory", s.handleMemory)
 
 	addr := fmt.Sprintf(":%d", port)
 	log.Printf("🌐 Web UI available at http://localhost%s\n", addr)
@@ -225,6 +280,460 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
+// memoryContext returns the project memory content to be prepended to system
+// prompts.  Returns an empty string when memory is disabled or the file is
+// empty / unreadable.
+func (s *Server) memoryContext() string {
+	if s.memoryPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(s.memoryPath)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	return "Project memory (facts from previous sessions — use this as background context):\n\n" + strings.TrimSpace(string(data))
+}
+
+// autoSaveMemory appends a structured summary (Option A) plus an LLM-generated
+// one-liner (Option B) to the project memory file after a successful agent run.
+// It is a no-op when memory is disabled (memoryPath == "").
+// The LLM call runs in a background goroutine so it never blocks the response.
+func (s *Server) autoSaveMemory(task string, results []AgentFileResult) {
+	if s.memoryPath == "" {
+		return
+	}
+	taskKey := hashTaskForMemory(task)
+	var changed, created, deleted []string
+	for _, r := range results {
+		if r.Error != "" {
+			continue
+		}
+		if r.Deleted {
+			deleted = append(deleted, r.File)
+		} else if r.Created {
+			created = append(created, r.File)
+		} else if r.Changed {
+			changed = append(changed, r.File)
+		}
+	}
+	changed = uniqueStringList(changed)
+	created = uniqueStringList(created)
+	deleted = uniqueStringList(deleted)
+	if len(changed)+len(created)+len(deleted) == 0 {
+		return
+	}
+	s.mu.RLock()
+	planText := strings.TrimSpace(s.planProgressText)
+	if planText == "" {
+		planText = strings.TrimSpace(s.taskPlanCache[taskKey])
+	}
+	s.mu.RUnlock()
+	if planText == "" {
+		planText = buildFallbackPlanForMemory(changed, created, deleted)
+	}
+
+	taskSummary := compactTaskForMemory(task)
+	event := memoryTaskEvent{
+		Timestamp: time.Now(),
+		TaskKey:   taskKey,
+		Task:      taskSummary,
+		Plan:      normalizePlanForMemory(planText),
+		Modified:  changed,
+		Created:   created,
+		Deleted:   deleted,
+	}
+	allFiles := append(append(append([]string{}, changed...), created...), deleted...)
+	s.mu.RLock()
+	client := s.llmClient
+	homeDir := s.homeDir
+	directory := s.directory
+	s.mu.RUnlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		prompt := fmt.Sprintf(
+			"In 1 short sentence, describe what was done. Task: %q. Files: %v.",
+			taskSummary, allFiles,
+		)
+		resp, err := client.Chat(ctx, &llm.ChatRequest{
+			Messages:  []llm.Message{{Role: "user", Content: prompt}},
+			MaxTokens: 120,
+		})
+		if err == nil && resp != nil {
+			event.Summary = strings.TrimSpace(resp.Message.Content)
+		}
+
+		s.memoryWriteMu.Lock()
+		defer s.memoryWriteMu.Unlock()
+
+		existing, loadErr := memory.Load(homeDir, directory)
+		if loadErr != nil {
+			_ = memory.Append(homeDir, directory, strings.TrimSpace(renderMemoryTaskEvent(event)))
+			return
+		}
+		updated := upsertMemoryTaskEvent(existing, event)
+		_ = memory.Save(homeDir, directory, updated)
+	}()
+}
+
+var memoryEntryHeaderRE = regexp.MustCompile(`(?m)^## \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n`)
+
+type memoryTaskEvent struct {
+	Timestamp time.Time
+	TaskKey   string
+	Task      string
+	Plan      string
+	Modified  []string
+	Created   []string
+	Deleted   []string
+	Summary   string
+}
+
+func compactTaskForMemory(task string) string {
+	task = strings.ReplaceAll(task, "\r\n", "\n")
+	firstLine := ""
+	for _, line := range strings.Split(task, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			firstLine = line
+			break
+		}
+	}
+	if firstLine == "" {
+		firstLine = strings.TrimSpace(task)
+	}
+	firstLine = strings.Join(strings.Fields(firstLine), " ")
+	if firstLine == "" {
+		return "(empty task)"
+	}
+	const maxTaskChars = 220
+	if len(firstLine) > maxTaskChars {
+		return strings.TrimSpace(firstLine[:maxTaskChars-3]) + "..."
+	}
+	return firstLine
+}
+
+func hashTaskForMemory(task string) string {
+	norm := strings.ToLower(strings.Join(strings.Fields(task), " "))
+	sum := sha1.Sum([]byte(norm))
+	return fmt.Sprintf("%x", sum[:6])
+}
+
+func normalizePlanForMemory(plan string) string {
+	plan = strings.ReplaceAll(plan, "\r\n", "\n")
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return ""
+	}
+	lines := strings.Split(plan, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func buildFallbackPlanForMemory(changed, created, deleted []string) string {
+	var lines []string
+	for _, f := range sortedCopy(created) {
+		lines = append(lines, "• "+f+" — create file")
+	}
+	for _, f := range sortedCopy(changed) {
+		lines = append(lines, "• "+f+" — modify file")
+	}
+	for _, f := range sortedCopy(deleted) {
+		lines = append(lines, "• "+f+" — delete file")
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "📋 Plan (executed changes):\n" + strings.Join(lines, "\n")
+}
+
+func (s *Server) rememberTaskPlanForMemory(task, plan string) {
+	plan = normalizePlanForMemory(plan)
+	if task == "" || plan == "" {
+		return
+	}
+	key := hashTaskForMemory(task)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.taskPlanCache == nil {
+		s.taskPlanCache = make(map[string]string)
+	}
+	s.taskPlanCache[key] = plan
+	if len(s.taskPlanCache) > maxTaskPlanCacheEntries {
+		for k := range s.taskPlanCache {
+			if k != key {
+				delete(s.taskPlanCache, k)
+				break
+			}
+		}
+	}
+}
+
+func uniqueStringList(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		v := strings.TrimSpace(item)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func renderMemoryTaskEvent(e memoryTaskEvent) string {
+	ts := e.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	var sb strings.Builder
+	sb.WriteString("## ")
+	sb.WriteString(ts.Format("2006-01-02 15:04"))
+	sb.WriteString("\n")
+	if strings.TrimSpace(e.TaskKey) != "" {
+		sb.WriteString("TaskKey: ")
+		sb.WriteString(strings.TrimSpace(e.TaskKey))
+		sb.WriteString("\n")
+	}
+	if strings.TrimSpace(e.Task) != "" {
+		sb.WriteString("Task: ")
+		sb.WriteString(strings.TrimSpace(e.Task))
+		sb.WriteString("\n")
+	}
+	if strings.TrimSpace(e.Plan) != "" {
+		sb.WriteString("Plan:\n")
+		for _, line := range strings.Split(normalizePlanForMemory(e.Plan), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			sb.WriteString("  ")
+			sb.WriteString(strings.TrimSpace(line))
+			sb.WriteString("\n")
+		}
+	}
+	if files := uniqueStringList(e.Modified); len(files) > 0 {
+		sb.WriteString("Modified: ")
+		sb.WriteString(strings.Join(files, ", "))
+		sb.WriteString("\n")
+	}
+	if files := uniqueStringList(e.Created); len(files) > 0 {
+		sb.WriteString("Created: ")
+		sb.WriteString(strings.Join(files, ", "))
+		sb.WriteString("\n")
+	}
+	if files := uniqueStringList(e.Deleted); len(files) > 0 {
+		sb.WriteString("Deleted: ")
+		sb.WriteString(strings.Join(files, ", "))
+		sb.WriteString("\n")
+	}
+	if strings.TrimSpace(e.Summary) != "" {
+		sb.WriteString("Summary: ")
+		sb.WriteString(strings.TrimSpace(e.Summary))
+		sb.WriteString("\n")
+	}
+	return strings.TrimRight(sb.String(), "\n") + "\n"
+}
+
+func splitLastMemoryEntry(content string) (prefix string, last string, ok bool) {
+	matches := memoryEntryHeaderRE.FindAllStringIndex(content, -1)
+	if len(matches) == 0 {
+		return content, "", false
+	}
+	start := matches[len(matches)-1][0]
+	return strings.TrimRight(content[:start], "\n"), strings.TrimSpace(content[start:]), true
+}
+
+func parseMemoryTaskEvent(block string) memoryTaskEvent {
+	e := memoryTaskEvent{}
+	lines := strings.Split(strings.TrimSpace(block), "\n")
+	if len(lines) == 0 {
+		return e
+	}
+	if strings.HasPrefix(lines[0], "## ") {
+		if ts, err := time.Parse("2006-01-02 15:04", strings.TrimSpace(strings.TrimPrefix(lines[0], "## "))); err == nil {
+			e.Timestamp = ts
+		}
+	}
+	for i := 1; i < len(lines); i++ {
+		line := lines[i]
+		switch {
+		case strings.HasPrefix(line, "TaskKey: "):
+			e.TaskKey = strings.TrimSpace(strings.TrimPrefix(line, "TaskKey: "))
+		case strings.HasPrefix(line, "Task: "):
+			e.Task = strings.TrimSpace(strings.TrimPrefix(line, "Task: "))
+		case strings.HasPrefix(line, "Plan:"):
+			planInline := strings.TrimSpace(strings.TrimPrefix(line, "Plan:"))
+			planLines := make([]string, 0, 8)
+			if planInline != "" {
+				planLines = append(planLines, planInline)
+			}
+			for j := i + 1; j < len(lines); j++ {
+				next := lines[j]
+				if strings.TrimSpace(next) == "" {
+					continue
+				}
+				if isMemoryTopLevelField(next) {
+					i = j - 1
+					break
+				}
+				planLines = append(planLines, strings.TrimSpace(next))
+				i = j
+			}
+			e.Plan = normalizePlanForMemory(strings.Join(planLines, "\n"))
+		case strings.HasPrefix(line, "Modified: "):
+			e.Modified = parseCommaList(strings.TrimPrefix(line, "Modified: "))
+		case strings.HasPrefix(line, "Created: "):
+			e.Created = parseCommaList(strings.TrimPrefix(line, "Created: "))
+		case strings.HasPrefix(line, "Deleted: "):
+			e.Deleted = parseCommaList(strings.TrimPrefix(line, "Deleted: "))
+		case strings.HasPrefix(line, "Summary: "):
+			e.Summary = strings.TrimSpace(strings.TrimPrefix(line, "Summary: "))
+		}
+	}
+	return e
+}
+
+func isMemoryTopLevelField(line string) bool {
+	if strings.TrimLeft(line, " \t") != line {
+		return false
+	}
+	return strings.HasPrefix(line, "TaskKey: ") ||
+		strings.HasPrefix(line, "Task: ") ||
+		strings.HasPrefix(line, "Plan:") ||
+		strings.HasPrefix(line, "Modified: ") ||
+		strings.HasPrefix(line, "Created: ") ||
+		strings.HasPrefix(line, "Deleted: ") ||
+		strings.HasPrefix(line, "Summary: ")
+}
+
+func parseCommaList(v string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return uniqueStringList(out)
+}
+
+func mergeMemoryTaskEvents(prev memoryTaskEvent, incoming memoryTaskEvent) memoryTaskEvent {
+	out := prev
+	out.Timestamp = incoming.Timestamp
+	if out.TaskKey == "" {
+		out.TaskKey = incoming.TaskKey
+	}
+	if out.Task == "" {
+		out.Task = incoming.Task
+	}
+	if out.Plan == "" || (incoming.Plan != "" && len(incoming.Plan) > len(out.Plan)) {
+		out.Plan = incoming.Plan
+	}
+	out.Modified = uniqueStringList(append(out.Modified, incoming.Modified...))
+	out.Created = uniqueStringList(append(out.Created, incoming.Created...))
+	out.Deleted = uniqueStringList(append(out.Deleted, incoming.Deleted...))
+	if strings.TrimSpace(incoming.Summary) != "" {
+		out.Summary = incoming.Summary
+	}
+	return out
+}
+
+func upsertMemoryTaskEvent(existing string, incoming memoryTaskEvent) string {
+	existing = strings.TrimSpace(existing)
+	incomingBlock := strings.TrimSpace(renderMemoryTaskEvent(incoming))
+	if existing == "" {
+		return incomingBlock + "\n"
+	}
+
+	prefix, lastBlock, ok := splitLastMemoryEntry(existing)
+	if ok {
+		prev := parseMemoryTaskEvent(lastBlock)
+		if prev.TaskKey != "" && prev.TaskKey == incoming.TaskKey {
+			merged := strings.TrimSpace(renderMemoryTaskEvent(mergeMemoryTaskEvents(prev, incoming)))
+			if strings.TrimSpace(prefix) == "" {
+				return merged + "\n"
+			}
+			return strings.TrimRight(prefix, "\n") + "\n\n" + merged + "\n"
+		}
+	}
+
+	return strings.TrimRight(existing, "\n") + "\n\n" + incomingBlock + "\n"
+}
+
+// handleMemory handles GET/POST/DELETE /api/memory
+//
+//	GET    → returns {"content":"..."} (empty string when no memory file)
+//	POST   → body {"content":"..."} replaces the memory file
+//	DELETE → clears the memory file
+func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.memoryPath == "" {
+		http.Error(w, `{"error":"memory disabled (--no-memory flag was set)"}`, http.StatusForbidden)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		data, err := os.ReadFile(s.memoryPath)
+		if os.IsNotExist(err) {
+			json.NewEncoder(w).Encode(map[string]string{"content": ""})
+			return
+		}
+		if err != nil {
+			http.Error(w, `{"error":"failed to read memory"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"content": string(data)})
+	case http.MethodPost:
+		var body struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+			return
+		}
+		if err := memory.Save(s.homeDir, s.directory, body.Content); err != nil {
+			http.Error(w, `{"error":"failed to save memory"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	case http.MethodDelete:
+		if err := memory.Clear(s.homeDir, s.directory); err != nil {
+			http.Error(w, `{"error":"failed to clear memory"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -245,7 +754,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Add user message
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{
+	s.appendMessageLocked(Message{
 		Role:      "user",
 		Content:   userInput,
 		Timestamp: time.Now(),
@@ -259,13 +768,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(ChatResponse{Success: true, Cleared: true})
 			return
 		}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
 		s.mu.Lock()
 		msg := Message{
-			Role:      "assistant",
+			Role:      role,
 			Content:   response,
 			Timestamp: time.Now(),
 		}
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -280,6 +794,29 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// If there are no files at all, still send the request — the user may be
 	// asking the LLM to generate something from scratch.
 	activeFiles := s.scopeFilesToQuestion(userInput, s.getActiveFilesSnapshot())
+
+	// Deterministic guard: if the message is clearly asking to mutate project
+	// files (e.g. "delete webpack from code", "fix sh: webpack: command not
+	// found"), redirect to the Agent without calling the LLM.  The chat prompt
+	// already instructs the LLM to do this, but the LLM can misclassify the
+	// intent; this check is always reliable.
+	if mut, desc := isChatMutationRequest(userInput); mut {
+		redirectContent := fmt.Sprintf(
+			"💡 It looks like you want to %s. **Chat** can only answer questions — it never writes to disk.\n\nUse the **⚡ Agent** button to have me actually apply changes to your project.",
+			desc,
+		)
+		redirectMsg := Message{
+			Role:      "assistant",
+			Content:   redirectContent,
+			Timestamp: time.Now(),
+		}
+		s.mu.Lock()
+		s.appendMessageLocked(redirectMsg)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{Success: true, Message: &redirectMsg})
+		return
+	}
 
 	// Use a background context so a page refresh does NOT cancel the Ollama
 	// request. Only an explicit Stop press (via /api/stop) cancels it.
@@ -306,13 +843,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		cancel()
 	}()
 
-	resp, answer, duration, err := s.processQuestion(taskCtx, userInput, activeFiles)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return // stopped — keep the user message, no reply to store
+	s.mu.RLock()
+	chatConcurrency := s.cfg.Agent.ConcurrentFiles
+	s.mu.RUnlock()
+
+	var answer string
+	var duration time.Duration
+	var promptEvalCount int
+	if len(activeFiles) > 1 && chatConcurrency > 1 {
+		var parallelErr error
+		answer, duration, parallelErr = s.processQuestionParallel(taskCtx, userInput, activeFiles)
+		if parallelErr != nil {
+			if errors.Is(parallelErr, context.Canceled) {
+				return // stopped — keep the user message, no reply to store
+			}
+			sendError(w, parallelErr.Error())
+			return
 		}
-		sendError(w, err.Error())
-		return
+	} else {
+		var resp *llm.ChatResponse
+		var singleErr error
+		resp, answer, duration, singleErr = s.processQuestion(taskCtx, userInput, activeFiles)
+		if singleErr != nil {
+			if errors.Is(singleErr, context.Canceled) {
+				return // stopped — keep the user message, no reply to store
+			}
+			sendError(w, singleErr.Error())
+			return
+		}
+		if resp != nil {
+			promptEvalCount = resp.PromptEvalCount
+		}
+		s.saveSession(userInput, answer, resp, duration)
 	}
 
 	msg := Message{
@@ -320,14 +882,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Content:         answer,
 		Timestamp:       time.Now(),
 		DurationMs:      duration.Milliseconds(),
-		PromptEvalCount: resp.PromptEvalCount,
+		PromptEvalCount: promptEvalCount,
 	}
 
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
-
-	s.saveSession(userInput, answer, resp, duration)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ChatResponse{
@@ -376,17 +936,24 @@ func (s *Server) handleCommand(input string) string {
 • model <name> - Switch to a different LLM model
 • rescan - Rescan the directory for changes
 • stats - Show current statistics
-• files - List all files in scope`
+• files - List all files in scope
+• mem show - Show current project memory
+• mem clear - Clear project memory
+• mem save <text> - Append text to project memory`
 
 	case lower == "stats":
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		activeFiles := s.getActiveFilesLocked()
-		return fmt.Sprintf(`📊 Statistics:
-• Directory: %s
-• Total files scanned: %d
-• Active files: %d
-• Model: %s`, s.directory, s.scanResult.TotalFiles, len(activeFiles), s.model)
+		memStat := "disabled"
+		if s.memoryPath != "" {
+			if _, err := os.Stat(s.memoryPath); err == nil {
+				memStat = "loaded"
+			} else {
+				memStat = "ready"
+			}
+		}
+		return fmt.Sprintf("__INFO__:Directory: %s\nTotal files scanned: %d\nActive files: %d\nModel: %s\nConcurrent Files: %d\nTemperature: %.2f\nMemory: %s", s.directory, s.scanResult.TotalFiles, len(activeFiles), s.model, s.cfg.Agent.ConcurrentFiles, s.cfg.LLM.Temperature, memStat)
 
 	case lower == "files":
 		s.mu.RLock()
@@ -415,7 +982,7 @@ func (s *Server) handleCommand(input string) string {
 		oldModel := s.model
 		s.model = newModel
 		s.cfg.LLM.Model = newModel
-		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, newModel, s.cfg.LLM.Timeout)
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, newModel, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
 		s.mu.Unlock()
 		return fmt.Sprintf("✅ Model switched: %s → %s\n\nYou can now continue asking questions.", oldModel, newModel)
 
@@ -429,6 +996,41 @@ func (s *Server) handleCommand(input string) string {
 		s.mu.Unlock()
 		return fmt.Sprintf("✅ Rescan complete!\n\nFiles found: %d\nFiltered: %d\nTotal size: %s",
 			scanResult.TotalFiles, scanResult.FilteredFiles, formatBytes(scanResult.TotalSize))
+
+	case lower == "mem show":
+		if s.memoryPath == "" {
+			return "⚠️  Memory is disabled (started with --no-memory)."
+		}
+		data, err := os.ReadFile(s.memoryPath)
+		if os.IsNotExist(err) || len(data) == 0 {
+			return "📭 No project memory yet.\n\nUse `mem save <text>` to add notes."
+		}
+		if err != nil {
+			return fmt.Sprintf("❌ Failed to read memory: %v", err)
+		}
+		return fmt.Sprintf("🧠 Project memory (%s):\n\n%s", s.memoryPath, string(data))
+
+	case lower == "mem clear":
+		if s.memoryPath == "" {
+			return "⚠️  Memory is disabled (started with --no-memory)."
+		}
+		if err := memory.Clear(s.homeDir, s.directory); err != nil {
+			return fmt.Sprintf("❌ Failed to clear memory: %v", err)
+		}
+		return "🗑️  Project memory cleared."
+
+	case strings.HasPrefix(lower, "mem save "):
+		if s.memoryPath == "" {
+			return "⚠️  Memory is disabled (started with --no-memory)."
+		}
+		text := strings.TrimSpace(input[len("mem save "):])
+		if text == "" {
+			return "⚠️  Please provide text to save."
+		}
+		if err := memory.Append(s.homeDir, s.directory, text); err != nil {
+			return fmt.Sprintf("❌ Failed to save memory: %v", err)
+		}
+		return "✅ Saved to project memory."
 
 	}
 
@@ -509,8 +1111,45 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 			matched = append(matched, f)
 		}
 	}
+	// If the task contains a shell/build error ("command not found", "cannot
+	// find module", etc.) always include manifest files in the scope so the
+	// agent can fix the dependency declaration directly rather than editing
+	// unrelated source files that were matched by keyword.
+	if commandNotFoundRe.MatchString(lower) ||
+		strings.Contains(lower, "cannot find module") ||
+		strings.Contains(lower, "modulenotfounderror") ||
+		strings.Contains(lower, "no module named") {
+		manifestNames := map[string]bool{
+			"package.json": true, "requirements.txt": true, "pyproject.toml": true,
+			"setup.py": true, "cargo.toml": true, "go.mod": true, "pom.xml": true,
+			"build.gradle": true, "gemfile": true,
+		}
+		manifestSet := map[string]bool{}
+		for _, f := range matched {
+			manifestSet[strings.ToLower(filepath.Base(f.RelPath))] = true
+		}
+		for _, f := range all {
+			base := strings.ToLower(filepath.Base(f.RelPath))
+			if manifestNames[base] && !manifestSet[base] {
+				matched = append(matched, f)
+				manifestSet[base] = true
+			}
+		}
+	}
 	if len(matched) > 0 {
 		return matched
+	}
+
+	// Read-only review / analysis with no specific file mentioned — the user
+	// wants feedback on the whole project, not a subset.
+	if strings.Contains(lower, "review") ||
+		strings.Contains(lower, "analyze") ||
+		strings.Contains(lower, "analyse") ||
+		strings.Contains(lower, "audit") ||
+		strings.Contains(lower, "assess") ||
+		strings.Contains(lower, "check the code") ||
+		strings.Contains(lower, "go through the code") {
+		return all
 	}
 
 	// No explicit file mentions: pick a conservative, likely-relevant subset.
@@ -531,21 +1170,6 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 	// 2) Technology mismatch check: if the task explicitly requests a language
 	// or framework that is NOT present in the workspace, return nil so the
 	// caller routes to runAgentCreate rather than overwriting unrelated files.
-	techMap := map[string][]string{
-		".ts":    {"typescript", " ts ", ".ts "},
-		".tsx":   {"react", ".tsx"},
-		".vue":   {"vue"},
-		".js":    {"javascript", " js ", ".js ", "nodejs", "node.js"},
-		".py":    {"python", ".py "},
-		".rs":    {"rust", ".rs "},
-		".rb":    {"ruby", ".rb "},
-		".java":  {"java "},
-		".kt":    {"kotlin"},
-		".cs":    {"c# ", "csharp", ".net"},
-		".swift": {"swift"},
-		".php":   {"php"},
-	}
-	// Collect extensions present in the workspace.
 	workspaceExts := map[string]bool{}
 	for _, f := range all {
 		if f == nil {
@@ -553,12 +1177,12 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 		}
 		workspaceExts[strings.ToLower(filepath.Ext(f.RelPath))] = true
 	}
-	for ext, keywords := range techMap {
-		for _, kw := range keywords {
+	for _, e := range types.LangRegistry {
+		for _, kw := range e.TechKW {
 			if strings.Contains(lower, kw) {
 				// Task mentions this technology; if the workspace has none of
 				// these files, signal that new files must be created.
-				if !workspaceExts[ext] {
+				if !workspaceExts[e.Ext] {
 					return nil
 				}
 			}
@@ -567,11 +1191,11 @@ func (s *Server) scopeFilesToQuestion(question string, all []*types.FileInfo) []
 
 	// 3) Prefer dominant source extension among code files (e.g. .py in a
 	// generated Python app), capped to a small set.
-	codeExts := map[string]bool{
-		".py": true, ".go": true, ".js": true, ".ts": true, ".tsx": true,
-		".java": true, ".rs": true, ".rb": true, ".php": true, ".cs": true,
-		".cpp": true, ".c": true, ".h": true, ".kt": true, ".scala": true,
-		".swift": true,
+	codeExts := make(map[string]bool)
+	for _, e := range types.LangRegistry {
+		if e.IsCode {
+			codeExts[e.Ext] = true
+		}
 	}
 	extFreq := map[string]int{}
 	for _, f := range all {
@@ -667,10 +1291,14 @@ func (s *Server) processQuestion(ctx context.Context, question string, files []*
 	}
 
 	var systemPrompt string
+	memCtx := s.memoryContext()
 	if len(filePaths) == 0 {
 		systemPrompt = promptChat + "\nAvailable files: none — the working directory has not been scanned or contains no readable files. Do NOT invent, guess, or fabricate any file contents or code. If the user asks about a specific file, tell them no files are available."
 	} else {
 		systemPrompt = promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	}
+	if memCtx != "" {
+		systemPrompt += "\n\n" + memCtx
 	}
 
 	chatReq := &llm.ChatRequest{
@@ -689,6 +1317,124 @@ func (s *Server) processQuestion(ctx context.Context, question string, files []*
 	}
 
 	return resp, resp.Message.Content, time.Since(start), nil
+}
+
+// processQuestionParallel is the wide-project variant of processQuestion.
+// Instead of concatenating all files into one prompt (which overflows the
+// context window for large projects), it issues one LLM call per file using
+// up to cfg.Agent.ConcurrentFiles goroutines simultaneously — the same
+// semaphore pattern used by the agent's per-file edit loop.
+// Results are assembled in the original file order and returned as a single
+// combined answer with per-file section headers.
+func (s *Server) processQuestionParallel(ctx context.Context, question string, files []*types.FileInfo) (string, time.Duration, error) {
+	s.mu.RLock()
+	concurrency := s.cfg.Agent.ConcurrentFiles
+	model := s.cfg.LLM.Model
+	temp := s.cfg.LLM.Temperature
+	s.mu.RUnlock()
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	// Collect readable files; keep their original index for ordered output.
+	readable := make([]*types.FileInfo, 0, len(files))
+	for _, f := range files {
+		if f != nil && f.IsReadable && len(f.Content) > 0 {
+			readable = append(readable, f)
+		}
+	}
+	if len(readable) == 0 {
+		return "", 0, nil
+	}
+
+	// Build a full file-path list for the system prompt so the LLM knows the
+	// project shape even though each call only receives one file's content.
+	var filePaths []string
+	for _, f := range files {
+		if f != nil {
+			filePaths = append(filePaths, f.RelPath)
+		}
+	}
+	systemPrompt := promptChat + "\nAvailable files: " + strings.Join(filePaths, ", ")
+	if memCtxP := s.memoryContext(); memCtxP != "" {
+		systemPrompt += "\n\n" + memCtxP
+	}
+
+	type result struct {
+		idx    int
+		answer string
+		err    error
+	}
+
+	resCh := make(chan result, len(readable))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i, f := range readable {
+		wg.Add(1)
+		go func(idx int, f *types.FileInfo) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				resCh <- result{idx: idx, err: ctx.Err()}
+				return
+			}
+			userPrompt := fmt.Sprintf("Task/Question: %s\n\nFile: %s\n\n%s", question, f.RelPath, f.Content)
+			chatReq := &llm.ChatRequest{
+				Model: model,
+				Messages: []llm.Message{
+					{Role: "system", Content: systemPrompt},
+					{Role: "user", Content: userPrompt},
+				},
+				Temperature: temp,
+			}
+			resp, err := s.llmClient.Chat(ctx, chatReq)
+			if err != nil {
+				resCh <- result{idx: idx, err: err}
+				return
+			}
+			resCh <- result{idx: idx, answer: resp.Message.Content}
+		}(i, f)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	type indexed struct {
+		idx    int
+		file   string
+		answer string
+	}
+	var answers []indexed
+	var firstErr error
+	for r := range resCh {
+		if r.err != nil {
+			if errors.Is(r.err, context.Canceled) {
+				return "", 0, r.err
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
+		}
+		answers = append(answers, indexed{r.idx, readable[r.idx].RelPath, r.answer})
+	}
+	if firstErr != nil && len(answers) == 0 {
+		return "", 0, firstErr
+	}
+
+	sort.Slice(answers, func(i, j int) bool { return answers[i].idx < answers[j].idx })
+
+	var sb strings.Builder
+	for _, a := range answers {
+		fmt.Fprintf(&sb, "### %s\n\n%s\n\n", a.file, a.answer)
+	}
+	return sb.String(), time.Since(start), nil
 }
 
 func (s *Server) saveSession(question, answer string, resp *llm.ChatResponse, duration time.Duration) {
@@ -834,7 +1580,8 @@ func sendError(w http.ResponseWriter, message string) {
 
 // AgentRunRequest is the JSON body for POST /api/agent/run.
 type AgentRunRequest struct {
-	Task string `json:"task"`
+	Task        string   `json:"task"`
+	PinnedFiles []string `json:"pinnedFiles,omitempty"` // when non-empty, restrict agent to exactly these files
 }
 
 // ExtSendRequest is the JSON body for POST /api/ext/send and POST /api/ext/stream.
@@ -855,6 +1602,15 @@ type ExtSendRequest struct {
 	Model   string `json:"model"` // optional per-request model override
 }
 
+// PlannedFile is one entry in the project file plan produced by runAgentPlan.
+// It carries the file path, a description of what the file owns/does, and
+// which other planned files it depends on (used for generation ordering).
+type PlannedFile struct {
+	File        string   // relative path, e.g. "handlers/user.go"
+	Description string   // what this file owns and is responsible for
+	DependsOn   []string // other planned files this file imports or references
+}
+
 // AgentFileResult describes what the agent did with one file.
 type AgentFileResult struct {
 	File    string `json:"file"`
@@ -864,16 +1620,17 @@ type AgentFileResult struct {
 	Deleted bool `json:"deleted,omitempty"`
 	// Pending is true when the result is a proposed change that has NOT yet
 	// been written to disk — the user must confirm via /api/agent/commit.
-	Pending        bool   `json:"pending,omitempty"`
-	OldContent     string `json:"oldContent,omitempty"`
-	NewContent     string `json:"newContent,omitempty"`
-	Error          string `json:"error,omitempty"`
-	PromptEvalCount int   `json:"prompt_eval_count,omitempty"`
+	Pending         bool   `json:"pending,omitempty"`
+	OldContent      string `json:"oldContent,omitempty"`
+	NewContent      string `json:"newContent,omitempty"`
+	Error           string `json:"error,omitempty"`
+	PromptEvalCount int    `json:"prompt_eval_count,omitempty"`
 }
 
 // AgentCommitRequest is the JSON body for POST /api/agent/commit.
 type AgentCommitRequest struct {
 	Files []AgentCommitFile `json:"files"`
+	Task  string            `json:"task,omitempty"` // original agent task; used to save to memory.md on commit
 }
 
 // AgentCommitFile is one approved file entry inside an AgentCommitRequest.
@@ -920,7 +1677,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: task, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: task, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Commands (clear, help, stats, …) should work regardless of which button
@@ -931,9 +1688,14 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(AgentRunResponse{Success: true, Cleared: true})
 			return
 		}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
 		s.mu.Lock()
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
-		s.messages = append(s.messages, msg)
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(AgentRunResponse{Success: true, Message: &msg})
@@ -972,15 +1734,15 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	agentStart := time.Now()
-	summary, results, err := s.runAgentTask(taskCtx, task, func(string) {}, dryRun)
+	summary, results, err := s.runAgentTask(taskCtx, task, nil, func(string) {}, dryRun)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(AgentRunResponse{Success: false, Error: err.Error()})
 		return
 	}
-
 	if !dryRun {
+		s.autoSaveMemory(task, results)
 		for _, res := range results {
 			if res.Changed {
 				if scanned, scanErr := s.performRescan(); scanErr == nil {
@@ -999,7 +1761,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: agentPromptEvalCount}
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1051,7 +1813,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: task, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: task, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Handle built-in commands (clear, help, …) before touching the LLM.
@@ -1060,9 +1822,14 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 			sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "cleared": true})
 			return
 		}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
 		s.mu.Lock()
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
-		s.messages = append(s.messages, msg)
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		sseWrite(w, flusher, map[string]any{
 			"type":    "done",
@@ -1124,7 +1891,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	streamAgentStart := time.Now()
-	summary, results, err := s.runAgentTask(taskCtx, task, progress, dryRun)
+	summary, results, err := s.runAgentTask(taskCtx, task, req.PinnedFiles, progress, dryRun)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return // stopped — keep the user message, no reply to store
@@ -1132,8 +1899,8 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
 		return
 	}
-
 	if !dryRun {
+		s.autoSaveMemory(task, results)
 		for _, res := range results {
 			if res.Changed {
 				if scanned, scanErr := s.performRescan(); scanErr == nil {
@@ -1152,7 +1919,7 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(streamAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: streamAgentPromptEvalCount}
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	sseWrite(w, flusher, map[string]any{
@@ -1201,6 +1968,7 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 
 	cleanDir := filepath.Clean(s.directory)
 	var results []commitResult
+	var agentResults []AgentFileResult
 	anyWritten := false
 
 	for _, f := range req.Files {
@@ -1224,7 +1992,7 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 			anyWritten = true
 			results = append(results, commitResult{File: f.Path, Success: true})
 			s.mu.Lock()
-			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.Path, Task: "(confirmed via Apply)"})
+			s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: f.Path, Task: "(confirmed via Apply)"})
 			s.mu.Unlock()
 			continue
 		}
@@ -1249,6 +2017,11 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 		s.markWrittenFile(f.Path)
 		anyWritten = true
 		results = append(results, commitResult{File: f.Path, Success: true})
+		agentResults = append(agentResults, AgentFileResult{
+			File:    f.Path,
+			Changed: true,
+			Created: !existedBefore,
+		})
 		// Record in agent changelog so future agent runs know about this file.
 		// The commit endpoint doesn't have access to the original task string,
 		// so we mark it generically; the file and operation are what matter.
@@ -1257,7 +2030,7 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 		if existedBefore {
 			op = "modified"
 		}
-		s.agentLog = append(s.agentLog, AgentLogEntry{Operation: op, File: f.Path, Task: "(confirmed via Apply)"})
+		s.appendAgentLogLocked(AgentLogEntry{Operation: op, File: f.Path, Task: "(confirmed via Apply)"})
 		s.mu.Unlock()
 	}
 
@@ -1287,6 +2060,12 @@ func (s *Server) handleAgentCommit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.mu.Unlock()
+	}
+
+	// Save applied files to memory. Only fires when the task is known (i.e. sent
+	// by the frontend commit call) — reverts don't send a task and are skipped.
+	if req.Task != "" && len(agentResults) > 0 {
+		s.autoSaveMemory(req.Task, agentResults)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1360,7 +2139,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		prevClient := s.llmClient
 		s.model = reqModel
 		s.cfg.LLM.Model = reqModel
-		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
 		s.mu.Unlock()
 		defer func() {
 			s.mu.Lock()
@@ -1373,7 +2152,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	// Store the user message so it shows up in the chat UI immediately.
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: text, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Handle built-in commands (clear, stats, …) regardless of mode.
@@ -1383,9 +2162,14 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "cleared": true})
 			return
 		}
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
@@ -1422,7 +2206,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 	case "agent":
 		// External API always writes files immediately — no pending/commit workflow.
 		extAgentStart := time.Now()
-		summary, results, err := s.runAgentTask(taskCtx, text, func(string) {}, false)
+		summary, results, err := s.runAgentTask(taskCtx, text, nil, func(string) {}, false)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
@@ -1432,6 +2216,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
 			return
 		}
+		s.autoSaveMemory(text, results)
 
 		// Always rescan after writing — dryRun is always false for the external API.
 		for _, res := range results {
@@ -1451,7 +2236,7 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 		}
 		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(extAgentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extAgentPromptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1462,24 +2247,43 @@ func (s *Server) handleExtSend(w http.ResponseWriter, r *http.Request) {
 
 	default: // "chat"
 		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
-		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+		s.mu.RLock()
+		extSendConcurrency := s.cfg.Agent.ConcurrentFiles
+		s.mu.RUnlock()
+		var answer string
+		var chatDuration time.Duration
+		var promptEvalCount int
+		if len(activeFiles) > 1 && extSendConcurrency > 1 {
+			var parallelErr error
+			answer, chatDuration, parallelErr = s.processQuestionParallel(taskCtx, text, activeFiles)
+			if parallelErr != nil {
+				if errors.Is(parallelErr, context.Canceled) {
+					json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": parallelErr.Error()})
 				return
 			}
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
-			return
-		}
-
-		var promptEvalCount int
-		if resp != nil {
-			promptEvalCount = resp.PromptEvalCount
+		} else {
+			resp, singleAnswer, singleDur, singleErr := s.processQuestion(taskCtx, text, activeFiles)
+			if singleErr != nil {
+				if errors.Is(singleErr, context.Canceled) {
+					json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "stopped"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": singleErr.Error()})
+				return
+			}
+			answer, chatDuration = singleAnswer, singleDur
+			if resp != nil {
+				promptEvalCount = resp.PromptEvalCount
+			}
 		}
 		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": msg})
@@ -1545,7 +2349,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 		prevClient := s.llmClient
 		s.model = reqModel
 		s.cfg.LLM.Model = reqModel
-		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout)
+		s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, reqModel, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
 		s.mu.Unlock()
 		defer func() {
 			s.mu.Lock()
@@ -1557,7 +2361,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: text, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: text, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	// Handle built-in commands (clear, stats, …) before touching the LLM.
@@ -1566,9 +2370,14 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 			sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "cleared": true})
 			return
 		}
-		msg := Message{Role: "assistant", Content: response, Timestamp: time.Now()}
+		role := "assistant"
+		if strings.HasPrefix(response, "__INFO__:") {
+			response = strings.TrimPrefix(response, "__INFO__:")
+			role = "info"
+		}
+		msg := Message{Role: role, Content: response, Timestamp: time.Now()}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
 		return
@@ -1619,7 +2428,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 		agentStart := time.Now()
-		summary, results, err := s.runAgentTask(taskCtx, text, progress, false)
+		summary, results, err := s.runAgentTask(taskCtx, text, nil, progress, false)
 		if err != nil {
 			if errors.Is(err, taskCtx.Err()) {
 				return // stopped
@@ -1629,6 +2438,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 			sseMu.Unlock()
 			return
 		}
+		s.autoSaveMemory(text, results)
 
 		// Always rescan after writing — dryRun is always false for the external API.
 		for _, res := range results {
@@ -1648,7 +2458,7 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 		}
 		msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(agentStart).Milliseconds(), AgentResults: results, PromptEvalCount: extStreamAgentPromptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		sseMu.Lock()
@@ -1662,22 +2472,39 @@ func (s *Server) handleExtStream(w http.ResponseWriter, r *http.Request) {
 
 	default: // "chat"
 		activeFiles := s.scopeFilesToQuestion(text, s.getActiveFilesSnapshot())
-		resp, answer, chatDuration, err := s.processQuestion(taskCtx, text, activeFiles)
-		if err != nil {
-			if errors.Is(err, taskCtx.Err()) {
-				return // stopped
-			}
-			sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": err.Error()})
-			return
-		}
-
+		s.mu.RLock()
+		extStreamChatConcurrency := s.cfg.Agent.ConcurrentFiles
+		s.mu.RUnlock()
+		var answer string
+		var chatDuration time.Duration
 		var promptEvalCount int
-		if resp != nil {
-			promptEvalCount = resp.PromptEvalCount
+		if len(activeFiles) > 1 && extStreamChatConcurrency > 1 {
+			var parallelErr error
+			answer, chatDuration, parallelErr = s.processQuestionParallel(taskCtx, text, activeFiles)
+			if parallelErr != nil {
+				if errors.Is(parallelErr, taskCtx.Err()) {
+					return // stopped
+				}
+				sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": parallelErr.Error()})
+				return
+			}
+		} else {
+			resp, singleAnswer, singleDur, singleErr := s.processQuestion(taskCtx, text, activeFiles)
+			if singleErr != nil {
+				if errors.Is(singleErr, taskCtx.Err()) {
+					return // stopped
+				}
+				sseWrite(w, flusher, map[string]any{"type": "done", "success": false, "error": singleErr.Error()})
+				return
+			}
+			answer, chatDuration = singleAnswer, singleDur
+			if resp != nil {
+				promptEvalCount = resp.PromptEvalCount
+			}
 		}
 		msg := Message{Role: "assistant", Content: answer, Timestamp: time.Now(), DurationMs: chatDuration.Milliseconds(), PromptEvalCount: promptEvalCount}
 		s.mu.Lock()
-		s.messages = append(s.messages, msg)
+		s.appendMessageLocked(msg)
 		s.mu.Unlock()
 
 		sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
@@ -1750,38 +2577,405 @@ func agentSanitizeFilename(name string) string {
 // agentImpliedExtension returns the file extension (including dot) that a task
 // implies creating, e.g. ".md" for "prepare md file". Returns "" when the task
 // does not clearly request a new specific file type.
+// Keyword matching is driven by types.LangRegistry — add new languages there.
 func agentImpliedExtension(task string) string {
 	lower := strings.ToLower(task)
-	pairs := [][2]string{
-		{".md", ".md"}, {"md file", ".md"}, {"markdown", ".md"}, {"readme", ".md"},
-		{".yaml", ".yaml"}, {"yaml file", ".yaml"}, {".yml", ".yml"}, {"yml file", ".yml"},
-		{".json", ".json"}, {"json file", ".json"},
-		{".toml", ".toml"}, {"toml file", ".toml"},
-		{".txt", ".txt"}, {"txt file", ".txt"}, {"text file", ".txt"},
-		{".sh", ".sh"}, {"shell script", ".sh"}, {"bash script", ".sh"},
-		{".html", ".html"}, {"html file", ".html"},
-		{".css", ".css"}, {"css file", ".css"},
-		{".env", ".env"}, {"env file", ".env"},
-		{".dockerfile", ""}, {"dockerfile", ""},
-		// TypeScript / JavaScript families
-		{"typescript", ".ts"}, {".ts ", ".ts"}, {".tsx", ".tsx"},
-		{"react", ".tsx"}, {"vue", ".vue"}, {"angular", ".ts"},
-		{"javascript", ".js"}, {".js ", ".js"}, {"node", ".js"},
-		// Python
-		{"python", ".py"}, {".py ", ".py"},
-		// Go
-		{"golang", ".go"}, {" go app", ".go"}, {" go server", ".go"},
-		// Rust / Java / other common languages
-		{"rust", ".rs"}, {"java ", ".java"}, {"kotlin", ".kt"},
-		{"c# ", ".cs"}, {"csharp", ".cs"}, {".net", ".cs"},
-		{"ruby", ".rb"}, {"php", ".php"}, {"swift", ".swift"},
-	}
-	for _, p := range pairs {
-		if strings.Contains(lower, p[0]) {
-			return p[1]
+	for _, e := range types.LangRegistry {
+		for _, kw := range e.ImpliedKW {
+			if strings.Contains(lower, kw) {
+				return e.Ext
+			}
 		}
 	}
 	return ""
+}
+
+func agentIsDocsIntent(task string) bool {
+	lower := strings.ToLower(task)
+	return strings.Contains(lower, "readme") || strings.Contains(lower, "documentation") || strings.Contains(lower, "docs")
+}
+
+// agentIsMixedCodeAndDocsTask returns true when the task asks for both new
+// code/files AND documentation. In that case the docs guard must not strip the
+// code files from the plan.
+func agentIsMixedCodeAndDocsTask(task string) bool {
+	if !agentIsDocsIntent(task) {
+		return false
+	}
+	lower := strings.ToLower(task)
+	codeWords := []string{
+		"generate", "create", "write", "build", "implement", "scaffold",
+		"develop", "server", "service", "function", "class", "module", "script",
+	}
+	for _, w := range codeWords {
+		if strings.Contains(lower, w) {
+			return true
+		}
+	}
+	return false
+}
+
+func agentIsDocLikeFile(name string) bool {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(filepath.Clean(name))))
+	ext := strings.ToLower(filepath.Ext(base))
+	// Guard: common dependency/lock manifests are not documentation, even if
+	// they have text-like extensions.
+	nonDocManifests := map[string]bool{
+		"requirements.txt":  true,
+		"constraints.txt":   true,
+		"go.mod":            true,
+		"go.sum":            true,
+		"package-lock.json": true,
+		"yarn.lock":         true,
+		"pnpm-lock.yaml":    true,
+		"pipfile":           true,
+		"pipfile.lock":      true,
+		"poetry.lock":       true,
+		"cargo.lock":        true,
+		"composer.lock":     true,
+	}
+	if nonDocManifests[base] {
+		return false
+	}
+	if strings.HasPrefix(base, "readme") {
+		return true
+	}
+	if strings.HasPrefix(base, "changelog") || strings.HasPrefix(base, "license") || strings.HasPrefix(base, "contributing") {
+		return true
+	}
+	if ext == ".txt" {
+		// Any .txt file inside a docs/ or documentation/ directory is doc-like
+		// regardless of its own filename (e.g. docs/reference.txt).
+		dir := strings.ToLower(filepath.ToSlash(filepath.Dir(filepath.Clean(name))))
+		if strings.Contains(dir, "docs") || strings.Contains(dir, "documentation") {
+			return true
+		}
+		for _, hint := range []string{"readme", "docs", "documentation", "guide", "manual", "install", "getting-started"} {
+			if strings.Contains(base, hint) {
+				return true
+			}
+		}
+		return false
+	}
+	switch ext {
+	case ".md", ".markdown", ".mdx", ".rst", ".adoc":
+		return true
+	default:
+		return false
+	}
+}
+
+func agentLastNonEmptyLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func agentDocValidationIssues(content string) []string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return []string{"empty documentation output"}
+	}
+
+	var issues []string
+	lower := strings.ToLower(content)
+
+	// Catch obviously garbage/minimal output before checking structure.
+	if len(trimmed) < 80 {
+		issues = append(issues, "content is too short to be complete documentation")
+	}
+	if !strings.Contains(content, "#") {
+		issues = append(issues, "missing markdown headings")
+	}
+
+	if strings.Count(content, "```")%2 != 0 {
+		issues = append(issues, "contains an unclosed code fence")
+	}
+	if !strings.Contains(lower, "getting started") && !strings.Contains(lower, "quick start") {
+		issues = append(issues, "missing a Getting Started or Quick Start section")
+	}
+	if !strings.Contains(lower, "```bash") {
+		issues = append(issues, "missing step-by-step shell examples in fenced bash blocks")
+	}
+
+	placeholderHints := []string{
+		"your-username",
+		"your_project",
+		"your-project",
+		"your-key",
+		"your_key",
+		"your-token",
+		"your_token",
+		"<project_name>",
+		"<your_",
+		"[your_",
+		"github.com/your-",
+	}
+	for _, hint := range placeholderHints {
+		if strings.Contains(lower, hint) {
+			issues = append(issues, "contains generic placeholders instead of project-specific values")
+			break
+		}
+	}
+
+	last := agentLastNonEmptyLine(content)
+	if last != "" {
+		lastTrimmed := strings.TrimSpace(last)
+		endsClean := strings.HasSuffix(lastTrimmed, ".") ||
+			strings.HasSuffix(lastTrimmed, "!") ||
+			strings.HasSuffix(lastTrimmed, "?") ||
+			strings.HasSuffix(lastTrimmed, ")") ||
+			strings.HasSuffix(lastTrimmed, "]") ||
+			strings.HasSuffix(lastTrimmed, "\"") ||
+			strings.HasSuffix(lastTrimmed, "'") ||
+			strings.HasPrefix(lastTrimmed, "#") ||
+			strings.HasPrefix(lastTrimmed, "- ") ||
+			strings.HasPrefix(lastTrimmed, "* ") ||
+			strings.HasPrefix(lastTrimmed, "```")
+		if !endsClean && len(lastTrimmed) > 10 {
+			issues = append(issues, "appears truncated at the end")
+		}
+	}
+
+	return issues
+}
+
+func agentHasIssue(issues []string, target string) bool {
+	for _, iss := range issues {
+		if iss == target {
+			return true
+		}
+	}
+	return false
+}
+
+func agentDocHasCompletionSentinel(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) == 0 {
+		return false
+	}
+	return strings.TrimSpace(lines[len(lines)-1]) == docCompletionSentinel
+}
+
+func agentDocStripCompletionSentinel(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) == 0 {
+		return trimmed
+	}
+	if strings.TrimSpace(lines[len(lines)-1]) != docCompletionSentinel {
+		return trimmed
+	}
+	body := strings.Join(lines[:len(lines)-1], "\n")
+	return strings.TrimSpace(body)
+}
+
+func agentDocValidationIssuesWithSentinel(content string) []string {
+	body := agentDocStripCompletionSentinel(content)
+	issues := agentDocValidationIssues(body)
+	if !agentDocHasCompletionSentinel(content) {
+		issues = append(issues, "missing completion sentinel")
+	}
+	return issues
+}
+
+// agentNormalizeDocOutput unwraps one outer markdown code fence wrapper while
+// preserving normal markdown content (including internal fenced code blocks).
+func agentNormalizeDocOutput(content string) string {
+	s := strings.TrimSpace(content)
+	if !strings.HasPrefix(s, "```") {
+		return agentTrimSeparator(s)
+	}
+
+	firstNL := strings.IndexByte(s, '\n')
+	if firstNL < 0 {
+		return agentTrimSeparator(s)
+	}
+
+	lastFence := strings.LastIndex(s, "```")
+	if lastFence <= firstNL {
+		return agentTrimSeparator(s)
+	}
+
+	// Only unwrap when the final non-whitespace token is the closing fence.
+	if strings.TrimSpace(s[lastFence:]) != "```" {
+		return agentTrimSeparator(s)
+	}
+
+	inner := strings.TrimSpace(s[firstNL+1 : lastFence])
+	return agentTrimSeparator(inner)
+}
+
+func (s *Server) buildDocSystemPrompt(changelog string) string {
+	sys := promptAgentDoc + "\n\nOutput contract:\n- Return the complete documentation file content.\n- End the final line with exactly " + docCompletionSentinel + "."
+	if strings.TrimSpace(changelog) != "" {
+		sys += "\n\n" + changelog
+	}
+	if memCtx := s.memoryContext(); memCtx != "" {
+		sys += "\n\n" + memCtx
+	}
+	return sys
+}
+
+// agentIsSignificantlyShortened returns true when newContent is less than one
+// third of oldContent's length, indicating the model likely truncated or ignored
+// the existing file. Only fires when oldContent is substantial (>200 chars).
+func agentIsSignificantlyShortened(newContent, oldContent string) bool {
+	oldLen := len(strings.TrimSpace(oldContent))
+	newLen := len(strings.TrimSpace(newContent))
+	if oldLen < 200 {
+		return false
+	}
+	return newLen > 0 && newLen < oldLen/3
+}
+
+// agentIsGarbageDocContent returns true when the doc content is so minimal or
+// malformed that it should be discarded entirely rather than proposed to the user.
+// "Too short" alone is sufficient — a 2-line output like "# Navigate\ncd dupa"
+// has a heading so the old two-condition check missed it. Any content under the
+// minimum length threshold is garbage regardless of structure.
+func agentIsGarbageDocContent(issues []string) bool {
+	for _, iss := range issues {
+		if iss == "empty documentation output" {
+			return true
+		}
+		if iss == "content is too short to be complete documentation" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, oldContent, draft, sourceCtx string) (final string, issues []string, err error) {
+	issues = agentDocValidationIssuesWithSentinel(draft)
+	if len(issues) == 0 {
+		return draft, nil, nil
+	}
+
+	systemPrompt := s.buildDocSystemPrompt("")
+
+	doRefinementPass := func(prevDraft string, prevIssues []string, passNum int) (string, []string, error) {
+		var issueList strings.Builder
+		for _, it := range prevIssues {
+			fmt.Fprintf(&issueList, "- %s\n", it)
+		}
+
+		// If the draft is clearly garbage (too short or no headings), tell the model
+		// to ignore it and write from scratch rather than trying to patch it.
+		draftNote := fmt.Sprintf("Draft that needs correction (pass %d):\n%s", passNum, prevDraft)
+		for _, iss := range prevIssues {
+			if iss == "content is too short to be complete documentation" || iss == "missing markdown headings" {
+				draftNote = fmt.Sprintf("The previous attempt produced unusable output (pass %d). Discard it and write the file from scratch.", passNum)
+				break
+			}
+		}
+
+		srcSection := ""
+		if sourceCtx != "" {
+			srcSection = fmt.Sprintf("Source snippets (read-only context, do NOT reproduce):\n%s\n\n", sourceCtx)
+		}
+		// Don't feed garbage existing content into the refinement prompt — it anchors the model.
+		existingForRefinement := oldContent
+		if agentIsGarbageDocContent(agentDocValidationIssues(oldContent)) {
+			existingForRefinement = "(none — write from scratch)"
+		}
+		userPrompt := fmt.Sprintf(
+			"Task: %s\n\nTarget file: %s\n\nExisting content:\n%s\n\n%s%s\n\nProblems to fix:\n%sReturn a complete replacement file.\n\n%s",
+			task,
+			filePath,
+			existingForRefinement,
+			srcSection,
+			draftNote,
+			issueList.String(),
+			s.agentProjectMetaBlock(),
+		)
+
+		chatReq := &llm.ChatRequest{
+			Model: s.cfg.LLM.Model,
+			Messages: []llm.Message{
+				{Role: "system", Content: systemPrompt},
+				{Role: "user", Content: userPrompt},
+			},
+			Temperature: agentTemperature(s.cfg.LLM.Temperature),
+		}
+
+		resp, callErr := s.llmClient.Chat(ctx, chatReq)
+		if callErr != nil {
+			return prevDraft, prevIssues, callErr
+		}
+
+		candidate := strings.TrimSpace(agentNormalizeDocOutput(resp.Message.Content))
+		if strings.TrimSpace(agentDocStripCompletionSentinel(candidate)) == "" {
+			return prevDraft, prevIssues, nil
+		}
+		candidateIssues := agentDocValidationIssuesWithSentinel(candidate)
+		// Don't downgrade: if the refinement produced something shorter/worse
+		// than the previous draft, keep the previous draft.
+		if agentIsGarbageDocContent(candidateIssues) &&
+			!agentIsGarbageDocContent(prevIssues) {
+			return prevDraft, prevIssues, nil
+		}
+		return candidate, candidateIssues, nil
+	}
+
+	// Pass 1
+	candidate, remaining, callErr := doRefinementPass(draft, issues, 1)
+	if callErr != nil {
+		return draft, issues, callErr
+	}
+	if len(remaining) == 0 {
+		return candidate, nil, nil
+	}
+
+	// Pass 2 — only if pass 1 still has issues.
+	candidate2, remaining2, callErr2 := doRefinementPass(candidate, remaining, 2)
+	if callErr2 != nil {
+		// Use pass-1 result on failure.
+		return candidate, remaining, nil
+	}
+	if len(remaining2) == 0 {
+		return candidate2, nil, nil
+	}
+
+	return candidate2, remaining2, nil
+}
+
+// filterPlannedFilesForDocsIntent keeps only documentation-like planned files,
+// unless a non-doc file was explicitly mentioned in the user task.
+func filterPlannedFilesForDocsIntent(task string, plannedFiles []string) (allowed []string, blocked []string) {
+	mentions := agentFileMentionsFromTask(task)
+	mentionedRel := map[string]bool{}
+	mentionedBase := map[string]bool{}
+	for _, m := range mentions {
+		clean := filepath.ToSlash(filepath.Clean(m))
+		mentionedRel[strings.ToLower(clean)] = true
+		mentionedBase[strings.ToLower(filepath.Base(clean))] = true
+	}
+
+	for _, f := range plannedFiles {
+		clean := filepath.ToSlash(filepath.Clean(f))
+		keyRel := strings.ToLower(clean)
+		keyBase := strings.ToLower(filepath.Base(clean))
+		explicitlyRequested := mentionedRel[keyRel] || mentionedBase[keyBase]
+		if agentIsDocLikeFile(clean) || explicitlyRequested {
+			allowed = append(allowed, f)
+		} else {
+			blocked = append(blocked, f)
+		}
+	}
+	return allowed, blocked
 }
 
 // runAgentTask sends one LLM request per relevant file.
@@ -1811,6 +3005,24 @@ func (s *Server) agentChangelogPrompt() string {
 	return b.String()
 }
 
+// appendMessageLocked appends msg to s.messages and trims the slice to at most
+// maxMessages entries (oldest first). Caller must hold s.mu write lock.
+func (s *Server) appendMessageLocked(msg Message) {
+	s.messages = append(s.messages, msg)
+	if len(s.messages) > maxMessages {
+		s.messages = s.messages[len(s.messages)-maxMessages:]
+	}
+}
+
+// appendAgentLogLocked appends entry to s.agentLog and trims to at most
+// maxAgentLogEntries (oldest first). Caller must hold s.mu write lock.
+func (s *Server) appendAgentLogLocked(entry AgentLogEntry) {
+	s.agentLog = append(s.agentLog, entry)
+	if len(s.agentLog) > maxAgentLogEntries {
+		s.agentLog = s.agentLog[len(s.agentLog)-maxAgentLogEntries:]
+	}
+}
+
 // agentIsDeleteTask returns true when the task is clearly asking to delete or
 // remove one or more files entirely (not to delete code inside a file).
 func agentIsDeleteTask(task string) bool {
@@ -1828,6 +3040,108 @@ func agentIsDeleteTask(task string) bool {
 		}
 	}
 	return false
+}
+
+// agentFileMentionsFromTask returns filename-like tokens found in the task,
+// normalized and deduplicated while preserving order.
+func agentFileMentionsFromTask(task string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range agentFilenameRe.FindAllString(task, -1) {
+		name := agentSanitizeFilename(strings.TrimSpace(m))
+		if name == "" {
+			continue
+		}
+		if filepath.Ext(name) == "" {
+			continue
+		}
+		if knownNonFilenames[strings.ToLower(name)] {
+			continue
+		}
+		key := strings.ToLower(filepath.ToSlash(filepath.Clean(name)))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// agentIsSingleFileMergeTask detects intents like "merge X and Y into one file".
+// It is language-agnostic and keyed on user wording, not file extensions.
+func agentIsSingleFileMergeTask(task string) bool {
+	lower := strings.ToLower(task)
+	hasMergeWord := false
+	for _, w := range []string{"merge", "combine", "consolidate", "unify", "fuse"} {
+		if strings.Contains(lower, w) {
+			hasMergeWord = true
+			break
+		}
+	}
+	if !hasMergeWord {
+		return false
+	}
+
+	for _, h := range []string{"single file", "one file", "single-file", "into one", "into a single", "as one file", "in one file"} {
+		if strings.Contains(lower, h) {
+			return true
+		}
+	}
+
+	return len(agentFileMentionsFromTask(task)) >= 2
+}
+
+// agentMergeDestinationFromTask extracts an explicit destination from phrases
+// like "into app.ts". Returns "" when no explicit destination is present.
+func agentMergeDestinationFromTask(task string) string {
+	rx := regexp.MustCompile(`(?i)\b(?:into|to|in)\s+([\w\-./]+\.\w{2,})\b`)
+	m := rx.FindStringSubmatch(task)
+	if len(m) == 2 {
+		return agentSanitizeFilename(strings.TrimSpace(m[1]))
+	}
+	return ""
+}
+
+// agentChooseMergeTargetFile picks the surviving destination file for a merge.
+// It prefers explicit "into <file>", then first mentioned file in task,
+// then the first scoped file.
+func agentChooseMergeTargetFile(task string, targetFiles []*types.FileInfo) string {
+	if explicit := agentMergeDestinationFromTask(task); explicit != "" {
+		return filepath.ToSlash(filepath.Clean(explicit))
+	}
+
+	byRel := map[string]string{}
+	byBase := map[string]string{}
+	for _, f := range targetFiles {
+		if f == nil {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(f.RelPath))
+		byRel[strings.ToLower(rel)] = rel
+		base := strings.ToLower(filepath.Base(rel))
+		if _, exists := byBase[base]; !exists {
+			byBase[base] = rel
+		}
+	}
+
+	for _, mention := range agentFileMentionsFromTask(task) {
+		clean := filepath.ToSlash(filepath.Clean(mention))
+		if rel, ok := byRel[strings.ToLower(clean)]; ok {
+			return rel
+		}
+		if rel, ok := byBase[strings.ToLower(filepath.Base(clean))]; ok {
+			return rel
+		}
+	}
+
+	for _, f := range targetFiles {
+		if f != nil {
+			return filepath.ToSlash(filepath.Clean(f.RelPath))
+		}
+	}
+
+	return ""
 }
 
 func promptTokens(s string) []string {
@@ -1858,10 +3172,27 @@ func truncatePromptContent(s string, maxBytes int) string {
 	return s[:maxBytes] + "\n\n...[truncated for context]"
 }
 
-func (s *Server) runAgentTask(ctx context.Context, task string, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
+func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []string, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
 	// Scope to files mentioned in the task; fall back to all files.
 	allFiles := s.getActiveFilesSnapshot()
-	targetFiles := s.scopeFilesToQuestion(task, allFiles)
+
+	// If the user pinned specific files in the UI, honour that selection
+	// exactly — skip keyword scoping entirely.
+	var targetFiles []*types.FileInfo
+	if len(pinnedFiles) > 0 {
+		pinnedSet := make(map[string]bool, len(pinnedFiles))
+		for _, p := range pinnedFiles {
+			pinnedSet[filepath.ToSlash(p)] = true
+		}
+		for _, f := range allFiles {
+			if f != nil && pinnedSet[filepath.ToSlash(f.RelPath)] {
+				targetFiles = append(targetFiles, f)
+			}
+		}
+		progress(fmt.Sprintf("📌 Pinned %d file(s): %s", len(targetFiles), strings.Join(pinnedFiles, ", ")))
+	} else {
+		targetFiles = s.scopeFilesToQuestion(task, allFiles)
+	}
 
 	// nil means a technology mismatch was detected: the task requests a
 	// language/framework absent from the workspace — route directly to create.
@@ -1905,7 +3236,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				}
 				progress(fmt.Sprintf("🗑️  %s — deleted", f.RelPath))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
 				s.mu.Unlock()
 			} else {
 				progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
@@ -1943,6 +3274,21 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 		return sb.String(), results, nil
 	}
 
+	// ── Detect "merge into a single file" intent ──────────────────────────
+	// This operation is multi-file by nature, so per-file independent edits tend
+	// to produce split outputs. Route to a dedicated consolidation flow that
+	// generates one surviving destination file and deletes the merged sources.
+	if agentIsSingleFileMergeTask(task) && len(targetFiles) >= 2 {
+		allCount := len(allFiles)
+		scopedCount := len(targetFiles)
+		if scopedCount == allCount && len(agentFileMentionsFromTask(task)) < 2 {
+			errMsg := "⚠️ Could not identify which files to merge. Please mention exact filenames (e.g. \"merge main.go and config.go into one file\")."
+			return errMsg, nil, nil
+		}
+		progress("🧩 Merge intent detected — consolidating scoped files into one file…")
+		return s.runAgentMergeSingleFile(ctx, task, targetFiles, progress, dryRun)
+	}
+
 	// ── Detect "create new file" intent ─────────────────────────────────────
 	// If the task implies a specific new file type (e.g. ".md") and none of the
 	// targeted files have that extension, route to runAgentCreate so we don't
@@ -1962,6 +3308,11 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 
 	// ── No existing files: ask LLM to create a new one ──────────────────────
 	if len(targetFiles) == 0 {
+		if agentIsDocsIntent(task) {
+			// For docs tasks, always include project context so commands and
+			// descriptions are derived from real files instead of generic templates.
+			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
+		}
 		return s.runAgentCreate(ctx, task, nil, progress, dryRun)
 	}
 
@@ -1993,19 +3344,24 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 	if changelog != "" {
 		systemPrompt += "\n\n" + changelog
 	}
+	if memCtxAgent := s.memoryContext(); memCtxAgent != "" {
+		systemPrompt += "\n\n" + memCtxAgent
+	}
 
 	// crossFileContextLimit caps the total bytes of cross-file context injected
-	// into each per-file prompt. Additional caps keep fanout bounded.
-	const crossFileContextLimit = 24 * 1024
-	const crossFileMaxFiles = 3
+	// into each per-file prompt. With num_ctx=32768 there is room for ~64KB of
+	// context text alongside system prompt and output tokens.
+	const crossFileContextLimit = 64 * 1024
 	const crossFileSnippetBytes = 6 * 1024
 	taskLower := strings.ToLower(task)
 	taskTokenSet := promptTokenSet(task)
 
-	// Pre-read all target files once so that each goroutine can build its
+	// Pre-read ALL project files once so that each goroutine can build its
 	// cross-file context from memory rather than issuing O(n²) disk reads.
-	fileCache := make(map[string]string, len(targetFiles))
-	for _, f := range targetFiles {
+	// Using allFiles (not targetFiles) ensures pinned single-file edits still
+	// have full project context available.
+	fileCache := make(map[string]string, len(allFiles))
+	for _, f := range allFiles {
 		if f == nil || !f.IsReadable {
 			continue
 		}
@@ -2056,10 +3412,10 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			currentRelLower := strings.ToLower(f.RelPath)
 			currentDir := strings.ToLower(filepath.Dir(currentRelLower))
 			currentExt := strings.ToLower(filepath.Ext(currentRelLower))
-			candidates := make([]related, 0, len(targetFiles))
+			candidates := make([]related, 0, len(allFiles))
 
 			var ctxBuf strings.Builder
-			for _, other := range targetFiles {
+			for _, other := range allFiles {
 				if other == nil || other.RelPath == f.RelPath || !other.IsReadable {
 					continue
 				}
@@ -2105,9 +3461,6 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 
 			included := 0
 			for _, cand := range candidates {
-				if included >= crossFileMaxFiles {
-					break
-				}
 				if cand.score <= 0 {
 					continue
 				}
@@ -2120,7 +3473,166 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			}
 
 			var userPrompt string
-			if ctxBuf.Len() > 0 {
+			fileSysPrompt := systemPrompt
+			if agentIsDocLikeFile(f.RelPath) {
+				// For doc files: use promptAgentDoc so the doc-writer system prompt
+				// is always applied. Files are scored so entry-points and manifests
+				// appear first in the context window.
+				progress(fmt.Sprintf("⚙️  Calling LLM for %s…", f.RelPath))
+				type docCandidate struct {
+					info    *types.FileInfo
+					content string
+					score   int
+				}
+				docCands := make([]docCandidate, 0, len(allFiles))
+				for _, other := range allFiles {
+					if other == nil || other.RelPath == f.RelPath || !other.IsReadable {
+						continue
+					}
+					base := strings.ToLower(filepath.Base(other.RelPath))
+					sc := 0
+					for _, ep := range []string{"main.", "index.", "app.", "server.", "cmd."} {
+						if strings.HasPrefix(base, ep) {
+							sc += 10
+							break
+						}
+					}
+					for _, m := range []string{"go.mod", "package.json", "makefile", "dockerfile", "pyproject.toml", "requirements.txt", "cargo.toml"} {
+						if base == m {
+							sc += 8
+							break
+						}
+					}
+					if strings.HasPrefix(base, "config.") {
+						sc += 8
+					}
+					docCands = append(docCands, docCandidate{
+						info:    other,
+						content: fileCache[other.RelPath],
+						score:   sc,
+					})
+				}
+				sort.Slice(docCands, func(i, j int) bool {
+					if docCands[i].score == docCands[j].score {
+						return docCands[i].info.RelPath < docCands[j].info.RelPath
+					}
+					return docCands[i].score > docCands[j].score
+				})
+				var docCtxBuf strings.Builder
+				for _, dc := range docCands {
+					block := ""
+					if dc.content != "" {
+						snippet := truncatePromptContent(dc.content, docContextSnippetBytes)
+						block = fmt.Sprintf("=== %s ===\n%s\n\n", dc.info.RelPath, snippet)
+					} else {
+						block = fmt.Sprintf("=== %s ===\n(no content)\n\n", dc.info.RelPath)
+					}
+					if docCtxBuf.Len()+len(block) > docContextMaxBytes {
+						continue
+					}
+					docCtxBuf.WriteString(block)
+				}
+				var docUserMsg strings.Builder
+				fmt.Fprintf(&docUserMsg, "Task: %s\n\nGenerate ONLY the file: %s\n", task, f.RelPath)
+				if strings.TrimSpace(oldContent) != "" {
+					fmt.Fprintf(&docUserMsg, "\nExisting content of %s (preserve correct concrete content, improve and extend it):\n%s\n", f.RelPath, oldContent)
+				}
+				if docCtxBuf.Len() > 0 {
+					fmt.Fprintf(&docUserMsg, "\nProject source files — extract concrete details (commands, flags, config keys, env vars, ports, binary names, function names) from these to write accurate, detailed documentation:\n%s", docCtxBuf.String())
+				}
+				docUserMsg.WriteString("\n")
+				docUserMsg.WriteString(s.agentProjectMetaBlock())
+				docDocSysPrompt := s.buildDocSystemPrompt(changelog)
+				docChatReq := &llm.ChatRequest{
+					Model: s.cfg.LLM.Model,
+					Messages: []llm.Message{
+						{Role: "system", Content: docDocSysPrompt},
+						{Role: "user", Content: docUserMsg.String()},
+					},
+					Temperature: s.cfg.LLM.Temperature,
+				}
+				docResp, docErr := s.llmClient.Chat(ctx, docChatReq)
+				if docErr != nil {
+					progress(fmt.Sprintf("❌ %s — error", f.RelPath))
+					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: docErr.Error()}}
+					return
+				}
+				newContentRaw := strings.TrimSpace(agentNormalizeDocOutput(docResp.Message.Content))
+				newContent := agentDocStripCompletionSentinel(newContentRaw)
+				if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
+					progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
+					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+					return
+				}
+				// Only skip refinement when the first-pass output is already clean.
+				// If the model returned garbage or a truncated response, we still run
+				// ensureCompleteDocContent so it gets a second chance to expand it.
+				initialIssues := agentDocValidationIssuesWithSentinel(newContentRaw)
+				isSimpleDocUpdate := strings.TrimSpace(oldContent) != "" &&
+					!agentIsMixedCodeAndDocsTask(task) &&
+					len(initialIssues) == 0
+				var refineIssues []string
+				if !isSimpleDocUpdate {
+					refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, f.RelPath, oldContent, newContentRaw, "")
+					if refineErr != nil {
+						progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", f.RelPath, refineErr))
+						// fall back to initial issues so garbage guard can still fire
+						refineIssues = initialIssues
+					} else {
+						newContentRaw = refined
+						newContent = agentDocStripCompletionSentinel(newContentRaw)
+						refineIssues = issues
+					}
+				} else {
+					refineIssues = initialIssues
+				}
+				if agentHasIssue(refineIssues, "missing completion sentinel") {
+					if strings.TrimSpace(oldContent) != "" {
+						progress(fmt.Sprintf("— %s — output missing completion sentinel; keeping existing content", f.RelPath))
+						resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+						return
+					}
+					progress(fmt.Sprintf("⚠️ %s — output missing completion sentinel; not writing incomplete documentation", f.RelPath))
+					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+					return
+				}
+				// Garbage guard: when output is too short/malformed OR significantly
+				// shorter than existing content, don't overwrite — keep existing content.
+				isGarbage := agentIsGarbageDocContent(refineIssues) ||
+					agentIsSignificantlyShortened(newContent, oldContent)
+				if isGarbage {
+					if strings.TrimSpace(oldContent) != "" {
+						progress(fmt.Sprintf("— %s — model output too short/malformed; keeping existing content (try a larger model)", f.RelPath))
+						resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+						return
+					}
+					progress(fmt.Sprintf("⚠️ %s — documentation may be incomplete; try a larger/better model", f.RelPath))
+				} else if len(refineIssues) > 0 {
+					progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", f.RelPath, strings.Join(refineIssues, "; ")))
+				}
+				if !dryRun {
+					if err := os.WriteFile(absPath, []byte(newContent), 0o644); err != nil {
+						progress(fmt.Sprintf("❌ %s — write error", f.RelPath))
+						resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: err.Error()}}
+						return
+					}
+					s.markWrittenFile(f.RelPath)
+					progress(fmt.Sprintf("✅ %s — modified", f.RelPath))
+					s.mu.Lock()
+					s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: f.RelPath, Task: task})
+					s.mu.Unlock()
+				} else {
+					progress(fmt.Sprintf("📋 %s — proposed (awaiting confirmation)", f.RelPath))
+				}
+				resultsCh <- indexedResult{idx, AgentFileResult{
+					File:       f.RelPath,
+					Changed:    true,
+					Pending:    dryRun,
+					OldContent: oldContent,
+					NewContent: newContent,
+				}}
+				return
+			} else if ctxBuf.Len() > 0 {
 				userPrompt = fmt.Sprintf(
 					"Related files for context (do NOT output these — only output the file you are asked to edit):\n\n%s\nFile to edit: %s\n\n%s\n\nTask: %s",
 					ctxBuf.String(), f.RelPath, oldContent, task,
@@ -2131,7 +3643,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			chatReq := &llm.ChatRequest{
 				Model: s.cfg.LLM.Model,
 				Messages: []llm.Message{
-					{Role: "system", Content: systemPrompt},
+					{Role: "system", Content: fileSysPrompt},
 					{Role: "user", Content: userPrompt},
 				},
 				Temperature: agentTemperature(s.cfg.LLM.Temperature),
@@ -2164,7 +3676,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 					}
 					progress(fmt.Sprintf("🗑️ %s — deleted", f.RelPath))
 					s.mu.Lock()
-					s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
+					s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: f.RelPath, Task: task})
 					s.mu.Unlock()
 				} else {
 					progress(fmt.Sprintf("📋 %s — delete proposed (awaiting confirmation)", f.RelPath))
@@ -2195,7 +3707,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				s.markWrittenFile(f.RelPath)
 				progress(fmt.Sprintf("✅ %s — modified", f.RelPath))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: f.RelPath, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: f.RelPath, Task: task})
 				s.mu.Unlock()
 			} else {
 				progress(fmt.Sprintf("📋 %s — proposed (awaiting confirmation)", f.RelPath))
@@ -2245,7 +3757,14 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 				break
 			}
 		}
-		if noErrors {
+		allDocTargets := true
+		for _, f := range targetFiles {
+			if f != nil && !agentIsDocLikeFile(f.RelPath) {
+				allDocTargets = false
+				break
+			}
+		}
+		if noErrors && !allDocTargets {
 			progress("🔄 No existing files need changes — routing to file creation…")
 			return s.runAgentCreate(ctx, task, allFiles, progress, dryRun)
 		}
@@ -2269,6 +3788,185 @@ func (s *Server) runAgentTask(ctx context.Context, task string, progress func(st
 			fmt.Fprintf(&sb, "• ✅ %s — modified\n", r.File)
 		} else {
 			fmt.Fprintf(&sb, "• — %s — no change needed\n", r.File)
+		}
+	}
+
+	return sb.String(), results, nil
+}
+
+// runAgentMergeSingleFile consolidates multiple scoped files into one
+// destination file and deletes the merged source files.
+func (s *Server) runAgentMergeSingleFile(ctx context.Context, task string, targetFiles []*types.FileInfo, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
+	if len(targetFiles) < 2 {
+		return "", nil, fmt.Errorf("merge flow requires at least two scoped files")
+	}
+
+	destination := agentChooseMergeTargetFile(task, targetFiles)
+	if destination == "" {
+		return "", nil, fmt.Errorf("could not determine merge destination file")
+	}
+
+	cleanDir := filepath.Clean(s.directory)
+	destAbs := filepath.Clean(filepath.Join(s.directory, destination))
+	destRel, relErr := filepath.Rel(cleanDir, destAbs)
+	if relErr != nil || strings.HasPrefix(destRel, "..") {
+		return "", nil, fmt.Errorf("merge destination is outside working directory: %s", destination)
+	}
+	destination = filepath.ToSlash(destRel)
+
+	targetByRel := map[string]*types.FileInfo{}
+	for _, f := range targetFiles {
+		if f == nil {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(f.RelPath))
+		targetByRel[rel] = f
+	}
+
+	var ctxBuf strings.Builder
+	sourceContents := map[string]string{}
+	for rel, f := range targetByRel {
+		if f == nil || !f.IsReadable {
+			continue
+		}
+		absPath := filepath.Clean(filepath.Join(s.directory, rel))
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		sourceContents[rel] = content
+		fmt.Fprintf(&ctxBuf, "=== %s ===\n%s\n\n", rel, content)
+	}
+
+	if ctxBuf.Len() == 0 {
+		return "", nil, fmt.Errorf("none of the scoped files were readable for merge")
+	}
+
+	oldDestContent := sourceContents[destination]
+	if oldDestContent == "" {
+		if data, err := os.ReadFile(destAbs); err == nil {
+			oldDestContent = string(data)
+		}
+	}
+
+	systemPrompt := "You are a coding agent. Consolidate multiple source files into a single destination file. " +
+		"Output ONLY the complete destination file content (raw text, no markdown, no commentary)."
+	if changelog := s.agentChangelogPrompt(); changelog != "" {
+		systemPrompt += "\n\n" + changelog
+	}
+
+	userPrompt := fmt.Sprintf(
+		"Task: %s\n\nDestination file (the only surviving file): %s\n\nSource files to merge:\n\n%s\nRules:\n- Return only the full content of %s.\n- Do not output filename headers or markdown fences.\n- The other scoped files will be removed after merge.",
+		task, destination, ctxBuf.String(), destination,
+	)
+
+	chatReq := &llm.ChatRequest{
+		Model: s.cfg.LLM.Model,
+		Messages: []llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Temperature: agentTemperature(s.cfg.LLM.Temperature),
+	}
+
+	progress(fmt.Sprintf("⚙️  Consolidating into %s…", destination))
+	resp, err := s.llmClient.Chat(ctx, chatReq)
+	if err != nil {
+		return "", nil, fmt.Errorf("merge generation failed: %w", err)
+	}
+
+	newDestContent := agentStripFences(strings.TrimSpace(resp.Message.Content))
+	if strings.TrimSpace(newDestContent) == "NO_CHANGE" {
+		newDestContent = oldDestContent
+	}
+	if strings.TrimSpace(newDestContent) == "" {
+		return "", nil, fmt.Errorf("merge generation returned empty destination content")
+	}
+
+	destChanged := strings.TrimSpace(newDestContent) != strings.TrimSpace(oldDestContent)
+
+	deleteList := make([]string, 0, len(targetByRel))
+	for rel := range targetByRel {
+		if rel == destination {
+			continue
+		}
+		deleteList = append(deleteList, rel)
+	}
+	sort.Strings(deleteList)
+
+	if !dryRun {
+		if err := os.MkdirAll(filepath.Dir(destAbs), 0o755); err != nil {
+			return "", nil, fmt.Errorf("failed to create destination directory: %w", err)
+		}
+		if destChanged || oldDestContent == "" {
+			if err := os.WriteFile(destAbs, []byte(newDestContent), 0o644); err != nil {
+				return "", nil, fmt.Errorf("failed to write merge destination %s: %w", destination, err)
+			}
+			s.markWrittenFile(destination)
+			s.mu.Lock()
+			op := "modified"
+			if oldDestContent == "" {
+				op = "created"
+			}
+			s.appendAgentLogLocked(AgentLogEntry{Operation: op, File: destination, Task: task})
+			s.mu.Unlock()
+		}
+
+		for _, rel := range deleteList {
+			abs := filepath.Clean(filepath.Join(s.directory, rel))
+			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+				return "", nil, fmt.Errorf("failed to delete merged source %s: %w", rel, err)
+			}
+			s.mu.Lock()
+			s.appendAgentLogLocked(AgentLogEntry{Operation: "deleted", File: rel, Task: task})
+			s.mu.Unlock()
+		}
+	}
+
+	var results []AgentFileResult
+	if destChanged || oldDestContent == "" || dryRun {
+		results = append(results, AgentFileResult{
+			File:            destination,
+			Changed:         destChanged || oldDestContent == "",
+			Created:         oldDestContent == "",
+			Pending:         dryRun,
+			OldContent:      oldDestContent,
+			NewContent:      newDestContent,
+			PromptEvalCount: resp.PromptEvalCount,
+		})
+	}
+	for _, rel := range deleteList {
+		results = append(results, AgentFileResult{
+			File:       rel,
+			Changed:    true,
+			Deleted:    true,
+			Pending:    dryRun,
+			OldContent: sourceContents[rel],
+		})
+	}
+
+	var sb strings.Builder
+	if dryRun {
+		fmt.Fprintf(&sb, "🤖 **Agent**: consolidated %d file(s) into %s — confirm or deny below.\n", len(targetByRel), destination)
+	} else {
+		fmt.Fprintf(&sb, "🤖 **Agent**: consolidated %d file(s) into %s.\n", len(targetByRel), destination)
+	}
+
+	if destChanged || oldDestContent == "" {
+		if dryRun {
+			fmt.Fprintf(&sb, "• 📋 %s — pending confirmation\n", destination)
+		} else {
+			fmt.Fprintf(&sb, "• ✅ %s — updated\n", destination)
+		}
+	} else {
+		fmt.Fprintf(&sb, "• — %s — unchanged\n", destination)
+	}
+	for _, rel := range deleteList {
+		if dryRun {
+			fmt.Fprintf(&sb, "• 📋 %s — delete pending\n", rel)
+		} else {
+			fmt.Fprintf(&sb, "• 🗑️  %s — deleted\n", rel)
 		}
 	}
 
@@ -2310,17 +4008,33 @@ func parseAgentCreateResponse(raw string) []agentFileBlock {
 		if sec == "" {
 			continue
 		}
-		// Find the first \n---\n separator within this section.
-		sepIdx := strings.Index(sec, "\n---\n")
-		if sepIdx < 0 {
+		rawName := ""
+		content := ""
+
+		// Preferred format: "<name>\n---\n<content>".
+		if sepIdx := strings.Index(sec, "\n---\n"); sepIdx >= 0 {
+			rawName = strings.TrimSpace(sec[:sepIdx])
+			content = agentStripFences(sec[sepIdx+5:])
+		} else {
+			// Tolerate malformed-but-common model output: "<name>/---\n<content>".
+			firstLine, rest, ok := strings.Cut(sec, "\n")
+			if !ok {
+				continue
+			}
+			line := strings.TrimSpace(firstLine)
+			if strings.HasSuffix(line, "/---") {
+				rawName = strings.TrimSpace(strings.TrimSuffix(line, "/---"))
+				content = agentStripFences(rest)
+			}
+		}
+
+		if rawName == "" || content == "" {
 			continue
 		}
-		rawName := strings.TrimSpace(sec[:sepIdx])
 		// Strip optional "FILE:" prefix (case-insensitive) the model might add.
 		if len(rawName) > 5 && strings.EqualFold(rawName[:5], "file:") {
 			rawName = strings.TrimSpace(rawName[5:])
 		}
-		content := agentStripFences(sec[sepIdx+5:])
 		if rawName != "" && content != "" {
 			blocks = append(blocks, agentFileBlock{name: rawName, content: content})
 		}
@@ -2334,35 +4048,63 @@ func parseAgentCreateResponse(raw string) []agentFileBlock {
 // treated as multi-file creation requests so they go through runAgentPlan.
 // If none is clearly present, it returns "".
 func agentExplicitFilenameFromTask(task string) string {
-	// Long tasks describe multi-file projects — don't try to extract a single
-	// filename from prose ("e.g., React, Vue..." would otherwise match "e.g").
-	if len(task) > 200 {
+	lower := strings.ToLower(task)
+	isDocsTask := strings.Contains(lower, "readme") || strings.Contains(lower, "documentation") || strings.Contains(lower, "docs")
+
+	// Mixed tasks (e.g. "generate golang app ... add documentation in README.md")
+	// must go through full planning so code files are not dropped.
+	if isDocsTask && agentIsMixedCodeAndDocsTask(task) {
 		return ""
 	}
-	match := agentFilenameRe.FindString(task)
-	if match == "" {
+
+	// Keep conservative behaviour for long generic prompts (project scaffolding),
+	// but still allow explicit doc targets like README.md.
+	if len(task) > 200 && !isDocsTask {
 		return ""
 	}
-	name := agentSanitizeFilename(match)
-	ext := filepath.Ext(name)
-	if name == "" || strings.Contains(name, " ") || ext == "" {
+
+	mentions := agentFileMentionsFromTask(task)
+	if len(mentions) == 0 {
 		return ""
 	}
-	// Require at least a 2-character extension (e.g. ".go", not ".g").
-	if len(ext) < 3 {
+	if len(mentions) == 1 {
+		return mentions[0]
+	}
+
+	// Multi-file mention: for docs requests, prefer an explicit README target.
+	if isDocsTask {
+		for _, name := range mentions {
+			if strings.HasPrefix(strings.ToLower(filepath.Base(name)), "readme.") {
+				return name
+			}
+		}
+	}
+
+	return ""
+}
+
+func formatPlanForMemory(plan []PlannedFile) string {
+	if len(plan) == 0 {
 		return ""
 	}
-	// Block known prose abbreviations that match the filename pattern.
-	if knownNonFilenames[strings.ToLower(name)] {
-		return ""
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "📋 Plan: %d file(s) to create\n", len(plan))
+	for _, pf := range plan {
+		desc := strings.TrimSpace(pf.Description)
+		if desc != "" {
+			fmt.Fprintf(&sb, "• %s — %s\n", pf.File, desc)
+		} else {
+			fmt.Fprintf(&sb, "• %s\n", pf.File)
+		}
 	}
-	return name
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // runAgentPlan asks the LLM which files need to be created for the task.
-// It returns a deduplicated, sanitized list of filenames. This is a cheap
-// "thinking" call — the model only returns names, not content.
-func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*types.FileInfo) ([]string, error) {
+// It returns a deduplicated list of PlannedFile entries each with a description
+// of what the file owns and its declared dependencies. This is a cheap
+// "thinking" call — the model only plans, it does not generate content.
+func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*types.FileInfo) ([]PlannedFile, error) {
 	// Build a brief context summary (just filenames, not content — keep tokens low).
 	var ctxNames []string
 	for _, cf := range contextFiles {
@@ -2375,18 +4117,10 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 		userMsg += "\n\nExisting files in the project:\n" + strings.Join(ctxNames, "\n")
 	}
 
-	planPrompt := "You are a project planning agent. " +
-		"Given a task, list EVERY file that must be created to fully complete it. " +
-		"Output ONLY the filenames, one per line — no explanations, no numbers, no markdown, no extra text. " +
-		"Include all files needed (e.g. for a standalone Go app: main.go and go.mod; " +
-		"for Terraform: main.tf, variables.tf, providers.tf; " +
-		"for a Python service: main.py, requirements.txt). " +
-		"Always include config/dependency files required to make the project runnable."
-
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
 		Messages: []llm.Message{
-			{Role: "system", Content: planPrompt},
+			{Role: "system", Content: promptAgentPlan},
 			{Role: "user", Content: userMsg},
 		},
 		Temperature: 0.2, // low temp: we want a deterministic, factual list
@@ -2397,12 +4131,14 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 		return nil, err
 	}
 
-	// Parse the response: one filename per line.
+	// Parse the response: one entry per line in "filename | description | deps" format.
 	seen := map[string]bool{}
-	var files []string
+	var files []PlannedFile
 	for _, line := range strings.Split(resp.Message.Content, "\n") {
-		name := agentSanitizeFilename(strings.TrimSpace(line))
-		// Skip empty lines, lines that look like prose (contain spaces after sanitizing)
+		line = strings.TrimSpace(line)
+		parts := strings.SplitN(line, "|", 3)
+		name := agentSanitizeFilename(strings.TrimSpace(parts[0]))
+		// Skip empty lines, lines that look like prose (contain spaces in the filename).
 		if name == "" || strings.Contains(name, " ") {
 			continue
 		}
@@ -2415,12 +4151,84 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 		if knownNonFilenames[strings.ToLower(name)] {
 			continue
 		}
-		if !seen[name] {
-			seen[name] = true
-			files = append(files, name)
+		if seen[name] {
+			continue
 		}
+		seen[name] = true
+		desc := ""
+		if len(parts) >= 2 {
+			desc = strings.TrimSpace(parts[1])
+		}
+		var deps []string
+		if len(parts) >= 3 {
+			for _, d := range strings.Split(parts[2], ",") {
+				if dep := agentSanitizeFilename(strings.TrimSpace(d)); dep != "" {
+					deps = append(deps, dep)
+				}
+			}
+		}
+		files = append(files, PlannedFile{File: name, Description: desc, DependsOn: deps})
 	}
 	return files, nil
+}
+
+// topoSortPlannedFiles orders files so each dependency comes before the files
+// that depend on it (Kahn's algorithm). Doc-like files are always placed last
+// regardless of declared dependencies. Falls back to original order on cycle.
+func topoSortPlannedFiles(files []PlannedFile) []PlannedFile {
+	if len(files) <= 1 {
+		return files
+	}
+	idx := make(map[string]int, len(files))
+	for i, f := range files {
+		idx[f.File] = i
+	}
+	// adj[j] = list of file indices that depend on file[j] (j must come first).
+	adj := make([][]int, len(files))
+	inDegree := make([]int, len(files))
+	for i, f := range files {
+		for _, dep := range f.DependsOn {
+			j, ok := idx[dep]
+			if !ok {
+				continue // dep not in plan, ignore
+			}
+			adj[j] = append(adj[j], i)
+			inDegree[i]++
+		}
+	}
+	queue := make([]int, 0, len(files))
+	for i := range files {
+		if inDegree[i] == 0 {
+			queue = append(queue, i)
+		}
+	}
+	result := make([]PlannedFile, 0, len(files))
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		result = append(result, files[cur])
+		for _, next := range adj[cur] {
+			inDegree[next]--
+			if inDegree[next] == 0 {
+				queue = append(queue, next)
+			}
+		}
+	}
+	if len(result) != len(files) {
+		// Cycle detected — fall back to original order.
+		result = files
+	}
+	// Always place doc-like files last regardless of dependency order.
+	code := make([]PlannedFile, 0, len(result))
+	docs := make([]PlannedFile, 0, 2)
+	for _, f := range result {
+		if agentIsDocLikeFile(f.File) {
+			docs = append(docs, f)
+		} else {
+			code = append(code, f)
+		}
+	}
+	return append(code, docs...)
 }
 
 // runAgentCreate handles the case where one or more new files must be created
@@ -2428,41 +4236,101 @@ func (s *Server) runAgentPlan(ctx context.Context, task string, contextFiles []*
 // generates each file with a focused, isolated LLM prompt.
 func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles []*types.FileInfo, progress func(string), dryRun bool) (string, []AgentFileResult, error) {
 	// ── Step 1: planning call (or explicit single-file shortcut) ───────────
-	var plannedFiles []string
+	var plan []PlannedFile
 	if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
 		// The user explicitly named a file, so avoid broad multi-file planning.
-		plannedFiles = []string{explicit}
-		progress(fmt.Sprintf("📋 Plan: explicit target %s (planning skipped)", explicit))
+		plan = []PlannedFile{{File: explicit, Description: "explicit target (planning skipped)"}}
+		planText := formatPlanForMemory(plan)
+		s.rememberTaskPlanForMemory(task, planText)
+		progress(planText)
 	} else {
 		// Ask the model which files are needed. This small focused call is far more
 		// reliable than asking a small LLM to plan AND generate in one shot.
 		progress("🗺️  Planning: asking LLM which files to create…")
 		var err error
-		plannedFiles, err = s.runAgentPlan(ctx, task, contextFiles)
+		plan, err = s.runAgentPlan(ctx, task, contextFiles)
 		if err != nil {
 			return "", nil, fmt.Errorf("agent plan step failed: %w", err)
 		}
-		if len(plannedFiles) == 0 {
+		if len(plan) == 0 {
 			// Planning failed silently (model returned only prose). Fall back to
 			// the legacy single-call path.
 			progress("⚠️  Planning returned no files — falling back to single-file mode…")
-			plannedFiles = nil
+			plan = nil
 		} else {
-			var planBuf strings.Builder
-			fmt.Fprintf(&planBuf, "📋 Plan: %d file(s) to create\n", len(plannedFiles))
-			for _, f := range plannedFiles {
-				fmt.Fprintf(&planBuf, "  • %s\n", f)
+			if agentIsDocsIntent(task) && !agentIsMixedCodeAndDocsTask(task) {
+				plannedFileNames := make([]string, len(plan))
+				for i, pf := range plan {
+					plannedFileNames[i] = pf.File
+				}
+				filtered, blocked := filterPlannedFilesForDocsIntent(task, plannedFileNames)
+				if len(blocked) > 0 {
+					progress(fmt.Sprintf("🛡️  Docs guard blocked non-doc planned files: %s", strings.Join(blocked, ", ")))
+				}
+				filteredSet := make(map[string]bool, len(filtered))
+				for _, f := range filtered {
+					filteredSet[f] = true
+				}
+				filteredPlan := make([]PlannedFile, 0, len(filtered))
+				for _, pf := range plan {
+					if filteredSet[pf.File] {
+						filteredPlan = append(filteredPlan, pf)
+					}
+				}
+				plan = filteredPlan
+				if len(plan) == 0 {
+					if explicit := agentExplicitFilenameFromTask(task); explicit != "" {
+						plan = []PlannedFile{{File: explicit}}
+					} else {
+						plan = []PlannedFile{{File: "README.md"}}
+					}
+					progress(fmt.Sprintf("📋 Plan: docs fallback target %s", plan[0].File))
+				} else if len(plan) > 1 {
+					// Pure doc tasks should produce exactly one file. The LLM often
+					// splits "add documentation" into multiple .md files (e.g. README.md
+					// + simplewebserver_documentation.md) which produces duplicate,
+					// low-quality output. Collapse to one: prefer README.md if planned,
+					// otherwise keep the first entry.
+					chosen := plan[0]
+					for _, pf := range plan {
+						if strings.EqualFold(filepath.Base(pf.File), "readme.md") {
+							chosen = pf
+							break
+						}
+					}
+					progress(fmt.Sprintf("📋 Docs guard collapsed %d planned files to single target: %s", len(plan), chosen.File))
+					plan = []PlannedFile{chosen}
+				}
 			}
-			progress(planBuf.String())
+
+			// Sort: deps-first topological order, doc files always last.
+			plan = topoSortPlannedFiles(plan)
+
+			var planBuf strings.Builder
+			fmt.Fprintf(&planBuf, "📋 Plan: %d file(s) to create\n", len(plan))
+			for _, pf := range plan {
+				if pf.Description != "" {
+					fmt.Fprintf(&planBuf, "  • %s — %s\n", pf.File, pf.Description)
+				} else {
+					fmt.Fprintf(&planBuf, "  • %s\n", pf.File)
+				}
+			}
+			planText := planBuf.String()
+			s.rememberTaskPlanForMemory(task, planText)
+			progress(planText)
 		}
 	}
 
 	// ── Step 2: build context block ─────────────────────────────────────────
-	var ctxBuf strings.Builder
+	// For doc files, only a filename list is needed — dumping full source code
+	// overwhelms small local models when all they need to write is prose.
+	var ctxBuf strings.Builder      // full file content (non-doc files)
+	var ctxFileList strings.Builder // filename-only list (used for doc files)
 	for _, cf := range contextFiles {
 		if cf == nil || !cf.IsReadable {
 			continue
 		}
+		fmt.Fprintf(&ctxFileList, "  %s\n", cf.RelPath)
 		absPath := filepath.Clean(filepath.Join(s.directory, cf.RelPath))
 		data, err := os.ReadFile(absPath)
 		if err != nil {
@@ -2476,17 +4344,42 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 	var results []AgentFileResult
 	var summaryLines []string
 
-	// ── Step 3a: per-file generation (planning succeeded) ───────────────────
-	if len(plannedFiles) > 0 {
+	// Build the plan block once — injected into every per-file prompt so each
+	// file knows what its siblings own and avoids redefining those symbols.
+	var planBlockBuf strings.Builder
+	if len(plan) > 1 {
+		planBlockBuf.WriteString("\nProject file plan (responsibilities of every file being created):\n")
+		for _, pf := range plan {
+			if pf.Description != "" {
+				fmt.Fprintf(&planBlockBuf, "  %s — %s\n", pf.File, pf.Description)
+			} else {
+				fmt.Fprintf(&planBlockBuf, "  %s\n", pf.File)
+			}
+		}
+		planBlockBuf.WriteString("Do NOT define symbols or logic that are owned by other files listed above.\n")
+	}
+	planBlock := planBlockBuf.String()
+
+	if len(plan) > 0 {
 		alreadyGenerated := map[string]string{} // relPath → content, for cross-file context
 
-		for i, fileName := range plannedFiles {
-			progress(fmt.Sprintf("⚙️  Generating %s (%d/%d)…", fileName, i+1, len(plannedFiles)))
+		for i, pf := range plan {
+			fileName := pf.File
+			progress(fmt.Sprintf("⚙️  Generating %s (%d/%d)…", fileName, i+1, len(plan)))
+			isDocFile := agentIsDocLikeFile(fileName)
 
 			// Build a focused prompt for this single file.
 			var userMsg strings.Builder
 			fmt.Fprintf(&userMsg, "Task: %s\n\nGenerate ONLY the file: %s\n", task, fileName)
-			if ctxBuf.Len() > 0 {
+			if !isDocFile && planBlock != "" {
+				userMsg.WriteString(planBlock)
+			}
+			if isDocFile {
+				// Filename list only — no source code contents.
+				if ctxFileList.Len() > 0 {
+					fmt.Fprintf(&userMsg, "\nProject files (for reference only, do NOT reproduce them):\n%s", ctxFileList.String())
+				}
+			} else if ctxBuf.Len() > 0 {
 				fmt.Fprintf(&userMsg, "\nExisting project files for context:\n%s", ctxBuf.String())
 			}
 			// Inject already-generated files so the model can stay consistent
@@ -2497,12 +4390,21 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 					fmt.Fprintf(&userMsg, "=== %s ===\n%s\n\n", name, content)
 				}
 			}
+			if isDocFile {
+				userMsg.WriteString("\n")
+				userMsg.WriteString(s.agentProjectMetaBlock())
+				userMsg.WriteString("\n")
+			}
 
-			sysPrompt := "You are a coding agent. " +
-				"Generate ONLY the complete content of the single file specified. " +
-				"Output raw file content — no markdown fences, no commentary, no filename header."
-			if changelog != "" {
+			sysPrompt := promptAgentCreateSingle
+			if isDocFile {
+				sysPrompt = s.buildDocSystemPrompt("")
+			}
+			if changelog != "" && !isDocFile {
 				sysPrompt += "\n\n" + changelog
+			}
+			if isDocFile && changelog != "" {
+				sysPrompt = s.buildDocSystemPrompt(changelog)
 			}
 
 			chatReq := &llm.ChatRequest{
@@ -2519,6 +4421,14 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				continue
 			}
 			fileContent := agentStripFences(strings.TrimSpace(resp.Message.Content))
+			fileContentRaw := fileContent
+			if isDocFile {
+				fileContentRaw = strings.TrimSpace(agentNormalizeDocOutput(resp.Message.Content))
+				fileContent = agentDocStripCompletionSentinel(fileContentRaw)
+			}
+			if !isDocFile {
+				fileContent = agentStripLeadingProse(fileContent, fileName)
+			}
 			if fileContent == "" {
 				progress(fmt.Sprintf("⚠️  %s — empty response, skipping", fileName))
 				continue
@@ -2545,6 +4455,30 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				return "", nil, fmt.Errorf("agent tried to write outside working directory: %s", fileName)
 			}
 			relSlash := filepath.ToSlash(rel)
+
+			if isDocFile {
+				existingDoc := ""
+				if data, readErr := os.ReadFile(absPath); readErr == nil {
+					existingDoc = string(data)
+				}
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContentRaw, "")
+				if refineErr != nil {
+					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
+				} else {
+					fileContentRaw = refined
+					fileContent = agentDocStripCompletionSentinel(fileContentRaw)
+					if agentHasIssue(issues, "missing completion sentinel") {
+						progress(fmt.Sprintf("⚠️ %s — output missing completion sentinel; skipping incomplete documentation", relSlash))
+						continue
+					}
+					if agentIsGarbageDocContent(issues) {
+						progress(fmt.Sprintf("⚠️ %s — documentation may be incomplete; try a larger/better model", relSlash))
+					} else if len(issues) > 0 {
+						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", relSlash, strings.Join(issues, "; ")))
+					}
+				}
+			}
+
 			alreadyGenerated[relSlash] = fileContent
 
 			if !dryRun {
@@ -2557,7 +4491,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				s.markWrittenFile(relSlash)
 				progress(fmt.Sprintf("✨ %s — created", relSlash))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "created", File: relSlash, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "created", File: relSlash, Task: task})
 				s.mu.Unlock()
 				summaryLines = append(summaryLines, fmt.Sprintf("• ✨ %s — created", relSlash))
 			} else {
@@ -2570,14 +4504,23 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				PromptEvalCount: resp.PromptEvalCount,
 			})
 		}
+		// Post-generation consistency check: a single cheap LLM call to surface
+		// duplicate symbols or mismatched signatures — no files are modified.
+		if !dryRun && len(alreadyGenerated) >= 2 {
+			progress("🔍 Running consistency check across generated files…")
+			s.runAgentConsistencyCheck(ctx, task, alreadyGenerated, progress)
+		}
 	}
 
-	// ── Step 3b: legacy single-call path (planning returned nothing) ─────────
 	if len(results) == 0 {
 		progress("⚙️  Calling LLM to create file(s)…")
 
+		isDocsLegacy := agentIsDocsIntent(task)
 		userContent := task
-		if ctxBuf.Len() > 0 {
+		if isDocsLegacy && ctxFileList.Len() > 0 {
+			progress("Reading context files…")
+			userContent = fmt.Sprintf("Project files (for reference only, do NOT reproduce them):\n%s\nTask: %s", ctxFileList.String(), task)
+		} else if !isDocsLegacy && ctxBuf.Len() > 0 {
 			progress("Reading context files…")
 			userContent = fmt.Sprintf("Existing files for context:\n\n%s\nTask: %s", ctxBuf.String(), task)
 		}
@@ -2585,6 +4528,9 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		createSystemPrompt := promptAgentCreate
 		if changelog != "" {
 			createSystemPrompt += "\n\n" + changelog
+		}
+		if memCtxCreate := s.memoryContext(); memCtxCreate != "" {
+			createSystemPrompt += "\n\n" + memCtxCreate
 		}
 
 		chatReq := &llm.ChatRequest{
@@ -2609,6 +4555,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		for _, blk := range blocks {
 			fileName := blk.name
 			fileContent := blk.content
+			fileContentRaw := fileContent
 			// Preserve subdirectory components the LLM proposes (e.g. src/game.ts);
 			// only strip to basename when there is no directory separator.
 			if !strings.ContainsAny(fileName, "/\\") {
@@ -2627,6 +4574,28 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				return "", nil, fmt.Errorf("agent tried to write outside working directory: %s", fileName)
 			}
 			relSlash := filepath.ToSlash(rel)
+
+			if agentIsDocLikeFile(fileName) {
+				existingDoc := ""
+				if data, readErr := os.ReadFile(absPath); readErr == nil {
+					existingDoc = string(data)
+				}
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContentRaw, "")
+				if refineErr != nil {
+					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
+				} else {
+					fileContentRaw = refined
+					fileContent = agentDocStripCompletionSentinel(fileContentRaw)
+					if agentHasIssue(issues, "missing completion sentinel") {
+						progress(fmt.Sprintf("⚠️ %s — output missing completion sentinel; skipping incomplete documentation", relSlash))
+						continue
+					}
+					if len(issues) > 0 {
+						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", relSlash, strings.Join(issues, "; ")))
+					}
+				}
+			}
+
 			if !dryRun {
 				if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 					return "", nil, fmt.Errorf("failed to create directory for %s: %w", relSlash, err)
@@ -2637,7 +4606,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				s.markWrittenFile(relSlash)
 				progress(fmt.Sprintf("✨ %s — created", relSlash))
 				s.mu.Lock()
-				s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "created", File: relSlash, Task: task})
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "created", File: relSlash, Task: task})
 				s.mu.Unlock()
 				summaryLines = append(summaryLines, fmt.Sprintf("• ✨ %s — created", relSlash))
 			} else {
@@ -2665,6 +4634,43 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 			len(results), strings.Join(summaryLines, "\n"))
 	}
 	return summary, results, nil
+}
+
+// runAgentConsistencyCheck runs a cheap LLM analysis across all generated files
+// to surface duplicate symbols, mismatched signatures, or missing imports.
+// It never modifies files — findings are emitted via progress messages only.
+func (s *Server) runAgentConsistencyCheck(ctx context.Context, task string, generated map[string]string, progress func(string)) {
+	if len(generated) < 2 {
+		return
+	}
+	var fileBuf strings.Builder
+	for name, content := range generated {
+		fmt.Fprintf(&fileBuf, "=== %s ===\n%s\n\n", name, content)
+	}
+	sysPrompt := "You are a code review agent. Analyze the provided source files and list ONLY concrete problems: " +
+		"duplicate symbol definitions across files, mismatched function or type signatures between files, " +
+		"or clearly missing imports or references. " +
+		"If no problems are found, output exactly: OK. " +
+		"Do not suggest style improvements or optional enhancements. Be concise."
+	userMsg := fmt.Sprintf("Task that generated these files: %s\n\nGenerated files:\n%s", task, fileBuf.String())
+	chatReq := &llm.ChatRequest{
+		Model: s.cfg.LLM.Model,
+		Messages: []llm.Message{
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: userMsg},
+		},
+		Temperature: 0.1,
+	}
+	resp, err := s.llmClient.Chat(ctx, chatReq)
+	if err != nil || strings.TrimSpace(resp.Message.Content) == "" {
+		return
+	}
+	issues := strings.TrimSpace(resp.Message.Content)
+	if strings.EqualFold(issues, "ok") {
+		progress("✅ Consistency check: no issues found")
+		return
+	}
+	progress("⚠️ Consistency check findings:\n" + issues)
 }
 
 // agentTemperature returns a temperature suitable for agent code-editing tasks.
@@ -2769,7 +4775,1476 @@ func extractErrorSnippets(workDir, errorOutput string) string {
 	return sb.String()
 }
 
-// agentInferExtension appends a file extension to name based on content
+// ── Search/Replace patch types ─────────────────────────────────────────────
+
+// fixHunk is a single search→replace pair within a file.
+type fixHunk struct {
+	search  string
+	replace string
+}
+
+// fixPatch describes all hunks to apply to one file.
+type fixPatch struct {
+	name  string
+	hunks []fixHunk
+}
+
+// parseFixPatchResponse parses SEARCH/REPLACE blocks from the LLM fix response.
+//
+// Expected format (one or more per response):
+//
+//	FILE: path/to/file.go
+//	<<<<<<< SEARCH
+//	old code
+//	=======
+//	new code
+//	>>>>>>> REPLACE
+func parseFixPatchResponse(text string) []fixPatch {
+	const (
+		stateTop = iota
+		stateSearch
+		stateReplace
+	)
+	var patches []fixPatch
+	var current *fixPatch
+	state := stateTop
+	var buf []string
+	var currentSearch string
+
+	flushPatch := func() {
+		if current != nil && len(current.hunks) > 0 {
+			patches = append(patches, *current)
+		}
+	}
+
+	for _, line := range strings.Split(text, "\n") {
+		switch state {
+		case stateTop:
+			if strings.HasPrefix(line, "FILE:") {
+				flushPatch()
+				name := strings.TrimSpace(strings.TrimPrefix(line, "FILE:"))
+				current = &fixPatch{name: name}
+			} else if strings.HasPrefix(line, "<<<<<<< SEARCH") || line == "<<<<<<<" {
+				if current != nil {
+					state = stateSearch
+					buf = nil
+				}
+			}
+		case stateSearch:
+			if line == "=======" {
+				currentSearch = strings.Join(buf, "\n")
+				buf = nil
+				state = stateReplace
+			} else {
+				buf = append(buf, line)
+			}
+		case stateReplace:
+			if strings.HasPrefix(line, ">>>>>>> REPLACE") || line == ">>>>>>>" {
+				if current != nil {
+					current.hunks = append(current.hunks, fixHunk{
+						search:  currentSearch,
+						replace: strings.Join(buf, "\n"),
+					})
+				}
+				buf = nil
+				state = stateTop
+			} else {
+				buf = append(buf, line)
+			}
+		}
+	}
+	flushPatch()
+	return patches
+}
+
+// applyFixPatch applies all hunks in patch to the file at workDir/patch.name.
+// Each hunk replaces the first occurrence of search with replace.
+// If search is empty the replace content is written as the entire file.
+// Returns per-hunk warnings (non-fatal) plus any fatal error.
+func applyFixPatch(workDir string, patch fixPatch) (warnings []string, err error) {
+	cleanDir := filepath.Clean(workDir)
+	absPath := filepath.Clean(filepath.Join(workDir, patch.name))
+	rel, relErr := filepath.Rel(cleanDir, absPath)
+	if relErr != nil || strings.HasPrefix(rel, "..") {
+		return nil, fmt.Errorf("path %q is outside working directory", patch.name)
+	}
+
+	var content string
+	existing, readErr := os.ReadFile(absPath)
+	hadExisting := readErr == nil
+	if readErr == nil {
+		content = string(existing)
+	} else if !os.IsNotExist(readErr) {
+		return nil, fmt.Errorf("read %s: %w", patch.name, readErr)
+	}
+
+	originalContent := content
+	appliedAny := false
+
+	for i, h := range patch.hunks {
+		if h.search == "" {
+			if content != h.replace {
+				content = h.replace
+				appliedAny = true
+			}
+			continue
+		}
+		// Strip display metadata the model might have accidentally included.
+		cleanSearch := stripDisplayPrefixes(h.search)
+		applied, ok := fuzzyReplaceHunk(content, cleanSearch, h.replace)
+		if !ok {
+			// Show the first line of what the model searched for to aid debugging.
+			preview := cleanSearch
+			if nl := strings.IndexByte(preview, '\n'); nl != -1 {
+				preview = preview[:nl]
+			}
+			if len(preview) > 80 {
+				preview = preview[:80] + "…"
+			}
+			warnings = append(warnings, fmt.Sprintf("hunk %d: search text not found in %s (searched for: %q)", i+1, patch.name, preview))
+			continue
+		}
+		if applied != content {
+			appliedAny = true
+		}
+		content = applied
+	}
+
+	if !appliedAny {
+		return warnings, fmt.Errorf("patch made no effective changes to %s", patch.name)
+	}
+
+	if content == originalContent {
+		return warnings, fmt.Errorf("patch made no effective changes to %s", patch.name)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		return warnings, fmt.Errorf("mkdir for %s: %w", patch.name, err)
+	}
+	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+		return warnings, fmt.Errorf("write %s: %w", patch.name, err)
+	}
+
+	if validateErr := validatePatchedFile(workDir, rel, content); validateErr != nil {
+		if hadExisting {
+			if rollbackErr := os.WriteFile(absPath, existing, 0o644); rollbackErr != nil {
+				return warnings, fmt.Errorf("%v (rollback failed: %w)", validateErr, rollbackErr)
+			}
+		} else {
+			if rollbackErr := os.Remove(absPath); rollbackErr != nil && !os.IsNotExist(rollbackErr) {
+				return warnings, fmt.Errorf("%v (rollback failed: %w)", validateErr, rollbackErr)
+			}
+		}
+		return warnings, validateErr
+	}
+
+	return warnings, nil
+}
+
+// validatePatchedFile runs lightweight syntax checks for common manifest files.
+// This prevents the fix loop from keeping obviously invalid replacements.
+func validatePatchedFile(workDir, relPath, content string) error {
+	if strings.EqualFold(filepath.Base(relPath), "go.mod") {
+		vctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		stdout, stderr, exitCode := execCommand(vctx, workDir, "go", "mod", "edit", "-json")
+		if exitCode != 0 {
+			diag := strings.TrimSpace(stderr)
+			if diag == "" {
+				diag = strings.TrimSpace(stdout)
+			}
+			if diag == "" {
+				diag = "go mod edit -json failed"
+			}
+			return fmt.Errorf("go.mod validation failed: %s", diag)
+		}
+	}
+
+	if strings.EqualFold(filepath.Ext(relPath), ".json") {
+		var parsed any
+		if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+			return fmt.Errorf("JSON validation failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// stripDisplayPrefixes removes display-only metadata that the LLM may have
+// accidentally included in a SEARCH block when copying from the context output.
+// Removes lines matching `line N | ` prefixes and `^ ERROR:` annotations.
+func stripDisplayPrefixes(s string) string {
+	rxPrefix := regexp.MustCompile(`^line\s+\d+\s+\|\s?`)
+	rxError := regexp.MustCompile(`^\s*\^\s*ERROR:.*$`)
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if rxError.MatchString(line) {
+			continue // drop error annotation lines entirely
+		}
+		out = append(out, rxPrefix.ReplaceAllString(line, ""))
+	}
+	return strings.Join(out, "\n")
+}
+
+// fuzzyReplaceHunk tries to replace the first occurrence of search in content
+// with replace. It first tries an exact match; if that fails it falls back to
+// a line-by-line sliding window that ignores trailing whitespace differences.
+func fuzzyReplaceHunk(content, search, replace string) (result string, ok bool) {
+	// Fast path: exact match.
+	if strings.Contains(content, search) {
+		return strings.Replace(content, search, replace, 1), true
+	}
+
+	// Slow path: normalize trailing whitespace per line and search line-by-line.
+	normLine := func(s string) string { return strings.TrimRight(s, " \t\r") }
+
+	contentLines := strings.Split(content, "\n")
+	searchLines := strings.Split(strings.TrimRight(search, "\n"), "\n")
+	replaceLines := strings.Split(replace, "\n")
+
+	nc := make([]string, len(contentLines))
+	for i, l := range contentLines {
+		nc[i] = normLine(l)
+	}
+	ns := make([]string, len(searchLines))
+	for i, l := range searchLines {
+		ns[i] = normLine(l)
+	}
+
+	for i := 0; i <= len(contentLines)-len(searchLines); i++ {
+		matched := true
+		for j, sl := range ns {
+			if nc[i+j] != sl {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			out := make([]string, 0, len(contentLines)-len(searchLines)+len(replaceLines))
+			out = append(out, contentLines[:i]...)
+			out = append(out, replaceLines...)
+			out = append(out, contentLines[i+len(searchLines):]...)
+			return strings.Join(out, "\n"), true
+		}
+	}
+	return content, false
+}
+
+// buildFixContext builds a focused prompt section for the LLM.
+// For each file referenced in errorOutput it includes:
+//   - the first 30 lines (package declaration + imports)
+//   - ±10 lines around each error location, with error annotations inline
+//
+// This replaces sending full file contents, keeping the prompt small.
+func buildFixContext(workDir, errorOutput string) string {
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+):(\d+)(?::\d+)?:\s+(.+)$`)
+	type anno struct {
+		lineNum int
+		msg     string
+	}
+	fileAnnos := map[string][]anno{}
+	var fileOrder []string
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		ln, err := strconv.Atoi(m[2])
+		if err != nil {
+			continue
+		}
+		if _, seen := fileAnnos[m[1]]; !seen {
+			fileOrder = append(fileOrder, m[1])
+		}
+		fileAnnos[m[1]] = append(fileAnnos[m[1]], anno{lineNum: ln, msg: m[3]})
+	}
+	if len(fileAnnos) == 0 {
+		return ""
+	}
+
+	type lineRange struct{ start, end int }
+
+	var sb strings.Builder
+	for _, fname := range fileOrder {
+		annos := fileAnnos[fname]
+		abs := filepath.Clean(filepath.Join(workDir, fname))
+		rel, relErr := filepath.Rel(filepath.Clean(workDir), abs)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+		srcLines := strings.Split(string(data), "\n")
+		total := len(srcLines)
+
+		// Build ranges: first 30 lines (imports) + ±10 around each error.
+		var ranges []lineRange
+		headerEnd := 30
+		if headerEnd > total {
+			headerEnd = total
+		}
+		ranges = append(ranges, lineRange{0, headerEnd})
+		for _, a := range annos {
+			s := a.lineNum - 11
+			if s < 0 {
+				s = 0
+			}
+			e := a.lineNum + 10
+			if e > total {
+				e = total
+			}
+			ranges = append(ranges, lineRange{s, e})
+		}
+
+		// Sort and merge overlapping ranges.
+		sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+		merged := []lineRange{ranges[0]}
+		for _, r := range ranges[1:] {
+			last := &merged[len(merged)-1]
+			if r.start <= last.end+1 {
+				if r.end > last.end {
+					last.end = r.end
+				}
+			} else {
+				merged = append(merged, r)
+			}
+		}
+
+		// Header note: make it unambiguous that "line N |" is display metadata,
+		// NOT part of the file. The LLM must omit it from SEARCH blocks.
+		fmt.Fprintf(&sb, "FILE: %s  (format: 'line N | RAW_CODE' — use only RAW_CODE in SEARCH blocks)\n", fname)
+		lastEnd := 0
+		for _, r := range merged {
+			if r.start > lastEnd {
+				fmt.Fprintf(&sb, "  ...\n")
+			}
+			for i := r.start; i < r.end; i++ {
+				// Print the raw code line with a line-number prefix.
+				fmt.Fprintf(&sb, "line %d | %s\n", i+1, srcLines[i])
+				// Print error annotation on its own line so it is never
+				// confused with file content.
+				for _, a := range annos {
+					if a.lineNum == i+1 {
+						fmt.Fprintf(&sb, "         ^ ERROR: %s\n", a.msg)
+						break
+					}
+				}
+			}
+			lastEnd = r.end
+		}
+		if lastEnd < total {
+			fmt.Fprintf(&sb, "  ...\n")
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// errorReferencedFiles returns unique file paths mentioned in error output.
+// It accepts any file-like token before :line so it works across ecosystems
+// (e.g. go.mod, Makefile, *.py, *.ts, Cargo.toml).
+func errorReferencedFiles(workDir, errorOutput string) []string {
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+):(\d+)(?::\d+)?:`)
+	seen := map[string]bool{}
+	var out []string
+	cleanDir := filepath.Clean(workDir)
+
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		relPath := filepath.ToSlash(filepath.Clean(m[1]))
+		if seen[relPath] {
+			continue
+		}
+		abs := filepath.Clean(filepath.Join(workDir, relPath))
+		rel, relErr := filepath.Rel(cleanDir, abs)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		st, statErr := os.Stat(abs)
+		if statErr != nil || st.IsDir() {
+			continue
+		}
+		seen[relPath] = true
+		out = append(out, relPath)
+	}
+
+	return out
+}
+
+func detectDeterministicManifestRepairTarget(errorOutput string) (string, bool) {
+	if strings.Contains(errorOutput, "errors parsing go.mod") {
+		return "go.mod", true
+	}
+	return "", false
+}
+
+func attemptDeterministicManifestRepair(workDir, manifestFile string) (bool, string) {
+	switch manifestFile {
+	case "go.mod":
+		return attemptAutoRepairGoMod(workDir)
+	default:
+		return false, fmt.Sprintf("Auto-repair skipped: deterministic strategy for %s is not implemented", manifestFile)
+	}
+}
+
+// buildMissingSymbolGuidance detects "undefined / missing symbol" errors across
+// multiple languages and attempts to look up what the package actually exports,
+// so the LLM stops guessing non-existent names.
+//
+// Supported patterns:
+//
+//	Go:     undefined: pkg.Symbol
+//	Python: cannot import name 'Symbol' from 'pkg'
+//	        module 'pkg' has no attribute 'Symbol'
+//	JS/TS:  Module '"pkg"' has no exported member 'Symbol'
+//	        Property 'Symbol' does not exist on type ...
+func buildMissingSymbolGuidance(workDir, errorOutput string) string {
+	type hint struct {
+		pkg string
+		sym string
+	}
+	seen := map[string]bool{}
+	var hints []hint
+
+	add := func(pkg, sym string) {
+		k := pkg + "." + sym
+		if !seen[k] {
+			seen[k] = true
+			hints = append(hints, hint{pkg, sym})
+		}
+	}
+
+	// Go: undefined: pkg.Symbol
+	goRx := regexp.MustCompile(`undefined: ([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)`)
+	for _, m := range goRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[1], m[2])
+	}
+
+	// Python: cannot import name 'Symbol' from 'pkg'
+	pyImportRx := regexp.MustCompile(`cannot import name '([^']+)' from '([^']+)'`)
+	for _, m := range pyImportRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[2], m[1])
+	}
+
+	// Python: module 'pkg' has no attribute 'Symbol'
+	pyAttrRx := regexp.MustCompile(`module '([^']+)' has no attribute '([^']+)'`)
+	for _, m := range pyAttrRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[1], m[2])
+	}
+
+	// JS/TS: Module '"pkg"' has no exported member 'Symbol'
+	tsRx := regexp.MustCompile(`Module '["']([^'"]+)["']' has no exported member '([^']+)'`)
+	for _, m := range tsRx.FindAllStringSubmatch(errorOutput, -1) {
+		add(m[1], m[2])
+	}
+
+	if len(hints) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for _, h := range hints {
+		exports := lookupPackageExports(workDir, h.pkg, errorOutput)
+		if len(exports) > 0 {
+			fmt.Fprintf(&b, "NOTE: `%s.%s` does not exist. Actual exports of `%s`:\n%s\nUse one of the above — do not invent names.\n\n",
+				h.pkg, h.sym, h.pkg, strings.Join(exports, "\n"))
+		} else {
+			fmt.Fprintf(&b, "NOTE: `%s.%s` does not exist in `%s`. Check the package documentation for the correct name.\n", h.pkg, h.sym, h.pkg)
+		}
+	}
+	return b.String()
+}
+
+// lookupPackageExports tries to enumerate exported names for a package using
+// the language-specific toolchain available in workDir.
+func lookupPackageExports(workDir, pkg, errorOutput string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// ── Go ──────────────────────────────────────────────────────────────────
+	// Presence of a go.mod or a .go file in error output is a strong signal.
+	if strings.Contains(errorOutput, ".go:") || hasFileExtInDir(workDir, ".go") {
+		stdout, _, exitCode := execCommand(ctx, workDir, "go", "doc", pkg)
+		if exitCode == 0 && strings.TrimSpace(stdout) != "" {
+			var out []string
+			for _, line := range strings.Split(stdout, "\n") {
+				t := strings.TrimSpace(line)
+				if strings.HasPrefix(t, "func ") || strings.HasPrefix(t, "type ") ||
+					strings.HasPrefix(t, "const ") || strings.HasPrefix(t, "var ") {
+					out = append(out, "  "+t)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+
+	// ── Python ──────────────────────────────────────────────────────────────
+	if strings.Contains(errorOutput, ".py:") || hasFileExtInDir(workDir, ".py") {
+		script := fmt.Sprintf("import %s; print('\\n'.join(x for x in dir(%s) if not x.startswith('_')))", pkg, pkg)
+		stdout, _, exitCode := execCommand(ctx, workDir, "python3", "-c", script)
+		if exitCode == 0 && strings.TrimSpace(stdout) != "" {
+			var out []string
+			for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+				if t := strings.TrimSpace(line); t != "" {
+					out = append(out, "  "+t)
+				}
+			}
+			return out
+		}
+	}
+
+	return nil
+}
+
+// hasFileExtInDir returns true when workDir contains at least one file with ext.
+func hasFileExtInDir(workDir, ext string) bool {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildManifestErrorGuidance(errorOutput string, relatedFiles []string) string {
+	var b strings.Builder
+
+	hasGoMod := strings.Contains(errorOutput, "errors parsing go.mod")
+	if !hasGoMod {
+		for _, rel := range relatedFiles {
+			if strings.EqualFold(filepath.Base(rel), "go.mod") {
+				hasGoMod = true
+				break
+			}
+		}
+	}
+	if hasGoMod {
+		b.WriteString("Manifest parser-error handling (go.mod):\n")
+		b.WriteString("- Return a FULL replacement for go.mod in a FILE/---/=== block (not partial prose).\n")
+		b.WriteString("- The go.mod content must be DIFFERENT from the current file and syntactically valid for `go mod edit -json`.\n")
+		b.WriteString("- Do not repeat any previous rejected or no-op go.mod content shown above.\n")
+	}
+
+	return b.String()
+}
+
+func detectDeterministicCodeRepairTarget(runCmd, errorOutput string) (string, bool) {
+	if runCmd == "go" && (strings.Contains(errorOutput, "imported and not used") || strings.Contains(errorOutput, "declared and not used")) {
+		return "go-unused", true
+	}
+	if runCmd == "go" && strings.Contains(errorOutput, "found packages ") {
+		return "go-package-mismatch", true
+	}
+	// Language-agnostic: detect "missing module / package" errors whose root
+	// cause is an absent dependency rather than a source-code bug.
+	if hasMissingDependencyErrors(errorOutput) {
+		return "missing-dependency", true
+	}
+	return "", false
+}
+
+// isChatMutationRequest returns (true, short description) when the user's
+// chat message is clearly asking the agent to mutate project files — e.g.
+// "delete webpack from code" or "fix sh: webpack: command not found".
+// The chat system prompt already instructs the LLM to redirect these, but
+// the LLM can occasionally mis-classify the intent; this deterministic check
+// is always reliable and fires before the LLM is ever called.
+func isChatMutationRequest(input string) (bool, string) {
+	lower := strings.ToLower(input)
+
+	// Deletion/removal of a dependency, package, or tool from the project.
+	deleteWords := []string{"delete ", "remove ", "uninstall ", "get rid of ", "strip out "}
+	fromWords := []string{
+		"from code", "from the code", "from project", "from my ",
+		"from package", "from all ", "from codebase", "from source",
+	}
+	for _, d := range deleteWords {
+		if strings.Contains(lower, d) {
+			for _, f := range fromWords {
+				if strings.Contains(lower, f) {
+					return true, "delete or remove a dependency/tool from the project"
+				}
+			}
+		}
+	}
+
+	// Modification verb + "command not found" error pattern.
+	if commandNotFoundRe.MatchString(lower) {
+		modWords := []string{"delete", "remove", "fix", "resolve", "handle", "clean", "get rid", "uninstall"}
+		for _, m := range modWords {
+			if strings.Contains(lower, m) {
+				return true, "fix a missing-command error"
+			}
+		}
+	}
+
+	// "fix/resolve" + well-known dependency error keywords.
+	if strings.Contains(lower, "fix ") || strings.Contains(lower, "resolve ") {
+		errorKeywords := []string{
+			"command not found", "cannot find module",
+			"modulenotfounderror", "no module named ",
+		}
+		for _, e := range errorKeywords {
+			if strings.Contains(lower, e) {
+				return true, "fix a dependency or build error"
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// hasMissingDependencyErrors returns true when the error output contains
+// patterns from known toolchains indicating a package must be installed.
+// It is intentionally language-agnostic: new patterns can be added here
+// without touching any other code path.
+// commandNotFoundRe matches shell "command not found" messages from bash, sh, and zsh.
+var commandNotFoundRe = regexp.MustCompile(`(?:sh|bash|zsh): (?:line \d+: )?([\w.-]+): command not found|command not found: ([\w.-]+)`)
+
+func hasMissingDependencyErrors(errorOutput string) bool {
+	// TypeScript / tsc: missing module or Node.js built-in type declarations.
+	if strings.Contains(errorOutput, "Cannot find module '") ||
+		strings.Contains(errorOutput, "Cannot find name '__dirname'") ||
+		strings.Contains(errorOutput, "Cannot find name '__filename'") {
+		return true
+	}
+	// Python: missing import at runtime or compile time.
+	if strings.Contains(errorOutput, "ModuleNotFoundError: No module named '") ||
+		strings.Contains(errorOutput, "ImportError: No module named '") {
+		return true
+	}
+	// Shell: a CLI tool required by the build script is not installed.
+	if commandNotFoundRe.MatchString(errorOutput) {
+		return true
+	}
+	return false
+}
+
+func attemptDeterministicCodeRepair(workDir, target, errorOutput string) (bool, string, []string) {
+	switch target {
+	case "go-unused":
+		return attemptAutoRepairGoUnusedDiagnostics(workDir, errorOutput)
+	case "go-package-mismatch":
+		return attemptAutoRepairGoPackageMismatch(workDir, errorOutput)
+	case "missing-dependency":
+		return attemptAutoRepairMissingDependency(workDir, errorOutput)
+	default:
+		return false, fmt.Sprintf("Auto-repair skipped: deterministic code strategy for %s is not implemented", target), nil
+	}
+}
+
+// dependencyInstallPlan holds the command needed to install missing packages.
+type dependencyInstallPlan struct {
+	cmd      string   // e.g. "npm" or "pip"
+	args     []string // full argument list including package names
+	describe string   // human-readable summary for progress messages
+}
+
+// npmToolPackages maps known CLI tool binaries to the npm package(s) that
+// provide them. Used when a tool is invoked in scripts but not declared as
+// a dependency, so we know exactly what to install.
+var npmToolPackages = map[string][]string{
+	"webpack":      {"webpack", "webpack-cli"},
+	"webpack-cli":  {"webpack-cli"},
+	"vite":         {"vite"},
+	"esbuild":      {"esbuild"},
+	"rollup":       {"rollup"},
+	"parcel":       {"parcel"},
+	"tsc":          {"typescript"},
+	"ts-node":      {"ts-node"},
+	"ts-node-esm":  {"ts-node"},
+	"eslint":       {"eslint"},
+	"prettier":     {"prettier"},
+	"jest":         {"jest"},
+	"vitest":       {"vitest"},
+	"mocha":        {"mocha"},
+	"nodemon":      {"nodemon"},
+	"concurrently": {"concurrently"},
+}
+
+// isCommandDeclaredInPackageJSON returns true when the command is explicitly
+// listed as a key in dependencies or devDependencies (not just referenced in
+// a script value), meaning `npm install` is sufficient to restore it.
+func isCommandDeclaredInPackageJSON(pkgJSONPath, cmd string) bool {
+	data, err := os.ReadFile(pkgJSONPath)
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if json.Unmarshal(data, &pkg) != nil {
+		return false
+	}
+	if _, ok := pkg.Dependencies[cmd]; ok {
+		return true
+	}
+	if _, ok := pkg.DevDependencies[cmd]; ok {
+		return true
+	}
+	// Also check mapped package names (e.g. cmd=webpack → package=webpack).
+	if pkgs, known := npmToolPackages[cmd]; known {
+		for _, p := range pkgs {
+			if _, ok := pkg.Dependencies[p]; ok {
+				return true
+			}
+			if _, ok := pkg.DevDependencies[p]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isCommandInPackageJSON returns true if the given command name appears in any
+// scripts value or as a key in dependencies/devDependencies in the given
+// package.json file. This confirms the missing tool is npm-managed rather than
+// a system utility.
+func isCommandInPackageJSON(pkgJSONPath, cmd string) bool {
+	data, err := os.ReadFile(pkgJSONPath)
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Scripts         map[string]string `json:"scripts"`
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if json.Unmarshal(data, &pkg) != nil {
+		return false
+	}
+	for _, script := range pkg.Scripts {
+		if strings.Contains(script, cmd) {
+			return true
+		}
+	}
+	if _, ok := pkg.Dependencies[cmd]; ok {
+		return true
+	}
+	if _, ok := pkg.DevDependencies[cmd]; ok {
+		return true
+	}
+	return false
+}
+
+// depRepairHandler is a function that tries to build an install plan for a
+// specific toolchain. It receives the project root, a pre-built hasFile
+// helper, and the raw error output. It returns a non-nil plan when it can
+// handle the error, or nil to let the next handler try.
+//
+// To add support for a new toolchain (e.g. cargo, go get, maven), register
+// a new function in depRepairHandlers below — no other code needs to change.
+type depRepairHandler func(workDir string, hasFile func(string) bool, errorOutput string) *dependencyInstallPlan
+
+// depRepairHandlers is the ordered registry of per-toolchain repair handlers.
+// Handlers are tried in order; the first non-nil result wins.
+var depRepairHandlers = []depRepairHandler{
+	depRepairNpm,
+	depRepairPip,
+}
+
+// depRepairNpm handles npm / Node.js / TypeScript missing-dependency errors.
+func depRepairNpm(workDir string, hasFile func(string) bool, errorOutput string) *dependencyInstallPlan {
+	if !hasFile("package.json") {
+		return nil
+	}
+	pkgJSONPath := filepath.Join(workDir, "package.json")
+
+	if m := commandNotFoundRe.FindStringSubmatch(errorOutput); m != nil {
+		missingCmd := m[1]
+		if missingCmd == "" {
+			missingCmd = m[2]
+		}
+		if isCommandInPackageJSON(pkgJSONPath, missingCmd) {
+			if isCommandDeclaredInPackageJSON(pkgJSONPath, missingCmd) {
+				// Tool IS declared as a dep — node_modules just needs restoring.
+				return &dependencyInstallPlan{
+					cmd:      "npm",
+					args:     []string{"install"},
+					describe: "npm install (restores node_modules for missing tool: " + missingCmd + ")",
+				}
+			}
+			// Tool is used in scripts but NOT declared — install it explicitly.
+			pkgsToInstall := []string{missingCmd}
+			if known, ok := npmToolPackages[missingCmd]; ok {
+				pkgsToInstall = known
+			}
+			args := append([]string{"install", "--save-dev"}, pkgsToInstall...)
+			return &dependencyInstallPlan{
+				cmd:      "npm",
+				args:     args,
+				describe: "npm install --save-dev " + strings.Join(pkgsToInstall, " ") + " (missing tool not declared in package.json)",
+			}
+		}
+	}
+
+	seen := map[string]bool{}
+	var pkgs []string
+
+	// node: built-ins and globals (__dirname, __filename) all resolved by @types/node.
+	nodeBuiltinRe := regexp.MustCompile(`Cannot find module 'node:[^']*'`)
+	if nodeBuiltinRe.MatchString(errorOutput) ||
+		strings.Contains(errorOutput, "Cannot find name '__dirname'") ||
+		strings.Contains(errorOutput, "Cannot find name '__filename'") {
+		if !seen["@types/node"] {
+			pkgs = append(pkgs, "@types/node")
+			seen["@types/node"] = true
+		}
+	}
+
+	// Other missing modules: "Cannot find module 'X'" → try @types/X.
+	// Skip relative paths (start with '.') — those are source-code bugs.
+	otherRe := regexp.MustCompile(`Cannot find module '([^'.][^']*)'`)
+	for _, m := range otherRe.FindAllStringSubmatch(errorOutput, -1) {
+		name := m[1]
+		if strings.HasPrefix(name, "node:") {
+			continue // already covered above
+		}
+		typePkg := "@types/" + strings.TrimPrefix(name, "@")
+		if !seen[typePkg] {
+			pkgs = append(pkgs, typePkg)
+			seen[typePkg] = true
+		}
+	}
+
+	if len(pkgs) > 0 {
+		args := append([]string{"install", "--save-dev"}, pkgs...)
+		return &dependencyInstallPlan{
+			cmd:      "npm",
+			args:     args,
+			describe: "npm install --save-dev " + strings.Join(pkgs, " "),
+		}
+	}
+	return nil
+}
+
+// depRepairPip handles Python missing-module errors.
+func depRepairPip(_ string, hasFile func(string) bool, errorOutput string) *dependencyInstallPlan {
+	if !hasFile("requirements.txt") && !hasFile("pyproject.toml") && !hasFile("setup.py") && !hasFile("setup.cfg") {
+		return nil
+	}
+	moduleRe := regexp.MustCompile(`(?:ModuleNotFoundError|ImportError): No module named '([^']+)'`)
+	seen := map[string]bool{}
+	var pkgs []string
+	for _, m := range moduleRe.FindAllStringSubmatch(errorOutput, -1) {
+		name := strings.SplitN(m[1], ".", 2)[0] // top-level package only
+		if !seen[name] {
+			pkgs = append(pkgs, name)
+			seen[name] = true
+		}
+	}
+	if len(pkgs) == 0 {
+		return nil
+	}
+	args := append([]string{"install"}, pkgs...)
+	return &dependencyInstallPlan{
+		cmd:      "pip",
+		args:     args,
+		describe: "pip install " + strings.Join(pkgs, " "),
+	}
+}
+
+// buildDependencyInstallPlan iterates depRepairHandlers and returns the first
+// non-nil plan. To support a new toolchain, add a handler to depRepairHandlers.
+func buildDependencyInstallPlan(workDir, errorOutput string) *dependencyInstallPlan {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return nil
+	}
+	hasFile := func(name string) bool {
+		for _, e := range entries {
+			if !e.IsDir() && strings.EqualFold(e.Name(), name) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, h := range depRepairHandlers {
+		if plan := h(workDir, hasFile, errorOutput); plan != nil {
+			return plan
+		}
+	}
+	return nil
+}
+
+// attemptAutoRepairMissingDependency resolves "missing module" errors from any
+// supported toolchain by detecting the project type and installing the required
+// packages. No source files are modified.
+func attemptAutoRepairMissingDependency(workDir, errorOutput string) (bool, string, []string) {
+	plan := buildDependencyInstallPlan(workDir, errorOutput)
+	if plan == nil {
+		return false, "Auto-repair skipped: could not determine missing packages or package manager", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, stderr, code := execCommand(ctx, workDir, plan.cmd, plan.args...)
+	if code != 0 {
+		return false, fmt.Sprintf("Auto-repair: `%s` failed: %s", plan.describe, strings.TrimSpace(stderr)), nil
+	}
+	return true, fmt.Sprintf("Auto-repair: ran `%s`", plan.describe), nil
+}
+
+type goPackageConflict struct {
+	dirRel string
+	fileA  string
+	pkgA   string
+	fileB  string
+	pkgB   string
+}
+
+func attemptAutoRepairGoPackageMismatch(workDir, errorOutput string) (bool, string, []string) {
+	conflicts := parseGoPackageConflicts(workDir, errorOutput)
+	if len(conflicts) == 0 {
+		return false, "Auto-repair skipped: no deterministic go package-mismatch diagnostics found", nil
+	}
+
+	changedSet := map[string]bool{}
+	for _, c := range conflicts {
+		absDir := filepath.Clean(filepath.Join(workDir, c.dirRel))
+		pkgByFile := readGoPackagesInDir(absDir)
+		targetPkg := chooseGoTargetPackage(c, pkgByFile)
+		if targetPkg == "" {
+			continue
+		}
+
+		for _, fname := range []string{c.fileA, c.fileB} {
+			if strings.HasSuffix(strings.ToLower(fname), "_test.go") {
+				continue
+			}
+			currentPkg := pkgByFile[fname]
+			if currentPkg == "" {
+				currentPkg = readGoPackageDecl(filepath.Join(absDir, fname))
+			}
+			if currentPkg == "" || currentPkg == targetPkg {
+				continue
+			}
+			changed, err := rewriteGoPackageDecl(filepath.Join(absDir, fname), targetPkg)
+			if err != nil || !changed {
+				continue
+			}
+			rel := filepath.ToSlash(filepath.Clean(filepath.Join(c.dirRel, fname)))
+			if c.dirRel == "." {
+				rel = fname
+			}
+			changedSet[rel] = true
+			pkgByFile[fname] = targetPkg
+		}
+	}
+
+	if len(changedSet) == 0 {
+		return false, "Auto-repair skipped: deterministic package alignment made no safe changes", nil
+	}
+
+	changedFiles := make([]string, 0, len(changedSet))
+	for f := range changedSet {
+		changedFiles = append(changedFiles, f)
+	}
+	sort.Strings(changedFiles)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	args := append([]string{"-w"}, changedFiles...)
+	_, _, _ = execCommand(ctx, workDir, "gofmt", args...)
+
+	return true, fmt.Sprintf("Auto-repaired Go package mismatch in: %s", strings.Join(changedFiles, ", ")), changedFiles
+}
+
+func parseGoPackageConflicts(workDir, errorOutput string) []goPackageConflict {
+	rx := regexp.MustCompile(`(?m)^found packages\s+([A-Za-z_][A-Za-z0-9_]*)\s+\(([^)]+)\)\s+and\s+([A-Za-z_][A-Za-z0-9_]*)\s+\(([^)]+)\)\s+in\s+(.+)$`)
+	var out []goPackageConflict
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		pkgA := strings.TrimSpace(m[1])
+		fileA := filepath.Base(strings.TrimSpace(m[2]))
+		pkgB := strings.TrimSpace(m[3])
+		fileB := filepath.Base(strings.TrimSpace(m[4]))
+		dirRel, ok := resolveConflictDir(workDir, strings.TrimSpace(m[5]), fileA, fileB)
+		if !ok {
+			continue
+		}
+		out = append(out, goPackageConflict{dirRel: dirRel, fileA: fileA, pkgA: pkgA, fileB: fileB, pkgB: pkgB})
+	}
+	return out
+}
+
+func resolveConflictDir(workDir, rawDir, fileA, fileB string) (string, bool) {
+	cleanDir := filepath.Clean(workDir)
+	candidate := strings.TrimSpace(rawDir)
+	if candidate == "" {
+		candidate = "."
+	}
+
+	abs := candidate
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(workDir, abs)
+	}
+	abs = filepath.Clean(abs)
+	rel, relErr := filepath.Rel(cleanDir, abs)
+	if relErr == nil && !strings.HasPrefix(rel, "..") {
+		if st, statErr := os.Stat(abs); statErr == nil && st.IsDir() {
+			if rel == "." {
+				return ".", true
+			}
+			return filepath.ToSlash(rel), true
+		}
+	}
+
+	// Fallback: most ad-hoc runs use workspace root.
+	if _, errA := os.Stat(filepath.Join(workDir, fileA)); errA == nil {
+		if _, errB := os.Stat(filepath.Join(workDir, fileB)); errB == nil {
+			return ".", true
+		}
+	}
+
+	return "", false
+}
+
+func readGoPackagesInDir(absDir string) map[string]string {
+	out := map[string]string{}
+	entries, err := os.ReadDir(absDir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".go") {
+			continue
+		}
+		pkg := readGoPackageDecl(filepath.Join(absDir, name))
+		if pkg != "" {
+			out[name] = pkg
+		}
+	}
+	return out
+}
+
+func chooseGoTargetPackage(c goPackageConflict, pkgByFile map[string]string) string {
+	if strings.EqualFold(c.fileA, "main.go") && c.pkgA == "main" {
+		return "main"
+	}
+	if strings.EqualFold(c.fileB, "main.go") && c.pkgB == "main" {
+		return "main"
+	}
+
+	if pkgByFile["main.go"] == "main" {
+		return "main"
+	}
+
+	counts := map[string]int{}
+	for file, pkg := range pkgByFile {
+		if pkg == "" || strings.HasSuffix(strings.ToLower(file), "_test.go") {
+			continue
+		}
+		counts[pkg]++
+	}
+	if len(counts) == 0 {
+		if c.pkgA == "main" || c.pkgB == "main" {
+			return "main"
+		}
+		if c.pkgA != "" {
+			return c.pkgA
+		}
+		return c.pkgB
+	}
+
+	type kv struct {
+		pkg string
+		n   int
+	}
+	var ranked []kv
+	for pkg, n := range counts {
+		ranked = append(ranked, kv{pkg: pkg, n: n})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].n == ranked[j].n {
+			return ranked[i].pkg < ranked[j].pkg
+		}
+		return ranked[i].n > ranked[j].n
+	})
+	return ranked[0].pkg
+}
+
+func readGoPackageDecl(absPath string) string {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return ""
+	}
+	rx := regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)\b`)
+	for _, line := range strings.Split(string(data), "\n") {
+		if m := rx.FindStringSubmatch(line); len(m) == 2 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+func rewriteGoPackageDecl(absPath, targetPkg string) (bool, error) {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return false, err
+	}
+	lines := strings.Split(string(data), "\n")
+	rx := regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)\b`)
+	for i, line := range lines {
+		m := rx.FindStringSubmatch(line)
+		if len(m) != 2 {
+			continue
+		}
+		if m[1] == targetPkg {
+			return false, nil
+		}
+		lines[i] = "package " + targetPkg
+		updated := strings.Join(lines, "\n")
+		if updated == string(data) {
+			return false, nil
+		}
+		if err := os.WriteFile(absPath, []byte(updated), 0o644); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("package declaration not found")
+}
+
+func attemptAutoRepairGoUnusedDiagnostics(workDir, errorOutput string) (bool, string, []string) {
+	rx := regexp.MustCompile(`(?m)^(?:\./)?([^\s:]+):(\d+):(\d+):\s+(.+)$`)
+	rxUnusedImport := regexp.MustCompile(`^"[^"]+" imported and not used$`)
+	rxUnusedDecl := regexp.MustCompile(`^declared and not used: [A-Za-z_][A-Za-z0-9_]*$`)
+
+	deletions := map[string]map[int]bool{}
+	for _, m := range rx.FindAllStringSubmatch(errorOutput, -1) {
+		lineNum, convErr := strconv.Atoi(m[2])
+		if convErr != nil || lineNum < 1 {
+			continue
+		}
+		msg := strings.TrimSpace(m[4])
+		if !rxUnusedImport.MatchString(msg) && !rxUnusedDecl.MatchString(msg) {
+			continue
+		}
+		relPath := filepath.ToSlash(filepath.Clean(m[1]))
+		if deletions[relPath] == nil {
+			deletions[relPath] = map[int]bool{}
+		}
+		deletions[relPath][lineNum] = true
+	}
+
+	if len(deletions) == 0 {
+		return false, "Auto-repair skipped: no deterministic go unused-symbol diagnostics found", nil
+	}
+
+	cleanDir := filepath.Clean(workDir)
+	var changedFiles []string
+
+	for relPath, lineSet := range deletions {
+		absPath := filepath.Clean(filepath.Join(workDir, relPath))
+		rel, relErr := filepath.Rel(cleanDir, absPath)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		data, readErr := os.ReadFile(absPath)
+		if readErr != nil {
+			continue
+		}
+
+		lines := strings.Split(string(data), "\n")
+		var lineNums []int
+		for n := range lineSet {
+			if n >= 1 && n <= len(lines) {
+				lineNums = append(lineNums, n)
+			}
+		}
+		if len(lineNums) == 0 {
+			continue
+		}
+		sort.Ints(lineNums)
+
+		changed := false
+		for i := len(lineNums) - 1; i >= 0; i-- {
+			idx := lineNums[i] - 1
+			if idx < 0 || idx >= len(lines) {
+				continue
+			}
+			lines = append(lines[:idx], lines[idx+1:]...)
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+
+		updated := strings.Join(lines, "\n")
+		if updated == string(data) {
+			continue
+		}
+		if writeErr := os.WriteFile(absPath, []byte(updated), 0o644); writeErr != nil {
+			continue
+		}
+		changedFiles = append(changedFiles, relPath)
+	}
+
+	if len(changedFiles) == 0 {
+		return false, "Auto-repair skipped: could not safely apply deterministic go unused-symbol edits", nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	args := []string{"-w"}
+	args = append(args, changedFiles...)
+	_, _, _ = execCommand(ctx, workDir, "gofmt", args...)
+
+	return true, fmt.Sprintf("Auto-repaired Go unused imports/variables in: %s", strings.Join(changedFiles, ", ")), changedFiles
+}
+
+// attemptAutoRepairGoMod performs a deterministic rewrite of go.mod when it is
+// syntactically broken. It keeps only valid directives and validates the result
+// with `go mod edit -json` before accepting it.
+func attemptAutoRepairGoMod(workDir string) (bool, string) {
+	absPath := filepath.Join(workDir, "go.mod")
+	originalBytes, err := os.ReadFile(absPath)
+	if err != nil {
+		return false, fmt.Sprintf("Auto-repair skipped: could not read go.mod (%v)", err)
+	}
+
+	rebuilt := rebuildGoModContent(workDir, string(originalBytes))
+	if strings.TrimSpace(rebuilt) == "" {
+		return false, "Auto-repair skipped: could not derive a valid go.mod structure"
+	}
+	if rebuilt == string(originalBytes) {
+		return false, "Auto-repair skipped: deterministic rewrite produced no changes"
+	}
+
+	if err := os.WriteFile(absPath, []byte(rebuilt), 0o644); err != nil {
+		return false, fmt.Sprintf("Auto-repair failed while writing go.mod (%v)", err)
+	}
+
+	if err := validatePatchedFile(workDir, "go.mod", rebuilt); err != nil {
+		_ = os.WriteFile(absPath, originalBytes, 0o644)
+		return false, fmt.Sprintf("Auto-repair rejected: %v", err)
+	}
+
+	return true, "Auto-repaired go.mod using deterministic parser-safe rewrite"
+}
+
+func rebuildGoModContent(workDir, content string) string {
+	var modulePath string
+	var goVersion string
+	var requireOrder []string
+	requireLines := map[string]string{}
+	var replaceOrder []string
+	replaceSeen := map[string]bool{}
+
+	inRequireBlock := false
+	inReplaceBlock := false
+
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line, "module "):
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && isLikelyModulePath(fields[1]) {
+				modulePath = fields[1]
+			}
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case strings.HasPrefix(line, "go "):
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if v := normalizeGoVersion(fields[1]); v != "" {
+					goVersion = v
+				}
+			}
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case line == "require (":
+			inRequireBlock = true
+			inReplaceBlock = false
+			continue
+
+		case line == "replace (":
+			inReplaceBlock = true
+			inRequireBlock = false
+			continue
+
+		case line == ")":
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case strings.HasPrefix(line, "require "):
+			entry := strings.TrimSpace(strings.TrimPrefix(line, "require"))
+			addRequireEntry(entry, requireLines, &requireOrder)
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+
+		case strings.HasPrefix(line, "replace "):
+			entry := strings.TrimSpace(strings.TrimPrefix(line, "replace"))
+			addReplaceEntry(entry, replaceSeen, &replaceOrder)
+			inRequireBlock = false
+			inReplaceBlock = false
+			continue
+		}
+
+		if inRequireBlock {
+			addRequireEntry(line, requireLines, &requireOrder)
+			continue
+		}
+		if inReplaceBlock {
+			addReplaceEntry(line, replaceSeen, &replaceOrder)
+			continue
+		}
+	}
+
+	if modulePath == "" {
+		modulePath = fallbackModulePath(workDir)
+	}
+	if goVersion == "" {
+		goVersion = detectDefaultGoVersion(workDir)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "module %s\n\n", modulePath)
+	fmt.Fprintf(&b, "go %s\n", goVersion)
+
+	if len(requireOrder) > 0 {
+		b.WriteString("\nrequire (\n")
+		for _, mod := range requireOrder {
+			fmt.Fprintf(&b, "\t%s\n", requireLines[mod])
+		}
+		b.WriteString(")\n")
+	}
+
+	if len(replaceOrder) > 0 {
+		b.WriteString("\nreplace (\n")
+		for _, line := range replaceOrder {
+			fmt.Fprintf(&b, "\t%s\n", line)
+		}
+		b.WriteString(")\n")
+	}
+
+	return b.String()
+}
+
+func addRequireEntry(line string, requireLines map[string]string, requireOrder *[]string) {
+	comment := ""
+	if idx := strings.Index(line, "//"); idx >= 0 {
+		rawComment := strings.TrimSpace(line[idx:])
+		if strings.Contains(strings.ToLower(rawComment), "indirect") {
+			comment = " // indirect"
+		}
+		line = strings.TrimSpace(line[:idx])
+	}
+	fields := strings.Fields(line)
+	if len(fields) != 2 {
+		return
+	}
+	if !isLikelyModulePath(fields[0]) || !isLikelyVersion(fields[1]) {
+		return
+	}
+	if _, exists := requireLines[fields[0]]; !exists {
+		*requireOrder = append(*requireOrder, fields[0])
+	}
+	requireLines[fields[0]] = fields[0] + " " + fields[1] + comment
+}
+
+func addReplaceEntry(line string, replaceSeen map[string]bool, replaceOrder *[]string) {
+	if idx := strings.Index(line, "//"); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	parts := strings.SplitN(line, "=>", 2)
+	if len(parts) != 2 {
+		return
+	}
+	left := strings.Fields(strings.TrimSpace(parts[0]))
+	right := strings.Fields(strings.TrimSpace(parts[1]))
+
+	if !(len(left) == 1 || len(left) == 2) {
+		return
+	}
+	if !(len(right) == 1 || len(right) == 2) {
+		return
+	}
+	if !isLikelyModulePath(left[0]) {
+		return
+	}
+	if len(left) == 2 && !isLikelyVersion(left[1]) {
+		return
+	}
+	if len(right) == 2 && !isLikelyVersion(right[1]) {
+		return
+	}
+
+	normalized := strings.Join(left, " ") + " => " + strings.Join(right, " ")
+	if replaceSeen[normalized] {
+		return
+	}
+	replaceSeen[normalized] = true
+	*replaceOrder = append(*replaceOrder, normalized)
+}
+
+func isLikelyModulePath(s string) bool {
+	if s == "" {
+		return false
+	}
+	rx := regexp.MustCompile(`^[A-Za-z0-9._~\-/]+$`)
+	return rx.MatchString(s)
+}
+
+func isLikelyVersion(s string) bool {
+	if s == "" {
+		return false
+	}
+	return strings.HasPrefix(s, "v")
+}
+
+func normalizeGoVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "go")
+	rx := regexp.MustCompile(`^\d+\.\d+(?:\.\d+)?$`)
+	if rx.MatchString(v) {
+		return v
+	}
+	return ""
+}
+
+func detectDefaultGoVersion(workDir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stdout, stderr, exitCode := execCommand(ctx, workDir, "go", "env", "GOVERSION")
+	if exitCode == 0 {
+		combined := strings.TrimSpace(stdout + stderr)
+		rx := regexp.MustCompile(`go(\d+\.\d+(?:\.\d+)?)`)
+		if m := rx.FindStringSubmatch(combined); len(m) == 2 {
+			return m[1]
+		}
+	}
+	return "1.22.0"
+}
+
+func fallbackModulePath(workDir string) string {
+	base := strings.ToLower(filepath.Base(filepath.Clean(workDir)))
+	rx := regexp.MustCompile(`[^a-z0-9._-]+`)
+	base = rx.ReplaceAllString(base, "-")
+	base = strings.Trim(base, "-.")
+	if base == "" {
+		base = "app"
+	}
+	return "example.com/" + base
+}
+
 // heuristics. Called when the LLM returns a filename with no extension.
 func agentInferExtension(name, content string) string {
 	c := strings.TrimSpace(content)
@@ -2801,6 +6276,96 @@ func agentInferExtension(name, content string) string {
 //
 // agentTrimSeparator removes a trailing === separator that models sometimes
 // append at the end of the last file block (leaking the multi-file format).
+// agentStripLeadingProse removes natural-language commentary that small LLMs
+// often prepend to code output (e.g. "Here is the main.go file:\n").
+// It finds the first line that looks like actual code for the given filename
+// extension and returns everything from that line onward. If no code-like line
+// is found the original content is returned unchanged.
+func agentStripLeadingProse(content, filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	// Also handle bare names like "go.mod" and "Makefile".
+	base := strings.ToLower(filepath.Base(filename))
+
+	var isCodeLine func(line string) bool
+	switch ext {
+	case ".go":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "package ") || strings.HasPrefix(l, "//") || strings.HasPrefix(l, "/*")
+		}
+	case ".mod":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "module ") || strings.HasPrefix(l, "go ")
+		}
+	case ".py":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "#!/") || strings.HasPrefix(l, "import ") ||
+				strings.HasPrefix(l, "from ") || strings.HasPrefix(l, "class ") ||
+				strings.HasPrefix(l, "def ") || strings.HasPrefix(l, "#") ||
+				strings.HasPrefix(l, "@")
+		}
+	case ".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "import ") || strings.HasPrefix(l, "export ") ||
+				strings.HasPrefix(l, "const ") || strings.HasPrefix(l, "let ") ||
+				strings.HasPrefix(l, "var ") || strings.HasPrefix(l, "function ") ||
+				strings.HasPrefix(l, "class ") || strings.HasPrefix(l, "//") ||
+				strings.HasPrefix(l, "/*") || strings.HasPrefix(l, "require(") ||
+				strings.HasPrefix(l, "\"use strict\"") || strings.HasPrefix(l, "'use strict'")
+		}
+	case ".tf", ".tfvars":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "terraform") || strings.HasPrefix(l, "resource ") ||
+				strings.HasPrefix(l, "provider ") || strings.HasPrefix(l, "data ") ||
+				strings.HasPrefix(l, "module ") || strings.HasPrefix(l, "variable ") ||
+				strings.HasPrefix(l, "output ") || strings.HasPrefix(l, "locals ") ||
+				strings.HasPrefix(l, "#") || strings.HasPrefix(l, "//")
+		}
+	case ".json":
+		isCodeLine = func(l string) bool { return strings.HasPrefix(l, "{") || strings.HasPrefix(l, "[") }
+	case ".yaml", ".yml":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "---") || strings.HasSuffix(l, ":") || strings.Contains(l, ": ")
+		}
+	case ".sh", ".bash":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "#!/") || strings.HasPrefix(l, "#") || strings.HasPrefix(l, "set ")
+		}
+	case ".rs":
+		isCodeLine = func(l string) bool {
+			return strings.HasPrefix(l, "use ") || strings.HasPrefix(l, "fn ") ||
+				strings.HasPrefix(l, "mod ") || strings.HasPrefix(l, "pub ") ||
+				strings.HasPrefix(l, "struct ") || strings.HasPrefix(l, "enum ") ||
+				strings.HasPrefix(l, "//") || strings.HasPrefix(l, "/*") ||
+				strings.HasPrefix(l, "#[")
+		}
+	default:
+		// Handle special base names without recognised extensions.
+		switch base {
+		case "makefile", "dockerfile":
+			isCodeLine = func(l string) bool {
+				return strings.HasPrefix(l, "#") || strings.Contains(l, ":") || strings.HasPrefix(l, "\t")
+			}
+		default:
+			return content // unknown type — don't mutate
+		}
+	}
+
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if isCodeLine(trimmed) {
+			if i == 0 {
+				return content // already starts with code
+			}
+			return strings.Join(lines[i:], "\n")
+		}
+	}
+	return content // no code-like line found — return as-is
+}
+
 func agentTrimSeparator(s string) string {
 	t := strings.TrimRight(s, " \t\r\n")
 	if strings.HasSuffix(t, "===") {
@@ -2873,7 +6438,7 @@ func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 
 	// Prevent path traversal: the resolved path must stay inside the directory.
 	rel, err := filepath.Rel(cleanDir, absPath)
-	if err != nil || len(rel) >= 2 && rel[:2] == ".." {
+	if err != nil || strings.HasPrefix(rel, "..") {
 		http.Error(w, "Access denied", http.StatusForbidden)
 		return
 	}
@@ -2916,7 +6481,7 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 
 	// Prevent path traversal.
 	rel, err := filepath.Rel(cleanDir, absPath)
-	if err != nil || len(rel) >= 2 && rel[:2] == ".." {
+	if err != nil || strings.HasPrefix(rel, "..") {
 		http.Error(w, "Access denied: path outside working directory", http.StatusForbidden)
 		return
 	}
@@ -2940,7 +6505,7 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 		Content:   fmt.Sprintf("✅ Applied changes to **%s**", req.Path),
 		Timestamp: time.Now(),
 	}
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2951,29 +6516,63 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSettings returns or updates runtime-configurable settings.
-// GET  /api/settings  → {"auto_apply": bool}
-// POST /api/settings  ← {"auto_apply": bool}
+//
+// GET  /api/settings
+//
+//	→ {"auto_apply":bool,"model":string,"temperature":float64,"concurrent_files":int}
+//
+// POST /api/settings
+//
+//	← {"auto_apply":bool,"model":string,"temperature":float64,"concurrent_files":int}
+//	   All fields are optional; omitted fields are left unchanged.
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
 	case http.MethodGet:
 		s.mu.RLock()
-		autoApply := s.cfg.Agent.AutoApply
+		out := map[string]interface{}{
+			"auto_apply":       s.cfg.Agent.AutoApply,
+			"model":            s.model,
+			"temperature":      s.cfg.LLM.Temperature,
+			"concurrent_files": s.cfg.Agent.ConcurrentFiles,
+		}
 		s.mu.RUnlock()
-		json.NewEncoder(w).Encode(map[string]interface{}{"auto_apply": autoApply})
+		json.NewEncoder(w).Encode(out)
 
 	case http.MethodPost:
 		var req struct {
-			AutoApply bool `json:"auto_apply"`
+			AutoApply       *bool    `json:"auto_apply"`
+			Model           *string  `json:"model"`
+			Temperature     *float64 `json:"temperature"`
+			ConcurrentFiles *int     `json:"concurrent_files"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			sendError(w, "Invalid request body")
 			return
 		}
 		s.mu.Lock()
-		s.cfg.Agent.AutoApply = req.AutoApply
+		if req.AutoApply != nil {
+			s.cfg.Agent.AutoApply = *req.AutoApply
+		}
+		if req.Model != nil && strings.TrimSpace(*req.Model) != "" {
+			s.model = strings.TrimSpace(*req.Model)
+			s.cfg.LLM.Model = s.model
+			s.llmClient = llm.NewOllamaClient(s.cfg.LLM.Endpoint, s.model, s.cfg.LLM.Timeout, s.cfg.LLM.NumCtx)
+		}
+		if req.Temperature != nil {
+			s.cfg.LLM.Temperature = *req.Temperature
+		}
+		if req.ConcurrentFiles != nil && *req.ConcurrentFiles > 0 {
+			s.cfg.Agent.ConcurrentFiles = *req.ConcurrentFiles
+		}
+		out := map[string]interface{}{
+			"auto_apply":       s.cfg.Agent.AutoApply,
+			"model":            s.model,
+			"temperature":      s.cfg.LLM.Temperature,
+			"concurrent_files": s.cfg.Agent.ConcurrentFiles,
+		}
 		s.mu.Unlock()
-		json.NewEncoder(w).Encode(map[string]interface{}{"auto_apply": req.AutoApply})
+		json.NewEncoder(w).Encode(out)
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -3022,7 +6621,7 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 		userLabel = "🔧 Run & Fix: " + task
 	}
 	s.mu.Lock()
-	s.messages = append(s.messages, Message{Role: "user", Content: userLabel, Timestamp: time.Now()})
+	s.appendMessageLocked(Message{Role: "user", Content: userLabel, Timestamp: time.Now()})
 	s.mu.Unlock()
 
 	var sseMu sync.Mutex
@@ -3072,7 +6671,7 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := Message{Role: "assistant", Content: summary, Timestamp: time.Now(), DurationMs: time.Since(fixStart).Milliseconds()}
 	s.mu.Lock()
-	s.messages = append(s.messages, msg)
+	s.appendMessageLocked(msg)
 	s.mu.Unlock()
 
 	sseWrite(w, flusher, map[string]any{"type": "done", "success": true, "message": msg})
@@ -3081,13 +6680,207 @@ func (s *Server) handleFixStream(w http.ResponseWriter, r *http.Request) {
 // prevFixAttempt records what the LLM wrote and what error followed, so subsequent
 // attempts can see exactly what was tried and why it did not help.
 type prevFixAttempt struct {
-	attempt      int
-	errorOutput  string
-	changedFiles []agentFileBlock
+	attempt     int
+	errorOutput string
+	patches     []fixPatch
+	applied     bool
 }
 
 // runFixLoop detects the project's run/build command, executes it, and if it
 // fails sends the error to the LLM for a fix. Iterates up to maxFixAttempts.
+// unifiedDiff produces a minimal unified diff between before and after,
+// showing context lines of unchanged context around each changed block.
+// Returns an empty string when the two inputs are identical.
+func unifiedDiff(filename, before, after string, context int) string {
+	aLines := strings.Split(before, "\n")
+	bLines := strings.Split(after, "\n")
+
+	type hunk struct {
+		aStart, aLen int
+		bStart, bLen int
+		lines        []string
+	}
+
+	// Find changed line ranges using a simple LCS-free diff approach:
+	// build a map of (b line → indices in b) then walk a to find matching runs.
+	// For large files this is O(n²) worst case but adequate for typical source files.
+	type change struct{ aIdx, bIdx int }
+	var changes []change
+
+	ia, ib := 0, 0
+	for ia < len(aLines) && ib < len(bLines) {
+		if aLines[ia] == bLines[ib] {
+			ia++
+			ib++
+			continue
+		}
+		// Scan ahead to find the next matching pair (simple greedy, not LCS).
+		found := false
+		for lookahead := 1; lookahead <= 20; lookahead++ {
+			if ia+lookahead < len(aLines) && aLines[ia+lookahead] == bLines[ib] {
+				for k := 0; k < lookahead; k++ {
+					changes = append(changes, change{ia + k, -1})
+				}
+				ia += lookahead
+				found = true
+				break
+			}
+			if ib+lookahead < len(bLines) && aLines[ia] == bLines[ib+lookahead] {
+				for k := 0; k < lookahead; k++ {
+					changes = append(changes, change{-1, ib + k})
+				}
+				ib += lookahead
+				found = true
+				break
+			}
+		}
+		if !found {
+			changes = append(changes, change{ia, -1}, change{-1, ib})
+			ia++
+			ib++
+		}
+	}
+	for ; ia < len(aLines); ia++ {
+		changes = append(changes, change{ia, -1})
+	}
+	for ; ib < len(bLines); ib++ {
+		changes = append(changes, change{-1, ib})
+	}
+
+	if len(changes) == 0 {
+		return ""
+	}
+
+	// Build output lines in unified diff format.
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "--- %s\n+++ %s\n", filename, filename)
+
+	// Collect changed a/b indices.
+	changedA := map[int]bool{}
+	changedB := map[int]bool{}
+	for _, c := range changes {
+		if c.aIdx >= 0 {
+			changedA[c.aIdx] = true
+		}
+		if c.bIdx >= 0 {
+			changedB[c.bIdx] = true
+		}
+	}
+
+	// Emit hunks: for each changed line in a/b, print ±context lines.
+	type span struct{ start, end int } // inclusive line indices in a
+	var spans []span
+	for idx := range changedA {
+		s := idx - context
+		if s < 0 {
+			s = 0
+		}
+		e := idx + context
+		if e >= len(aLines) {
+			e = len(aLines) - 1
+		}
+		spans = append(spans, span{s, e})
+	}
+	for idx := range changedB {
+		s := idx - context
+		if s < 0 {
+			s = 0
+		}
+		e := idx + context
+		if e >= len(bLines) {
+			e = len(bLines) - 1
+		}
+		spans = append(spans, span{s, e})
+	}
+
+	if len(spans) == 0 {
+		return ""
+	}
+
+	// Merge overlapping spans (operating in a-space for simplicity).
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	merged := []span{spans[0]}
+	for _, sp := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if sp.start <= last.end+1 {
+			if sp.end > last.end {
+				last.end = sp.end
+			}
+		} else {
+			merged = append(merged, sp)
+		}
+	}
+
+	// Walk a and b together, emitting hunk headers + lines.
+	bCursor := 0
+	for _, sp := range merged {
+		// Count lines in this hunk.
+		aHunkLen := sp.end - sp.start + 1
+
+		// Walk b to find the b-start equivalent.
+		bStart := bCursor
+		// Advance bStart to align with sp.start in a (skipping deleted+added).
+		// Simple heuristic: walk together until a-index reaches sp.start.
+		aWalk, bWalk := 0, bCursor
+		for aWalk < sp.start && bWalk < len(bLines) {
+			if !changedA[aWalk] && !changedB[bWalk] {
+				aWalk++
+				bWalk++
+			} else if changedA[aWalk] {
+				aWalk++
+			} else {
+				bWalk++
+			}
+		}
+		bStart = bWalk
+
+		// Now emit from sp.start / bStart.
+		var hunkLines []string
+		ai, bi := sp.start, bStart
+		for ai <= sp.end || (bi < len(bLines) && changedB[bi]) {
+			if ai <= sp.end && bi < len(bLines) {
+				if !changedA[ai] && !changedB[bi] {
+					hunkLines = append(hunkLines, " "+aLines[ai])
+					ai++
+					bi++
+				} else {
+					if changedA[ai] {
+						hunkLines = append(hunkLines, "-"+aLines[ai])
+						ai++
+					}
+					if bi < len(bLines) && changedB[bi] {
+						hunkLines = append(hunkLines, "+"+bLines[bi])
+						bi++
+					}
+				}
+			} else if ai <= sp.end {
+				hunkLines = append(hunkLines, "-"+aLines[ai])
+				ai++
+			} else if bi < len(bLines) && changedB[bi] {
+				hunkLines = append(hunkLines, "+"+bLines[bi])
+				bi++
+			} else {
+				break
+			}
+		}
+		bCursor = bi
+
+		bHunkLen := 0
+		for _, l := range hunkLines {
+			if !strings.HasPrefix(l, "-") {
+				bHunkLen++
+			}
+		}
+
+		fmt.Fprintf(&sb, "@@ -%d,%d +%d,%d @@\n", sp.start+1, aHunkLen, bStart+1, bHunkLen)
+		for _, l := range hunkLines {
+			sb.WriteString(l + "\n")
+		}
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
+}
+
 func (s *Server) runFixLoop(ctx context.Context, task string, progress func(string)) (string, error) {
 	files := s.getActiveFilesSnapshot()
 
@@ -3101,6 +6894,8 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 
 	var prevErrSnippet string
 	var history []prevFixAttempt
+	autoManifestRepairTried := map[string]bool{}
+	autoCodeRepairTried := map[string]bool{}
 
 	for attempt := 1; attempt <= maxFixAttempts; attempt++ {
 		if ctx.Err() != nil {
@@ -3143,67 +6938,155 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 		}
 		prevErrSnippet = errSnippet
 
+		if manifestFile, shouldRepair := detectDeterministicManifestRepairTarget(errSnippet); shouldRepair && !autoManifestRepairTried[manifestFile] {
+			autoManifestRepairTried[manifestFile] = true
+			repaired, repairMsg := attemptDeterministicManifestRepair(s.directory, manifestFile)
+			if repairMsg != "" {
+				progress("🛠️  " + repairMsg)
+			}
+			if repaired {
+				s.markWrittenFile(manifestFile)
+				s.mu.Lock()
+				s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: manifestFile, Task: "(auto-fix deterministic)"})
+				s.mu.Unlock()
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
+				}
+				progress(fmt.Sprintf("♻️  Retrying build after deterministic %s repair…", manifestFile))
+				continue
+			}
+		}
+
+		if repairTarget, shouldRepair := detectDeterministicCodeRepairTarget(runCmd, errSnippet); shouldRepair && !autoCodeRepairTried[repairTarget] {
+			autoCodeRepairTried[repairTarget] = true
+			repaired, repairMsg, touchedFiles := attemptDeterministicCodeRepair(s.directory, repairTarget, errSnippet)
+			if repairMsg != "" {
+				progress("🛠️  " + repairMsg)
+			}
+			if repaired {
+				for _, rel := range touchedFiles {
+					s.markWrittenFile(rel)
+					s.mu.Lock()
+					s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: rel, Task: "(auto-fix deterministic)"})
+					s.mu.Unlock()
+				}
+				if scanned, scanErr := s.performRescan(); scanErr == nil {
+					s.mu.Lock()
+					s.scanResult = scanned
+					s.mu.Unlock()
+				}
+				progress(fmt.Sprintf("♻️  Retrying build after deterministic %s repair…", repairTarget))
+				continue
+			}
+		}
+
 		if attempt == maxFixAttempts {
 			return fmt.Sprintf("❌ **Run & Fix**: still failing after %d attempt(s).\n\nLast error:\n```\n%s\n```", maxFixAttempts, errSnippet), nil
 		}
 
 		progress(fmt.Sprintf("🤖 Asking LLM to propose a fix (attempt %d/%d)…", attempt, maxFixAttempts))
 
-		// Refresh files snapshot so we send the latest content to the LLM.
-		files = s.getActiveFilesSnapshot()
-		fixedBlocks, llmErr := s.runFixLLM(ctx, task, files, errSnippet, attempt, sameError, history)
+		patches, llmErr := s.runFixLLM(ctx, task, errSnippet, attempt, sameError, history)
 		if llmErr != nil {
-			return "", llmErr
+			if errors.Is(llmErr, context.Canceled) {
+				return "", llmErr
+			}
+			// Non-fatal: surface the message so the user can see the raw LLM output,
+			// then continue to the next attempt.
+			progress(fmt.Sprintf("⚠️  %v", llmErr))
+			history = append(history, prevFixAttempt{attempt: attempt, errorOutput: errSnippet, applied: false})
+			continue
 		}
 
-		if len(fixedBlocks) == 0 {
+		if len(patches) == 0 {
 			if sameError {
-				// Same error, LLM has no new ideas — no point continuing.
 				return fmt.Sprintf("❌ **Run & Fix**: same error persists and LLM could not find a fix.\n\nError:\n```\n%s\n```", errSnippet), nil
 			}
 			progress(fmt.Sprintf("⚠️  LLM found no changes to make on attempt %d/%d — retrying…", attempt, maxFixAttempts))
 			continue
 		}
 
-		// Report proposed fix before writing.
-		var fixedNames []string
-		for _, block := range fixedBlocks {
-			if block.name != "" {
-				fixedNames = append(fixedNames, block.name)
+		// Report and apply patches.
+		var patchedNames []string
+		for _, p := range patches {
+			if p.name != "" {
+				patchedNames = append(patchedNames, p.name)
 			}
 		}
-		progress(fmt.Sprintf("📝 Proposed fix: %s", strings.Join(fixedNames, ", ")))
+		progress(fmt.Sprintf("📝 Proposed fix: %s", strings.Join(patchedNames, ", ")))
 
-		cleanDir := filepath.Clean(s.directory)
-		for _, block := range fixedBlocks {
-			if block.name == "" {
+		// Snapshot file contents before patching so we can show a diff after.
+		preSnapshots := map[string]string{}
+		for _, p := range patches {
+			if p.name == "" {
 				continue
 			}
-			absPath := filepath.Clean(filepath.Join(s.directory, block.name))
-			rel, relErr := filepath.Rel(cleanDir, absPath)
-			if relErr != nil || strings.HasPrefix(rel, "..") {
-				continue // security: skip paths outside working directory
+			absSnap := filepath.Clean(filepath.Join(s.directory, p.name))
+			if data, readErr := os.ReadFile(absSnap); readErr == nil {
+				preSnapshots[p.name] = string(data)
 			}
-			if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-				progress(fmt.Sprintf("⚠️  Could not create directory for %s: %v", block.name, err))
+		}
+
+		var appliedPatches []fixPatch
+		var appliedNames []string
+
+		for _, p := range patches {
+			if p.name == "" {
 				continue
 			}
-			if err := os.WriteFile(absPath, []byte(block.content), 0o644); err != nil {
-				progress(fmt.Sprintf("⚠️  Could not write %s: %v", block.name, err))
+			warnings, applyErr := applyFixPatch(s.directory, p)
+			for _, w := range warnings {
+				progress("⚠️  " + w)
+			}
+			if applyErr != nil {
+				progress(fmt.Sprintf("⚠️  Could not apply patch to %s: %v", p.name, applyErr))
 				continue
 			}
-			s.markWrittenFile(block.name)
+			appliedPatches = append(appliedPatches, p)
+			appliedNames = append(appliedNames, p.name)
+			s.markWrittenFile(p.name)
 			s.mu.Lock()
-			s.agentLog = append(s.agentLog, AgentLogEntry{Operation: "modified", File: block.name, Task: "(auto-fix)"})
+			s.appendAgentLogLocked(AgentLogEntry{Operation: "modified", File: p.name, Task: "(auto-fix)"})
 			s.mu.Unlock()
 		}
-		progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(fixedNames, ", ")))
+		if len(appliedNames) == 0 {
+			progress("⚠️  No proposed changes were applied (all patches were rejected or invalid).")
+		} else {
+			progress(fmt.Sprintf("✏️  Applied fix to: %s", strings.Join(appliedNames, ", ")))
+			// Show a unified diff for each patched file.
+			for _, name := range appliedNames {
+				absPatched := filepath.Clean(filepath.Join(s.directory, name))
+				afterBytes, readErr := os.ReadFile(absPatched)
+				if readErr != nil {
+					continue
+				}
+				before := preSnapshots[name]
+				after := string(afterBytes)
+				if before == after {
+					continue
+				}
+				diff := unifiedDiff(name, before, after, 3)
+				if diff != "" {
+					progress(fmt.Sprintf("📄 Diff for %s:\n```diff\n%s\n```", name, diff))
+				}
+			}
+		}
+
+		recordedPatches := appliedPatches
+		wereApplied := len(appliedPatches) > 0
+		if !wereApplied {
+			// Preserve rejected/no-op proposals so the next prompt can avoid repeating them.
+			recordedPatches = patches
+		}
 
 		// Record this attempt so the next iteration can see what was tried.
 		history = append(history, prevFixAttempt{
-			attempt:      attempt,
-			errorOutput:  errSnippet,
-			changedFiles: fixedBlocks,
+			attempt:     attempt,
+			errorOutput: errSnippet,
+			patches:     recordedPatches,
+			applied:     wereApplied,
 		})
 
 		// Rescan so the next iteration sees up-to-date file contents.
@@ -3217,66 +7100,85 @@ func (s *Server) runFixLoop(ctx context.Context, task string, progress func(stri
 	return "❌ Max fix attempts reached.", nil
 }
 
-// runFixLLM calls the LLM with the current file contents + error output.
-// The model is asked to return only files that need to change, using the same
-// FILE:/---/=== format as agent_create, so we can reuse parseAgentCreateResponse.
-func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.FileInfo, errorOutput string, attempt int, sameError bool, history []prevFixAttempt) ([]agentFileBlock, error) {
+// runFixLLM calls the LLM with focused context (imports + error locations) and
+// error output. It expects SEARCH/REPLACE blocks back, parsed as []fixPatch.
+func (s *Server) runFixLLM(ctx context.Context, task string, errorOutput string, attempt int, sameError bool, history []prevFixAttempt) ([]fixPatch, error) {
 	var prompt strings.Builder
 	if task != "" {
 		fmt.Fprintf(&prompt, "Original task: %s\n\n", task)
 	}
 
-	// Include history of previous failed attempts so the LLM knows exactly
-	// what it already tried and can avoid repeating the same broken fix.
+	// Show history of previous failed attempts.
 	if len(history) > 0 {
 		prompt.WriteString("=== PREVIOUS FAILED ATTEMPTS ===\n")
 		for _, h := range history {
-			fmt.Fprintf(&prompt, "--- Attempt %d ---\n", h.attempt)
-			fmt.Fprintf(&prompt, "Error after applying the fix:\n```\n%s\n```\n", h.errorOutput)
-			if len(h.changedFiles) > 0 {
-				prompt.WriteString("Files written (which did NOT fix the error):\n")
-				for _, f := range h.changedFiles {
-					fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n", f.name, f.content)
+			fmt.Fprintf(&prompt, "--- Attempt %d error ---\n```\n%s\n```\n", h.attempt, h.errorOutput)
+			if len(h.patches) > 0 {
+				if h.applied {
+					prompt.WriteString("Files written (which did NOT fix the error):\n")
+				} else {
+					prompt.WriteString("Files proposed in previous attempt but rejected/no-op (did NOT fix the error):\n")
+				}
+				for _, p := range h.patches {
+					for _, hunk := range p.hunks {
+						// Reconstruct as FILE/---/=== to match the output format.
+						fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n", p.name, hunk.replace)
+					}
 				}
 			} else {
-				prompt.WriteString("(LLM produced no file changes)\n")
+				prompt.WriteString("(no files produced)\n")
 			}
 			prompt.WriteString("\n")
 		}
 		if sameError {
-			fmt.Fprintf(&prompt, "CRITICAL: Attempt %d produced the SAME error as before. The fixes above had NO effect. You MUST take a completely different approach.\n\n", attempt)
+			fmt.Fprintf(&prompt, "CRITICAL: Attempt %d produced the SAME error. The files above had NO effect. Take a completely different approach.\n\n", attempt)
 		} else {
-			prompt.WriteString("IMPORTANT: The fixes above did not resolve the error. You MUST try a structurally different approach — do not repeat anything that was already attempted.\n\n")
+			prompt.WriteString("IMPORTANT: The files above did not fix the error. Take a structurally different approach.\n\n")
 		}
 		prompt.WriteString("=== END OF PREVIOUS ATTEMPTS ===\n\n")
 	}
 
-	prompt.WriteString("Current source files:\n\n")
-	for _, f := range files {
-		if f == nil || !f.IsReadable {
-			continue
+	// Keep context tight: only send files directly referenced by the error.
+	relatedFiles := errorReferencedFiles(s.directory, errorOutput)
+	if len(relatedFiles) > 0 {
+		prompt.WriteString("Relevant source files referenced by the error:\n\n")
+		for _, relPath := range relatedFiles {
+			abs := filepath.Clean(filepath.Join(s.directory, relPath))
+			data, err := os.ReadFile(abs)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(&prompt, "FILE: %s\n```\n%s\n```\n\n", relPath, string(data))
 		}
-		absPath := filepath.Clean(filepath.Join(s.directory, f.RelPath))
-		data, err := os.ReadFile(absPath)
-		if err != nil {
-			continue
-		}
-		fmt.Fprintf(&prompt, "FILE: %s\n---\n%s\n===\n\n", f.RelPath, string(data))
 	}
-	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\n", errorOutput)
 
-	// Append annotated source snippets so the model sees the exact broken lines.
-	if snippets := extractErrorSnippets(s.directory, errorOutput); snippets != "" {
-		prompt.WriteString(snippets)
+	if guidance := buildManifestErrorGuidance(errorOutput, relatedFiles); guidance != "" {
+		prompt.WriteString(guidance)
 		prompt.WriteString("\n")
 	}
 
-	prompt.WriteString("Fix the error(s) above. Return only the files that need to change.")
+	if guidance := buildMissingSymbolGuidance(s.directory, errorOutput); guidance != "" {
+		prompt.WriteString(guidance)
+		prompt.WriteString("\n")
+	}
+
+	// Append a focused error-location summary.
+	if fixCtx := buildFixContext(s.directory, errorOutput); fixCtx != "" {
+		prompt.WriteString("Error locations (line numbers shown for reference only — do not include them in file output):\n\n")
+		prompt.WriteString(fixCtx)
+	}
+
+	fmt.Fprintf(&prompt, "Error output:\n```\n%s\n```\n\nFix the error(s) above. Return only the files that need to change.", errorOutput)
+
+	fixSystemPrompt := promptAgentFix
+	if memCtxFix := s.memoryContext(); memCtxFix != "" {
+		fixSystemPrompt += "\n\n" + memCtxFix
+	}
 
 	chatReq := &llm.ChatRequest{
 		Model: s.cfg.LLM.Model,
 		Messages: []llm.Message{
-			{Role: "system", Content: promptAgentFix},
+			{Role: "system", Content: fixSystemPrompt},
 			{Role: "user", Content: prompt.String()},
 		},
 		Temperature: fixTemperature(s.cfg.LLM.Temperature, attempt, sameError),
@@ -3287,7 +7189,31 @@ func (s *Server) runFixLLM(ctx context.Context, task string, files []*types.File
 		return nil, fmt.Errorf("LLM fix request failed: %w", err)
 	}
 
-	return parseAgentCreateResponse(resp.Message.Content), nil
+	// Primary: FILE/---/=== full-file format (matches the system prompt).
+	if blocks := parseAgentCreateResponse(resp.Message.Content); len(blocks) > 0 {
+		var patches []fixPatch
+		for _, b := range blocks {
+			if b.name != "" {
+				patches = append(patches, fixPatch{
+					name:  b.name,
+					hunks: []fixHunk{{search: "", replace: b.content}},
+				})
+			}
+		}
+		return patches, nil
+	}
+
+	// Fallback: SEARCH/REPLACE format.
+	if patches := parseFixPatchResponse(resp.Message.Content); len(patches) > 0 {
+		return patches, nil
+	}
+
+	// Neither format matched — surface the raw response so the progress log
+	// shows what the model actually said, making failures diagnosable.
+	if strings.TrimSpace(resp.Message.Content) != "" {
+		return nil, fmt.Errorf("LLM response did not contain any fix blocks.\nRaw response:\n%s", resp.Message.Content)
+	}
+	return nil, nil
 }
 
 // detectRunCommand inspects the project files and returns the appropriate
@@ -3311,6 +7237,32 @@ func (s *Server) detectRunCommand(files []*types.FileInfo) (cmd string, args []s
 	// Node.js / TypeScript — prefer npm run build, fall back to npm install
 	if check("package.json") {
 		if check("tsconfig.json") {
+			// If package.json has a "build" script, use it — it likely runs tsc
+			// with the correct flags and also produces dist/ output.
+			if pkgJSON, readErr := os.ReadFile(filepath.Join(s.directory, "package.json")); readErr == nil {
+				var pkgMeta struct {
+					Scripts map[string]string `json:"scripts"`
+				}
+				if json.Unmarshal(pkgJSON, &pkgMeta) == nil {
+					if _, hasBuild := pkgMeta.Scripts["build"]; hasBuild {
+						return "npm", []string{"run", "build"}, nil
+					}
+				}
+			}
+			// No build script: check tsconfig.json for outDir. If one is set
+			// the project expects compiled output, so run tsc without --noEmit
+			// so that dist/ is actually populated. If outDir is absent, type-
+			// check only is fine.
+			if tsconfig, readErr := os.ReadFile(filepath.Join(s.directory, "tsconfig.json")); readErr == nil {
+				var tsMeta struct {
+					CompilerOptions map[string]interface{} `json:"compilerOptions"`
+				}
+				if json.Unmarshal(tsconfig, &tsMeta) == nil {
+					if outDir, ok := tsMeta.CompilerOptions["outDir"]; ok && outDir != "" {
+						return "npx", []string{"tsc"}, nil
+					}
+				}
+			}
 			return "npx", []string{"tsc", "--noEmit"}, nil
 		}
 		return "npm", []string{"run", "build", "--if-present"}, nil
@@ -3350,6 +7302,168 @@ func (s *Server) detectRunCommand(files []*types.FileInfo) (cmd string, args []s
 
 // execCommand runs name with args inside dir, captures combined stdout+stderr,
 // and returns the exit code. A non-zero code always means failure.
+// agentFetchGitRemoteURL returns the "origin" remote URL of the git
+// repository rooted at dir, or an empty string if there is no remote or no
+// git repository.
+func agentFetchGitRemoteURL(dir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stdout, _, code := execCommand(ctx, dir, "git", "remote", "get-url", "origin")
+	if code != 0 {
+		return ""
+	}
+	return strings.TrimSpace(stdout)
+}
+
+// agentDetectProjectName reads common manifest files to find the canonical
+// project/module name. Falls back to the directory name if nothing is found.
+func agentDetectProjectName(dir string) string {
+	// go.mod — take last path segment of the module declaration
+	if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "module ") {
+				mod := strings.TrimSpace(strings.TrimPrefix(line, "module "))
+				if parts := strings.Split(mod, "/"); len(parts) > 0 {
+					return parts[len(parts)-1]
+				}
+			}
+		}
+	}
+	// package.json — "name" field
+	if data, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
+		var pkg struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(data, &pkg) == nil && pkg.Name != "" {
+			return pkg.Name
+		}
+	}
+	// Cargo.toml — name = "..."
+	if data, err := os.ReadFile(filepath.Join(dir, "Cargo.toml")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "name") && strings.Contains(line, "=") {
+				parts := strings.SplitN(line, "=", 2)
+				if len(parts) == 2 {
+					name := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+					if name != "" {
+						return name
+					}
+				}
+			}
+		}
+	}
+	return filepath.Base(filepath.Clean(dir))
+}
+
+// agentDetectBuildCommands scans common manifest and build files to produce
+// concrete build/run commands for the project's Getting Started section.
+func agentDetectBuildCommands(dir string) string {
+	var cmds []string
+	// go.mod → go build / go run / go test
+	if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+		modName := ""
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "module ") {
+				modName = strings.TrimSpace(strings.TrimPrefix(line, "module "))
+			}
+		}
+		if modName != "" {
+			parts := strings.Split(modName, "/")
+			binName := parts[len(parts)-1]
+			cmds = append(cmds,
+				"go build -o "+binName+" .",
+				"go run .",
+				"go test ./...",
+			)
+		}
+	}
+	// package.json → npm scripts (build, start, dev)
+	if data, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
+		var pkg struct {
+			Scripts map[string]string `json:"scripts"`
+		}
+		if json.Unmarshal(data, &pkg) == nil {
+			for _, key := range []string{"build", "start", "dev"} {
+				if v, ok := pkg.Scripts[key]; ok {
+					cmds = append(cmds, fmt.Sprintf("npm run %s  # %s", key, v))
+				}
+			}
+		}
+	}
+	// Makefile → first few non-trivial targets
+	if data, err := os.ReadFile(filepath.Join(dir, "Makefile")); err == nil {
+		count := 0
+		for _, line := range strings.Split(string(data), "\n") {
+			if count >= 5 {
+				break
+			}
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "\t") {
+				continue
+			}
+			if idx := strings.Index(trimmed, ":"); idx > 0 {
+				target := strings.TrimSpace(trimmed[:idx])
+				if target != "" && !strings.Contains(target, " ") {
+					cmds = append(cmds, "make "+target)
+					count++
+				}
+			}
+		}
+	}
+	// Dockerfile → ENTRYPOINT / CMD lines
+	if data, err := os.ReadFile(filepath.Join(dir, "Dockerfile")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			upper := strings.ToUpper(strings.TrimSpace(line))
+			if strings.HasPrefix(upper, "ENTRYPOINT") || strings.HasPrefix(upper, "CMD") {
+				cmds = append(cmds, "Docker: "+strings.TrimSpace(line))
+			}
+		}
+	}
+	// Python
+	if _, err := os.Stat(filepath.Join(dir, "requirements.txt")); err == nil {
+		cmds = append(cmds, "pip install -r requirements.txt")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pyproject.toml")); err == nil {
+		cmds = append(cmds, "pip install -e .")
+	}
+	if len(cmds) == 0 {
+		return ""
+	}
+	return strings.Join(cmds, "\n")
+}
+
+// agentProjectMetaBlock returns a context block with repository-specific facts
+// (project name, directory, remote URL, detected build commands) that the LLM
+// should use when writing README / documentation files.
+func (s *Server) agentProjectMetaBlock() string {
+	dirName := filepath.Base(filepath.Clean(s.directory))
+	projectName := agentDetectProjectName(s.directory)
+	remoteURL := agentFetchGitRemoteURL(s.directory)
+	buildCmds := agentDetectBuildCommands(s.directory)
+
+	var b strings.Builder
+	b.WriteString("Project metadata for documentation (use these exact values):\n")
+	fmt.Fprintf(&b, "- Project name: %s\n", projectName)
+	fmt.Fprintf(&b, "- Local directory name: %s\n", dirName)
+	if remoteURL != "" {
+		fmt.Fprintf(&b, "- Repository URL: %s\n", remoteURL)
+		fmt.Fprintf(&b, "  Use this URL for the git clone step, e.g.: git clone %s\n", remoteURL)
+		fmt.Fprintf(&b, "  Then: cd %s\n", dirName)
+	} else {
+		b.WriteString("- No remote repository found. Do NOT include a \"git clone\" step; the user already has the source code.\n")
+	}
+	if buildCmds != "" {
+		b.WriteString("- Detected build/run commands (use these verbatim in Getting Started):\n")
+		for _, line := range strings.Split(buildCmds, "\n") {
+			fmt.Fprintf(&b, "  %s\n", line)
+		}
+	}
+	return b.String()
+}
+
 func execCommand(ctx context.Context, dir, name string, args ...string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir

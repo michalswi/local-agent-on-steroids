@@ -167,3 +167,94 @@ type SecurityViolation struct {
 	Description string  `json:"description"`
 	Confidence  float64 `json:"confidence"` // 0.0 to 1.0
 }
+
+// LangEntry describes a programming language or file type for agent heuristics.
+// All language-aware logic is driven from LangRegistry so that adding support
+// for a new language only requires a single new entry here.
+type LangEntry struct {
+	Ext       string   // canonical file extension including dot, e.g. ".go"
+	IsCode    bool     // true → counted by the dominant-extension heuristic
+	TechKW    []string // task keywords indicating this technology is present (tech-mismatch detection)
+	ImpliedKW []string // ordered task keywords implying a new file of this type should be created
+	AllowGlob string   // default filter allow-pattern glob, e.g. "*.go"; "" = omit from defaults
+}
+
+// LangRegistry is the single source of truth for all language and file-type
+// heuristics used by the agent. Entries are ordered to preserve first-match
+// semantics in implied-extension detection.
+//
+// To add support for a new language: add ONE entry here.
+// No other code needs to change.
+var LangRegistry = []LangEntry{
+	// ── documentation / config formats ───────────────────────────────────────
+	{Ext: ".md", AllowGlob: "*.md",
+		ImpliedKW: []string{".md", "md file", "markdown", "readme"}},
+	{Ext: ".yaml", AllowGlob: "*.yaml",
+		ImpliedKW: []string{".yaml", "yaml file"}},
+	{Ext: ".yml", AllowGlob: "*.yml",
+		ImpliedKW: []string{".yml", "yml file"}},
+	{Ext: ".json", AllowGlob: "*.json",
+		ImpliedKW: []string{".json", "json file"}},
+	{Ext: ".toml", AllowGlob: "*.toml",
+		ImpliedKW: []string{".toml", "toml file"}},
+	{Ext: ".txt", AllowGlob: "*.txt",
+		ImpliedKW: []string{".txt", "txt file", "text file"}},
+	{Ext: ".sh", AllowGlob: "*.sh",
+		ImpliedKW: []string{".sh", "shell script", "bash script"}},
+	{Ext: ".html", AllowGlob: "",
+		ImpliedKW: []string{".html", "html file"}},
+	{Ext: ".css", AllowGlob: "",
+		ImpliedKW: []string{".css", "css file"}},
+	{Ext: ".env", AllowGlob: "*.env",
+		ImpliedKW: []string{".env", "env file"}},
+	// ── web / JS family ──────────────────────────────────────────────────────
+	{Ext: ".ts", IsCode: true, AllowGlob: "*.ts",
+		TechKW:    []string{"typescript", " ts ", ".ts "},
+		ImpliedKW: []string{"typescript", ".ts ", "angular"}},
+	{Ext: ".tsx", IsCode: true, AllowGlob: "",
+		TechKW:    []string{"react", ".tsx"},
+		ImpliedKW: []string{".tsx", "react"}},
+	{Ext: ".vue", IsCode: true, AllowGlob: "",
+		TechKW:    []string{"vue"},
+		ImpliedKW: []string{"vue"}},
+	{Ext: ".js", IsCode: true, AllowGlob: "*.js",
+		TechKW:    []string{"javascript", " js ", ".js ", "nodejs", "node.js"},
+		ImpliedKW: []string{"javascript", ".js ", "node"}},
+	// ── Python ───────────────────────────────────────────────────────────────
+	{Ext: ".py", IsCode: true, AllowGlob: "*.py",
+		TechKW:    []string{"python", ".py "},
+		ImpliedKW: []string{"python", ".py "}},
+	// ── Go ───────────────────────────────────────────────────────────────────
+	{Ext: ".go", IsCode: true, AllowGlob: "*.go",
+		ImpliedKW: []string{"golang", " go app", " go server"}},
+	// ── Rust ─────────────────────────────────────────────────────────────────
+	{Ext: ".rs", IsCode: true, AllowGlob: "*.rs",
+		TechKW:    []string{"rust", ".rs "},
+		ImpliedKW: []string{"rust"}},
+	// ── Java / JVM ───────────────────────────────────────────────────────────
+	{Ext: ".java", IsCode: true, AllowGlob: "*.java",
+		TechKW:    []string{"java "},
+		ImpliedKW: []string{"java "}},
+	{Ext: ".kt", IsCode: true, AllowGlob: "*.kt",
+		TechKW:    []string{"kotlin"},
+		ImpliedKW: []string{"kotlin"}},
+	{Ext: ".scala", IsCode: true, AllowGlob: "*.scala"},
+	// ── .NET / C# ────────────────────────────────────────────────────────────
+	{Ext: ".cs", IsCode: true, AllowGlob: "",
+		TechKW:    []string{"c# ", "csharp", ".net"},
+		ImpliedKW: []string{"c# ", "csharp", ".net"}},
+	// ── C / C++ ──────────────────────────────────────────────────────────────
+	{Ext: ".cpp", IsCode: true, AllowGlob: "*.cpp"},
+	{Ext: ".c", IsCode: true, AllowGlob: "*.c"},
+	{Ext: ".h", IsCode: true, AllowGlob: "*.h"},
+	// ── other scripted languages ──────────────────────────────────────────────
+	{Ext: ".rb", IsCode: true, AllowGlob: "*.rb",
+		TechKW:    []string{"ruby", ".rb "},
+		ImpliedKW: []string{"ruby"}},
+	{Ext: ".php", IsCode: true, AllowGlob: "*.php",
+		TechKW:    []string{"php"},
+		ImpliedKW: []string{"php"}},
+	{Ext: ".swift", IsCode: true, AllowGlob: "*.swift",
+		TechKW:    []string{"swift"},
+		ImpliedKW: []string{"swift"}},
+}
