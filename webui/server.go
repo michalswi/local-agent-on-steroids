@@ -46,6 +46,18 @@ const maxMessages = 200
 // agent prompt. Older entries are dropped first to bound prompt token usage.
 const maxAgentLogEntries = 50
 
+// docCompletionSentinel must be the final line emitted by doc-generation
+// prompts so we can detect truncated/incomplete outputs reliably.
+const docCompletionSentinel = "<END_OF_DOC>"
+
+// docContextMaxBytes caps the total source context injected into doc prompts.
+// Even on local models, unbounded prompt growth leaves too little room for the
+// model's completion and increases truncation risk.
+const docContextMaxBytes = 96 * 1024
+
+// docContextSnippetBytes caps each per-file snippet included in doc context.
+const docContextSnippetBytes = 8 * 1024
+
 var (
 	promptChat              = mustPrompt("prompts/chat.md")
 	promptAgentEdit         = mustPrompt("prompts/agent_edit.md")
@@ -2400,6 +2412,90 @@ func agentDocValidationIssues(content string) []string {
 	return issues
 }
 
+func agentHasIssue(issues []string, target string) bool {
+	for _, iss := range issues {
+		if iss == target {
+			return true
+		}
+	}
+	return false
+}
+
+func agentDocHasCompletionSentinel(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) == 0 {
+		return false
+	}
+	return strings.TrimSpace(lines[len(lines)-1]) == docCompletionSentinel
+}
+
+func agentDocStripCompletionSentinel(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) == 0 {
+		return trimmed
+	}
+	if strings.TrimSpace(lines[len(lines)-1]) != docCompletionSentinel {
+		return trimmed
+	}
+	body := strings.Join(lines[:len(lines)-1], "\n")
+	return strings.TrimSpace(body)
+}
+
+func agentDocValidationIssuesWithSentinel(content string) []string {
+	body := agentDocStripCompletionSentinel(content)
+	issues := agentDocValidationIssues(body)
+	if !agentDocHasCompletionSentinel(content) {
+		issues = append(issues, "missing completion sentinel")
+	}
+	return issues
+}
+
+// agentNormalizeDocOutput unwraps one outer markdown code fence wrapper while
+// preserving normal markdown content (including internal fenced code blocks).
+func agentNormalizeDocOutput(content string) string {
+	s := strings.TrimSpace(content)
+	if !strings.HasPrefix(s, "```") {
+		return agentTrimSeparator(s)
+	}
+
+	firstNL := strings.IndexByte(s, '\n')
+	if firstNL < 0 {
+		return agentTrimSeparator(s)
+	}
+
+	lastFence := strings.LastIndex(s, "```")
+	if lastFence <= firstNL {
+		return agentTrimSeparator(s)
+	}
+
+	// Only unwrap when the final non-whitespace token is the closing fence.
+	if strings.TrimSpace(s[lastFence:]) != "```" {
+		return agentTrimSeparator(s)
+	}
+
+	inner := strings.TrimSpace(s[firstNL+1 : lastFence])
+	return agentTrimSeparator(inner)
+}
+
+func (s *Server) buildDocSystemPrompt(changelog string) string {
+	sys := promptAgentDoc + "\n\nOutput contract:\n- Return the complete documentation file content.\n- End the final line with exactly " + docCompletionSentinel + "."
+	if strings.TrimSpace(changelog) != "" {
+		sys += "\n\n" + changelog
+	}
+	if memCtx := s.memoryContext(); memCtx != "" {
+		sys += "\n\n" + memCtx
+	}
+	return sys
+}
+
 // agentIsSignificantlyShortened returns true when newContent is less than one
 // third of oldContent's length, indicating the model likely truncated or ignored
 // the existing file. Only fires when oldContent is substantial (>200 chars).
@@ -2430,17 +2526,12 @@ func agentIsGarbageDocContent(issues []string) bool {
 }
 
 func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, oldContent, draft, sourceCtx string) (final string, issues []string, err error) {
-	issues = agentDocValidationIssues(draft)
+	issues = agentDocValidationIssuesWithSentinel(draft)
 	if len(issues) == 0 {
 		return draft, nil, nil
 	}
-	// If the only issue is truncation, the model hit its output token limit.
-	// Retrying the same model will produce identical truncation — skip passes.
-	if len(issues) == 1 && issues[0] == "appears truncated at the end" {
-		return draft, issues, nil
-	}
 
-	systemPrompt := promptAgentDoc
+	systemPrompt := s.buildDocSystemPrompt("")
 
 	doRefinementPass := func(prevDraft string, prevIssues []string, passNum int) (string, []string, error) {
 		var issueList strings.Builder
@@ -2492,17 +2583,18 @@ func (s *Server) ensureCompleteDocContent(ctx context.Context, task, filePath, o
 			return prevDraft, prevIssues, callErr
 		}
 
-		candidate := agentStripFences(strings.TrimSpace(resp.Message.Content))
-		if strings.TrimSpace(candidate) == "" {
+		candidate := strings.TrimSpace(agentNormalizeDocOutput(resp.Message.Content))
+		if strings.TrimSpace(agentDocStripCompletionSentinel(candidate)) == "" {
 			return prevDraft, prevIssues, nil
 		}
+		candidateIssues := agentDocValidationIssuesWithSentinel(candidate)
 		// Don't downgrade: if the refinement produced something shorter/worse
 		// than the previous draft, keep the previous draft.
-		if agentIsGarbageDocContent(agentDocValidationIssues(candidate)) &&
+		if agentIsGarbageDocContent(candidateIssues) &&
 			!agentIsGarbageDocContent(prevIssues) {
 			return prevDraft, prevIssues, nil
 		}
-		return candidate, agentDocValidationIssues(candidate), nil
+		return candidate, candidateIssues, nil
 	}
 
 	// Pass 1
@@ -3095,12 +3187,17 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 				})
 				var docCtxBuf strings.Builder
 				for _, dc := range docCands {
+					block := ""
 					if dc.content != "" {
-						snippet := truncatePromptContent(dc.content, crossFileSnippetBytes)
-						fmt.Fprintf(&docCtxBuf, "=== %s ===\n%s\n\n", dc.info.RelPath, snippet)
+						snippet := truncatePromptContent(dc.content, docContextSnippetBytes)
+						block = fmt.Sprintf("=== %s ===\n%s\n\n", dc.info.RelPath, snippet)
 					} else {
-						fmt.Fprintf(&docCtxBuf, "=== %s ===\n(no content)\n\n", dc.info.RelPath)
+						block = fmt.Sprintf("=== %s ===\n(no content)\n\n", dc.info.RelPath)
 					}
+					if docCtxBuf.Len()+len(block) > docContextMaxBytes {
+						continue
+					}
+					docCtxBuf.WriteString(block)
 				}
 				var docUserMsg strings.Builder
 				fmt.Fprintf(&docUserMsg, "Task: %s\n\nGenerate ONLY the file: %s\n", task, f.RelPath)
@@ -3112,10 +3209,7 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 				}
 				docUserMsg.WriteString("\n")
 				docUserMsg.WriteString(s.agentProjectMetaBlock())
-				docDocSysPrompt := promptAgentDoc
-				if changelog != "" {
-					docDocSysPrompt += "\n\n" + changelog
-				}
+				docDocSysPrompt := s.buildDocSystemPrompt(changelog)
 				docChatReq := &llm.ChatRequest{
 					Model: s.cfg.LLM.Model,
 					Messages: []llm.Message{
@@ -3130,7 +3224,8 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Error: docErr.Error()}}
 					return
 				}
-				newContent := strings.TrimSpace(agentStripFences(docResp.Message.Content))
+				newContentRaw := strings.TrimSpace(agentNormalizeDocOutput(docResp.Message.Content))
+				newContent := agentDocStripCompletionSentinel(newContentRaw)
 				if newContent == "" || strings.TrimSpace(newContent) == strings.TrimSpace(oldContent) {
 					progress(fmt.Sprintf("— %s — no change needed", f.RelPath))
 					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
@@ -3139,23 +3234,34 @@ func (s *Server) runAgentTask(ctx context.Context, task string, pinnedFiles []st
 				// Only skip refinement when the first-pass output is already clean.
 				// If the model returned garbage or a truncated response, we still run
 				// ensureCompleteDocContent so it gets a second chance to expand it.
-				initialIssues := agentDocValidationIssues(newContent)
+				initialIssues := agentDocValidationIssuesWithSentinel(newContentRaw)
 				isSimpleDocUpdate := strings.TrimSpace(oldContent) != "" &&
 					!agentIsMixedCodeAndDocsTask(task) &&
 					len(initialIssues) == 0
 				var refineIssues []string
 				if !isSimpleDocUpdate {
-					refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, f.RelPath, oldContent, newContent, "")
+					refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, f.RelPath, oldContent, newContentRaw, "")
 					if refineErr != nil {
 						progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", f.RelPath, refineErr))
 						// fall back to initial issues so garbage guard can still fire
 						refineIssues = initialIssues
 					} else {
-						newContent = refined
+						newContentRaw = refined
+						newContent = agentDocStripCompletionSentinel(newContentRaw)
 						refineIssues = issues
 					}
 				} else {
 					refineIssues = initialIssues
+				}
+				if agentHasIssue(refineIssues, "missing completion sentinel") {
+					if strings.TrimSpace(oldContent) != "" {
+						progress(fmt.Sprintf("— %s — output missing completion sentinel; keeping existing content", f.RelPath))
+						resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+						return
+					}
+					progress(fmt.Sprintf("⚠️ %s — output missing completion sentinel; not writing incomplete documentation", f.RelPath))
+					resultsCh <- indexedResult{idx, AgentFileResult{File: f.RelPath, Changed: false}}
+					return
 				}
 				// Garbage guard: when output is too short/malformed OR significantly
 				// shorter than existing content, don't overwrite — keep existing content.
@@ -3938,10 +4044,13 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 
 			sysPrompt := promptAgentCreateSingle
 			if isDocFile {
-				sysPrompt = promptAgentDoc
+				sysPrompt = s.buildDocSystemPrompt("")
 			}
-			if changelog != "" {
+			if changelog != "" && !isDocFile {
 				sysPrompt += "\n\n" + changelog
+			}
+			if isDocFile && changelog != "" {
+				sysPrompt = s.buildDocSystemPrompt(changelog)
 			}
 
 			chatReq := &llm.ChatRequest{
@@ -3958,6 +4067,11 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				continue
 			}
 			fileContent := agentStripFences(strings.TrimSpace(resp.Message.Content))
+			fileContentRaw := fileContent
+			if isDocFile {
+				fileContentRaw = strings.TrimSpace(agentNormalizeDocOutput(resp.Message.Content))
+				fileContent = agentDocStripCompletionSentinel(fileContentRaw)
+			}
 			if !isDocFile {
 				fileContent = agentStripLeadingProse(fileContent, fileName)
 			}
@@ -3993,11 +4107,16 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				if data, readErr := os.ReadFile(absPath); readErr == nil {
 					existingDoc = string(data)
 				}
-				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent, "")
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContentRaw, "")
 				if refineErr != nil {
 					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
 				} else {
-					fileContent = refined
+					fileContentRaw = refined
+					fileContent = agentDocStripCompletionSentinel(fileContentRaw)
+					if agentHasIssue(issues, "missing completion sentinel") {
+						progress(fmt.Sprintf("⚠️ %s — output missing completion sentinel; skipping incomplete documentation", relSlash))
+						continue
+					}
 					if agentIsGarbageDocContent(issues) {
 						progress(fmt.Sprintf("⚠️ %s — documentation may be incomplete; try a larger/better model", relSlash))
 					} else if len(issues) > 0 {
@@ -4082,6 +4201,7 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 		for _, blk := range blocks {
 			fileName := blk.name
 			fileContent := blk.content
+			fileContentRaw := fileContent
 			// Preserve subdirectory components the LLM proposes (e.g. src/game.ts);
 			// only strip to basename when there is no directory separator.
 			if !strings.ContainsAny(fileName, "/\\") {
@@ -4106,11 +4226,16 @@ func (s *Server) runAgentCreate(ctx context.Context, task string, contextFiles [
 				if data, readErr := os.ReadFile(absPath); readErr == nil {
 					existingDoc = string(data)
 				}
-				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContent, "")
+				refined, issues, refineErr := s.ensureCompleteDocContent(ctx, task, relSlash, existingDoc, fileContentRaw, "")
 				if refineErr != nil {
 					progress(fmt.Sprintf("⚠️ %s — docs refinement failed: %v", relSlash, refineErr))
 				} else {
-					fileContent = refined
+					fileContentRaw = refined
+					fileContent = agentDocStripCompletionSentinel(fileContentRaw)
+					if agentHasIssue(issues, "missing completion sentinel") {
+						progress(fmt.Sprintf("⚠️ %s — output missing completion sentinel; skipping incomplete documentation", relSlash))
+						continue
+					}
 					if len(issues) > 0 {
 						progress(fmt.Sprintf("⚠️ %s — documentation may still be incomplete: %s", relSlash, strings.Join(issues, "; ")))
 					}
